@@ -1,0 +1,81 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Disaggregated TRT-LLM generation: one replica of context and generation
+# engines with attention DP. Engine counts and widths come from CTX_* and
+# GEN_* in the config_*.sh profile.
+defaults: /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/conf/grpo_qwen35_397b_swe_openhands_async_trtllm.yaml
+
+policy:
+  generation:
+    trtllm_cfg:
+      precision: ${policy.precision}
+      is_mx: false
+      # widest engine; per-role widths live under disaggregation.*_trtllm_kwargs
+      tensor_parallel_size: ${oc.decode:${oc.env:GEN_TP,16}}
+      moe_expert_parallel_size: ${oc.decode:${oc.env:GEN_MEP,16}}
+      max_batch_size: ${oc.decode:${oc.env:GEN_MAX_BATCH,256}}
+      gpu_memory_utilization: ${oc.decode:${oc.env:TRTLLM_GPU_UTIL,0.8}}
+      disaggregation:
+        enabled: true
+        num_context_engines: ${oc.decode:${oc.env:CTX_ENGINES,1}}
+        num_generation_engines: ${oc.decode:${oc.env:GEN_ENGINES,1}}
+        ctx_router: conversation
+        gen_router: load_balancing
+        cache_transceiver_backend: ${oc.env:TRTLLM_CACHE_TRANSCEIVER,NIXL}
+        cache_transceiver_runtime: ${oc.env:TRTLLM_TRANSCEIVER_RUNTIME,PYTHON}
+        kv_cache_bounce_size_mb: ${oc.decode:${oc.env:KV_BOUNCE_MB,256}}
+        max_tokens_in_buffer: ${oc.decode:${oc.env:KV_MAX_TOKENS_IN_BUFFER,null}}
+        kv_transfer_timeout_ms: ${oc.decode:${oc.env:KV_TRANSFER_TIMEOUT_MS,600000}}
+        num_frontend_workers: ${oc.decode:${oc.env:DISAGG_FRONTENDS,16}}
+        gen_tokids_ctxbytes: ${oc.decode:${oc.env:DISAGG_TOKIDS_B64,true}}
+        gen_strip_message_history: ${oc.decode:${oc.env:DISAGG_STRIP_GEN_HISTORY,true}}
+        frontend_tokenize: ${oc.decode:${oc.env:DISAGG_FRONTEND_TOKENIZE,true}}
+        frontend_base_port: ${oc.decode:${oc.env:DISAGG_FE_BASE_PORT,17300}}
+        ctx_trtllm_kwargs:
+          tensor_parallel_size: ${oc.decode:${oc.env:CTX_TP,8}}
+          gpu_memory_utilization: ${oc.decode:${oc.env:CTX_GPU_UTIL,0.8}}
+          moe_tensor_parallel_size: ${oc.decode:${oc.env:CTX_MTP,1}}
+          moe_expert_parallel_size: ${oc.decode:${oc.env:CTX_MEP,8}}
+          max_batch_size: ${oc.decode:${oc.env:CTX_MAX_BATCH,64}}
+          trtllm_kwargs:
+            enable_attention_dp: ${oc.decode:${oc.env:CTX_ADP,true}}
+            attention_dp_config:
+              enable_kv_cache_aware_routing: ${oc.decode:${oc.env:CTX_KV_AWARE_ROUTING,true}}
+              kv_cache_routing_account_for_in_transfer: ${oc.decode:${oc.env:CTX_KV_AWARE_ROUTING,true}}
+              kv_cache_routing_conversation_affinity: ${oc.decode:${oc.env:CTX_KV_ROUTING_CONV_AFFINITY,true}}
+            kv_cache_config:
+              enable_block_reuse: ${oc.decode:${oc.env:CTX_BLOCK_REUSE,true}}
+              mamba_state_cache_interval: ${oc.decode:${oc.env:CTX_MAMBA_INTERVAL,16384}}
+              mamba_max_off_grid_snapshots_per_chain: ${oc.decode:${oc.env:CTX_MAMBA_MAX_OFFGRID,1}}
+              mamba_ssm_cache_dtype: ${oc.env:MAMBA_SSM_DTYPE,bfloat16}
+              # Repeated per role: a role's kv_cache_config replaces the frontend one.
+              use_kv_cache_manager_v2: false
+        gen_trtllm_kwargs:
+          tensor_parallel_size: ${oc.decode:${oc.env:GEN_TP,16}}
+          moe_tensor_parallel_size: ${oc.decode:${oc.env:GEN_MTP,1}}
+          moe_expert_parallel_size: ${oc.decode:${oc.env:GEN_MEP,16}}
+          max_batch_size: ${oc.decode:${oc.env:GEN_MAX_BATCH,256}}
+          trtllm_kwargs:
+            enable_attention_dp: ${oc.decode:${oc.env:GEN_ADP,true}}
+            attention_dp_config:
+              enable_kv_cache_aware_routing: ${oc.decode:${oc.env:GEN_KV_AWARE_ROUTING,true}}
+              kv_cache_routing_account_for_in_transfer: ${oc.decode:${oc.env:GEN_KV_AWARE_ROUTING,true}}
+              kv_cache_routing_conversation_affinity: ${oc.decode:${oc.env:GEN_KV_ROUTING_CONV_AFFINITY,true}}
+            kv_cache_config:
+              enable_block_reuse: ${oc.decode:${oc.env:GEN_BLOCK_REUSE,true}}
+              mamba_state_cache_interval: ${oc.decode:${oc.env:CTX_MAMBA_INTERVAL,16384}}
+              mamba_max_off_grid_snapshots_per_chain: ${oc.decode:${oc.env:GEN_MAMBA_MAX_OFFGRID,0}}
+              mamba_ssm_cache_dtype: ${oc.env:MAMBA_SSM_DTYPE,bfloat16}
+              use_kv_cache_manager_v2: false
+    trtllm_kwargs:
+      moe_config:
+        backend: CUTEDSL
+      stream_interval: 100
+      use_cute_dsl_bf16_gemm: true
+      print_iter_log: true
+      torch_compile_config: null
+      kv_cache_config:
+        mamba_ssm_cache_dtype: ${oc.env:MAMBA_SSM_DTYPE,bfloat16}
+        enable_block_reuse: true
+        mamba_state_cache_interval: ${oc.decode:${oc.env:CTX_MAMBA_INTERVAL,16384}}
+        use_kv_cache_manager_v2: false  # V1 manager on the frontend engine config too (see the aggregated recipe)

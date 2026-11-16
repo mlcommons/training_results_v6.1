@@ -1,0 +1,82 @@
+diff --git a/examples/mlperf/llama2_70b/config_MI355X_1x8x1.sh b/examples/mlperf/llama2_70b/config_MI355X_1x8x1.sh
+index d29f3d83..9ee6f2cb 100755
+--- a/examples/mlperf/llama2_70b/config_MI355X_1x8x1.sh
++++ b/examples/mlperf/llama2_70b/config_MI355X_1x8x1.sh
+@@ -108,6 +108,13 @@ export MLLOG_MICRO_BATCH_SIZE=1
+ MLLOG_CONFIG_FILENAME=$(basename "${BASH_SOURCE[0]}")
+ export MLLOG_CONFIG_FILENAME
+ export MLLOG_LOWEST_NUMERICAL_PRECISION_LINEAR=mxfp4
++# HPE: MLPerf 6.1 precision keys (logged by the recipe) and submitter fields
++# (these override AMD's values set above).
++export MLLOG_LOWEST_NUMERICAL_PRECISION_IN_LINEAR=mxfp4
++export MLLOG_LOWEST_NUMERICAL_PRECISION_IN_ATTN=bfloat16
++export MLLOG_LOWEST_NUMERICAL_PRECISION_IN_COMM=bfloat16
++export MLLOG_SUBMISSION_ORG=HPE
++export MLLOG_SUBMISSION_PLATFORM=XD685_MI355X
+ 
+ export TP_COMM_OVERLAP=False
+ export MC_TP_OVERLAP_AG=False
+@@ -154,6 +161,8 @@ export LOGGING_INTERVAL=5000
+ export FP4=True
+ export FP4_RECIPE=mxfp4
+ export MAX_STEPS=550
++# HPE: cosine schedule length (opt_learning_rate_training_steps); unconstrained by the rules.
++export PRIMUS_LR_DECAY_ITERS=${PRIMUS_LR_DECAY_ITERS:-550}
+ export NEXP=1
+ 
+ export LOAD_CKPT=True
+diff --git a/examples/mlperf/llama2_70b/configs/MI355X/llama2_70b_lora_mlperf_posttrain.yaml b/examples/mlperf/llama2_70b/configs/MI355X/llama2_70b_lora_mlperf_posttrain.yaml
+index 474ccfbe..c4cc1a6c 100644
+--- a/examples/mlperf/llama2_70b/configs/MI355X/llama2_70b_lora_mlperf_posttrain.yaml
++++ b/examples/mlperf/llama2_70b/configs/MI355X/llama2_70b_lora_mlperf_posttrain.yaml
+@@ -45,7 +45,7 @@ modules:
+       min_lr: 0.0
+       lr: ${LR:0.0006}
+       lr_warmup_iters: ${PRIMUS_LR_WARMUP_ITERS:0}
+-      lr_decay_iters: 550
++      lr_decay_iters: ${PRIMUS_LR_DECAY_ITERS:550}
+       clip_grad: 0.3
+ 
+       comm_overlap_config: null
+diff --git a/examples/mlperf/llama2_70b/run_with_docker.sh b/examples/mlperf/llama2_70b/run_with_docker.sh
+index e3fbce6b..f27afdff 100755
+--- a/examples/mlperf/llama2_70b/run_with_docker.sh
++++ b/examples/mlperf/llama2_70b/run_with_docker.sh
+@@ -243,7 +243,7 @@ for _experiment_index in $(seq 1 "${NEXP}"); do
+         fi
+     fi
+ 
+-    _run_env=("${_base_exec_env[@]}" --env="SEED=${RANDOM}")
++    _run_env=("${_base_exec_env[@]}" --env="SEED=$(( $(od -An -N4 -tu4 /dev/urandom) & 0x7fffffff ))")
+ 
+     set +e
+     docker exec "${_run_env[@]}" "${_cont_name}" bash -lc "${_run_cmd}" \
+diff --git a/primus/backends/megatron_bridge/recipes/mlperf_llama2_70b/llama2_custom.py b/primus/backends/megatron_bridge/recipes/mlperf_llama2_70b/llama2_custom.py
+index 5bb411f0..f61de520 100644
+--- a/primus/backends/megatron_bridge/recipes/mlperf_llama2_70b/llama2_custom.py
++++ b/primus/backends/megatron_bridge/recipes/mlperf_llama2_70b/llama2_custom.py
+@@ -414,7 +414,24 @@ def llama2_70b_lora_config(**user_kwargs: Unpack[Llama2CustomKwargs]) -> ConfigC
+                     "MLLOG_LOWEST_NUMERICAL_PRECISION_LINEAR", "mxfp4"
+                 ),
+             )
++            # HPE: opt_learning_rate_training_steps is the step where the cosine
++            # curve ends (lr_decay_iters), which can differ from train_iters.
++            _decay = kw.get("lr_decay_iters") or int(os.getenv("PRIMUS_LR_DECAY_ITERS", "0") or 0)
++            if _decay and isinstance(init_cfg, dict) and "opt_lr_training_steps" in init_cfg:
++                init_cfg["opt_lr_training_steps"] = int(_decay)
+             _sft_logger.log_init_params(init_cfg)
++            # HPE: MLPerf Training 6.1 makes these three keys mandatory; the
++            # primus_mllog version in the image only knows the 6.0 name
++            # (lowest_numerical_precision_linear). Linear layers are MXFP4; the
++            # MXFP4 recipe and the FP8 healing phase keep FP8 attention off
++            # (fp8_dot_product_attention=False) and reduce gradients in bf16
++            # (grad_reduce_in_fp32=False, no FP8 param gather).
++            for _key, _env, _default in (
++                ("lowest_numerical_precision_in_linear", "MLLOG_LOWEST_NUMERICAL_PRECISION_IN_LINEAR", "mxfp4"),
++                ("lowest_numerical_precision_in_attn", "MLLOG_LOWEST_NUMERICAL_PRECISION_IN_ATTN", "bfloat16"),
++                ("lowest_numerical_precision_in_comm", "MLLOG_LOWEST_NUMERICAL_PRECISION_IN_COMM", "bfloat16"),
++            ):
++                _sft_logger._logger.log_event(key=_key, value=os.getenv(_env, _default))
+         except Exception as exc:
+             _orig_log_rank_0(f"MLPerf logging init failed ({type(exc).__name__}: {exc}) — disabled")
+             _sft_logger = None

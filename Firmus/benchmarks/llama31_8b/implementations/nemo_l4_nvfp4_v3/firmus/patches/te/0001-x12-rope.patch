@@ -1,0 +1,362 @@
+--- a/transformer_engine/pytorch/attention/rope.py
++++ b/transformer_engine/pytorch/attention/rope.py
+@@ -175,6 +175,292 @@
+         return grad_input, None, None, None, None, None, None, None, None
+ 
+ 
++# ---------------------------------------------------------------------------------------------
++# auto_kernel X12 overlay (2026-09-21): AK_X12_ROPE=1 routes the fused QKV rotary embedding --
++# forward and backward, the training call (sbhd, not interleaved, cp_size 1, no start positions,
++# bf16) -- to the Triton module at AK_X12_KERNEL_DIR/fused_qkv_rope.py (the rope_qkv task's
++# winner: libdevice cos/sin, TE's fma order, exact negation; byte-identical to
++# tex.fused_qkv_rope_forward / _backward on the task's nine cases).  Any other call keeps TE's
++# kernels.  Rank 0 prints one ARMED line at the first forward.
++# (Llama 3.1 8B campaign, 2026-10-02: TE 2.20.0+131157b5's rope.py is byte-identical to TE 2.19's, so these hunks apply
++#  unchanged; a first-call byte check against TE's kernels was added below.)
++# (sec 168: ported to the 20260929 image -- rope.py is identical there (sha 86d7e3f8), so the hunks are
++# unchanged; mcore 0.20 attention.py:1609 still calls apply_fused_qkv_rotary_pos_emb with the defaults
++# above, and FP8 attention (fp8_dpa, not fp8_mha) leaves q/k/v and dq/dk/dv in bf16 around this op.)
++# ---------------------------------------------------------------------------------------------
++import os as _ak_os
++import sys as _ak_sys
++_AK_X12_ROPE = _ak_os.environ.get("AK_X12_ROPE", "0") == "1"
++_ak_x12_mod = None
++_ak_x12_rope = None
++_ak_x12_announced = False
++if _AK_X12_ROPE:
++    _ak_root = _ak_os.environ.get("AK_X12_KERNEL_DIR", "/opt/firmus/ak/x12")
++    if _ak_root not in _ak_sys.path:
++        _ak_sys.path.insert(0, _ak_root)
++    import fused_qkv_rope as _ak_x12_mod
++
++
++def _ak_x12_armed(tensor_format, interleaved, cp_size, start_positions, t):
++    return (_AK_X12_ROPE and _ak_x12_mod is not None and tensor_format == "sbhd" and not interleaved
++            and cp_size == 1 and start_positions is None and t.dtype == torch.bfloat16 and t.dim() == 4)
++
++
++def _ak_x12_instance(device):
++    global _ak_x12_rope
++    if _ak_x12_rope is None:
++        _ak_x12_rope = _ak_x12_mod.FusedQKVRoPE(device=device)
++    return _ak_x12_rope
++
++
++# --- auto_kernel X12 first-call byte check (Llama 3.1 8B campaign, 2026-10-02) --------------------------------------
++# The gpt-oss overlay had no live check (its E0 rested on the rope_qkv task's cases under TE 2.15 / Triton 3.6).  Here the
++# first eager forward and the first eager backward (warm-up iteration 0, before any graph capture) also run TE's own
++# tex.fused_qkv_rope_forward / _backward on the same inputs and compare the outputs as bytes, on every rank.  Rank 0 prints
++# one line each; a mismatch raises.
++_AK_X12_CHECKED = {"fwd": False, "bwd": False}
++
++
++def _ak_x12_bytes_equal(a, b):
++    return (a.shape == b.shape and a.dtype == b.dtype
++            and bool(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))))
++
++
++def _ak_x12_check(kind, ours, ref, desc):
++    _AK_X12_CHECKED[kind] = True
++    oks = [_ak_x12_bytes_equal(o, r) for o, r in zip(ours, ref)]
++    ok = len(oks) == len(ref) and all(oks)
++    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++    if rank == 0:
++        print("[auto_kernel x12] first-call check: {} {} byte-exact v tex.fused_qkv_rope_{}: {} ({})".format(
++            kind, desc, "forward" if kind == "fwd" else "backward", ok, oks), flush=True)
++    if not ok:
++        raise RuntimeError("[auto_kernel x12] E0 self-check FAILED ({}): {}".format(kind, oks))
++
++
++# --- auto_kernel QKV-pack (2026-10-02, sec 168) -------------------------------------------------------------------
++# Under FP8 attention (Float8CurrentScaling) TE's combine_and_quantize concatenates the bf16 q, k, v into one buffer
++# (torch.cat, ~92 us and 0.5 GB of traffic per layer) and quantizes that buffer with one scale.  With AK_QKV_PACK=1 the
++# rope_qkv module's forward kernel writes q, k, v into three contiguous views of ONE flat buffer laid out exactly as that
++# cat would build it ([q | k | v], each in its own [s, b, heads, d] order); the kernel, its grid and its stores are the
++# module's own (FusedQKVRoPE.forward, re-launched here with packed output pointers).  The matching hunk in TE's
++# dot_product_attention/utils.py quantizes the adjacent views in place instead of concatenating them.
++_AK_QKV_PACK = _ak_os.environ.get("AK_QKV_PACK", "0") == "1"
++# --- auto_kernel QKVA (Llama 3.1 8B campaign, 2026-10-02): with AK_QKV_AMAX=1 the packed forward launches
++# fused_qkv_rope_amax._qkv_rope_fwd_amax_kernel (the same stores) which also writes one partial max |y| per (s, b)
++# position; the packed buffer's pointer, size and partials are registered here, and the FP8 current-scaling quantize of
++# exactly that buffer (the ak_l8b_fp8cs patch) takes its amax from them instead of a pass over the buffer.
++_AK_QKV_AMAX = _ak_os.environ.get("AK_QKV_AMAX", "0") == "1"
++_AK_QKVA_REG = {"ptr": None, "numel": 0, "part": None, "launches": 0, "direct": None, "deferred": None,
++                "direct_ok": False, "deferred_launches": 0}
++_ak_x12a_mod = None
++if _AK_X12_ROPE and _AK_QKV_AMAX:
++    import fused_qkv_rope_amax as _ak_x12a_mod
++# --- auto_kernel QKV direct (Llama 3.1 8B campaign, 2026-10-07): with AK_QKV_DIRECT=1 (needs AK_QKV_AMAX=1 and the
++# fp8cs2 overlay) every packed forward also registers what the FP8 quantize of its buffer needs to write the FP8 bytes
++# straight from the RoPE's own inputs (fused_qkv_rope_fp8._qkv_rope_fp8_kernel: the same bf16 values, times the scale,
++# TE's satfinite cast).  Once the fp8cs2 patch has checked that path against tex.quantize of a written buffer (its first
++# eager quantize; it then sets _AK_QKVA_REG["direct_ok"]), a packed forward under CUDA-graph capture launches only
++# fused_qkv_rope_fp8._qkv_rope_amax_only_kernel (the partial maxima, no q / k / v stores) and leaves the bf16 buffer
++# unwritten: TE's FP8 attention (current scaling, O in F16) saves only the FP8 q, k, v, and combine_and_quantize reads
++# the buffer only through that quantize.  A deferred buffer the next packed forward finds unquantized raises.
++_AK_QKV_DIRECT = _ak_os.environ.get("AK_QKV_DIRECT", "0") == "1" and _AK_QKV_AMAX
++# the partial-maxima pass: kernel version (1: five block reductions, 2: three) and warps per (s, b) position
++_AK_QKV_DIRECT_P1 = _ak_os.environ.get("AK_QKV_DIRECT_P1", "1")
++_AK_QKV_DIRECT_W1 = int(_ak_os.environ.get("AK_QKV_DIRECT_W1", "2"))
++_ak_x12d_mod = None
++if _AK_X12_ROPE and _AK_QKV_DIRECT:
++    import fused_qkv_rope_fp8 as _ak_x12d_mod
++# --- auto_kernel QKV gradient amaxes + QKV direct in CUDA (Llama 3.1 8B campaign, 2026-10-07): ak_l8b_qkvx (a CUDA
++# extension next to the Triton modules in AK_X12_KERNEL_DIR) --
++#  * AK_QKV_GRAD_AMAX=1: the RoPE backward is ak_l8b_qkvx.rope_bwd_amax -- _qkv_rope_bwd_kernel's arithmetic and stores,
++#    plus in the same pass the two amaxes the QKV linear's NVFP4 gradient quantizer takes of the result (the pre-RHT
++#    amax and the post-RHT amax of the columnwise copy, ak_l8b_rht_epi.cuh: TE's own amax instructions).  They are
++#    registered with the NVFP4P patch exactly as its fused norm backward registers the residual gradient's
++#    (ak_l8b_nvfp4p_patch._STATE["bwd_reg"], site "rope_bwd"): the next tex.quantize of exactly that tensor (the QKV
++#    linear's grad_output, a view of it) runs the cast with them, and its separate amax pass (ak_l8b_nvfp4b.rht_amax,
++#    PROF-L2k 39.5 us per layer) is gone.  The first eager call checks the gradient against TE (the x12 check below) and
++#    the amaxes against ak_l8b_nvfp4b.rht_amax of the same tensor, bit for bit; the NVFP4P patch checks the quantize with
++#    them against TE's own quantize.  Only without a pending registration, for d 128, (s * b) % 32 == 0, nq even.
++#  * AK_QKV_DIRECT_IMPL=cuda: QKV direct's two passes are ak_l8b_qkvx.rope_fwd_partials and rope_fwd_fp8 (the same
++#    partials and bytes as the Triton kernels; one CTA per s with each thread's angles in registers), handed to the
++#    fp8cs patch (version 3) as callables in the registry ("p1", "p2") so its eager check proves what runs under capture.
++_AK_QKV_GRAD_AMAX = _ak_os.environ.get("AK_QKV_GRAD_AMAX", "0") == "1"
++_AK_QKV_DIRECT_IMPL = _ak_os.environ.get("AK_QKV_DIRECT_IMPL", "triton")
++_AK_QKV_DIRECT_P1_REV = _ak_os.environ.get("AK_QKV_DIRECT_P1_REV", "0") == "1"
++_AK_QKV_DIRECT_P2_REV = _ak_os.environ.get("AK_QKV_DIRECT_P2_REV", "1") == "1"
++# kernel versions (ak_l8b_qkvx): 2 = any shape; 30-35 / 30-34 = version 3, the Llama shape compile-time (h 8 groups of
++# nq 4 + 2 heads, b 2), its CTA-shape variants -- taken only for that shape, version 2 otherwise
++_AK_QKVX_BWD_VER = int(_ak_os.environ.get("AK_QKVX_BWD_VER", "2"))
++_AK_QKVX_P1_VER = int(_ak_os.environ.get("AK_QKVX_P1_VER", "2"))
++_AK_QKVX_P2_VER = int(_ak_os.environ.get("AK_QKVX_P2_VER", "2"))
++_ak_qkvx = None
++if _AK_X12_ROPE and (_AK_QKV_GRAD_AMAX or (_AK_QKV_DIRECT and _AK_QKV_DIRECT_IMPL == "cuda")):
++    import ak_l8b_qkvx as _ak_qkvx
++_AK_QKVG = {"checked": False, "fused": 0, "registered": 0, "skipped": 0}
++
++
++def _ak_qkvx_ver(ver, h, nq, b):
++    return ver if (ver < 30 or (h == 8 and nq == 4 and b == 2)) else 2
++
++
++def _ak_qkvx_direct(qkv, tab, same, d, b):
++    """the CUDA passes of QKV direct for this packed forward, as callables (None when the shape is not covered)"""
++    if (_ak_qkvx is None or _AK_QKV_DIRECT_IMPL != "cuda" or d != 128 or not 1 <= b <= 4 or not qkv.is_contiguous()
++            or qkv.dtype != torch.bfloat16 or qkv.data_ptr() % 16 != 0):
++        return None
++    v1 = _ak_qkvx_ver(_AK_QKVX_P1_VER, qkv.size(2), qkv.size(3) // 128 - 2, b)
++    v2 = _ak_qkvx_ver(_AK_QKVX_P2_VER, qkv.size(2), qkv.size(3) // 128 - 2, b)
++    return (lambda part: _ak_qkvx.rope_fwd_partials(qkv, tab, same, part, _AK_QKV_DIRECT_P1_REV, v1),
++            lambda ws, data: _ak_qkvx.rope_fwd_fp8(qkv, tab, same, ws, data, _AK_QKV_DIRECT_P2_REV, v2),
++            "{} / {}".format(v1, v2))
++
++
++def _ak_qkvg_backward(rope, dq, dk, dv, q_freqs, k_freqs, split, s, b, d):
++    """ak_l8b_qkvx.rope_bwd_amax with its amaxes registered for the next gradient quantize; None: not taken"""
++    patch = _ak_sys.modules.get("ak_l8b_nvfp4p_patch")
++    st = getattr(patch, "_STATE", None) if patch is not None else None
++    if not getattr(patch, "_ARMED", False) or not isinstance(st, dict) or "bwd_reg" not in st:
++        return None
++    qs, ks, vs = split
++    nq = qs // d
++    rows = s * b
++    if (d != 128 or ks != d or vs != d or qs % d != 0 or (nq + 2) % 2 != 0 or rows % 32 != 0 or rows // 32 > 65535
++            or any(t.dtype != torch.bfloat16 for t in (dq, dk, dv))):
++        return None
++    tab, same = rope._angles(q_freqs.contiguous(), k_freqs.contiguous(), s, d)
++    mask = int(st.get("rht_mask", 0xD7E8))
++    ver = _ak_qkvx_ver(_AK_QKVX_BWD_VER, dk.size(2), nq, b)
++    dqkv, am = _ak_qkvx.rope_bwd_amax(dq.contiguous(), dk.contiguous(), dv.contiguous(), tab, same, mask, ver)
++    _AK_QKVG["fused"] += 1
++    if not _AK_QKVG["checked"] and not torch.cuda.is_current_stream_capturing():
++        _AK_QKVG["checked"] = True
++        ref = patch._ext_b().rht_amax(dqkv.view(rows, -1), mask)
++        ok = bool(torch.equal(ref.view(torch.int32), am.view(torch.int32)))
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        if rank == 0:
++            import hashlib as _h
++            path = _ak_qkvx.__file__
++            print("[auto_kernel x12] RoPE backward + the gradient quantizer's pre/post-RHT amaxes ARMED (dqkv {}, mask "
++                  "{:#x}): module {} sha256={} v{}; amaxes ({:.6g}, {:.6g}) bit-equal to ak_l8b_nvfp4b.rht_amax of the "
++                  "gradient: {}".format(list(dqkv.shape), mask, _ak_os.path.basename(path),
++                                        _h.sha256(open(path, "rb").read()).hexdigest()[:16], ver, float(am[0]),
++                                        float(am[1]), ok), flush=True)
++        if not ok:
++            raise RuntimeError("[auto_kernel x12] E0 self-check FAILED for the RoPE backward's amaxes: {} v {}".format(
++                am.tolist(), ref.tolist()))
++    if st["bwd_reg"] is None:
++        import weakref
++        st["bwd_reg"] = {"ref": weakref.ref(dqkv), "ver": dqkv._version, "a_pre": am[0:1], "a_post": am[1:2],
++                         "mask": mask, "site": "rope_bwd"}
++        _AK_QKVG["registered"] += 1
++    else:
++        _AK_QKVG["skipped"] += 1
++    return dqkv
++
++
++def _ak_x12_packed_forward(inst, qkv, q_freqs, k_freqs, split):
++    s, b, h, total = qkv.shape
++    qs, ks, vs = split
++    d = q_freqs.shape[-1]
++    assert total == qs + ks + vs and ks == d and vs == d and qs % d == 0
++    nq = qs // d
++    nqe, nke = s * b * h * nq * d, s * b * h * d
++    flat = torch.empty(nqe + 2 * nke, dtype=qkv.dtype, device=qkv.device)
++    q = flat[:nqe].view(s, b, h * nq, d)
++    k = flat[nqe:nqe + nke].view(s, b, h, d)
++    v = flat[nqe + nke:].view(s, b, h, d)
++    tab, same = inst._angles(q_freqs, k_freqs, s, d)
++    if _ak_x12a_mod is not None:
++        part = torch.empty(s * b, dtype=torch.float32, device=qkv.device)
++        if _AK_QKVA_REG["deferred"] is not None and _AK_QKVA_REG["part"] is not None:
++            raise RuntimeError("[auto_kernel x12] a q|k|v buffer left unwritten (QKV direct) was never quantized")
++        direct = None
++        if _ak_x12d_mod is not None:
++            direct = dict(qkv=qkv, tab=tab, b=b, n_prog=s * b, nqe=nqe, nke=nke, D=d, NQ=nq, H=h, TOTAL=total,
++                          SAME=same)
++            cu = _ak_qkvx_direct(qkv, tab, same, d, b)
++            if cu is not None:
++                direct.update(p1=cu[0], p2=cu[1], impl="cuda v{} p1 rev {} p2 rev {}".format(
++                    cu[2], int(_AK_QKV_DIRECT_P1_REV), int(_AK_QKV_DIRECT_P2_REV)))
++        if direct is not None and _AK_QKVA_REG["direct_ok"] and torch.cuda.is_current_stream_capturing():
++            if "p1" in direct:
++                direct["p1"](part)
++            else:
++                k1 = (_ak_x12d_mod._qkv_rope_amax_only_kernel2 if _AK_QKV_DIRECT_P1 == "2"
++                      else _ak_x12d_mod._qkv_rope_amax_only_kernel)
++                k1[(s * b,)](qkv, tab, part, b, D=d, NQ=nq, H=h, TOTAL=total, SAME=same,
++                             num_warps=_AK_QKV_DIRECT_W1)
++            deferred = direct
++            _AK_QKVA_REG["deferred_launches"] += 1
++        else:
++            _ak_x12a_mod._qkv_rope_fwd_amax_kernel[(s * b,)](qkv, tab, q, k, v, part, b,
++                                                             D=d, NQ=nq, H=h, TOTAL=total, SAME=same,
++                                                             num_warps=_ak_x12_mod._NUM_WARPS)
++            deferred = None
++        _AK_QKVA_REG.update(ptr=flat.data_ptr(), numel=flat.numel(), part=part,
++                            launches=_AK_QKVA_REG["launches"] + 1, direct=direct, deferred=deferred)
++    else:
++        _ak_x12_mod._qkv_rope_fwd_kernel[(s * b,)](qkv, tab, q, k, v, b,
++                                                   D=d, NQ=nq, H=h, TOTAL=total, SAME=same,
++                                                   num_warps=_ak_x12_mod._NUM_WARPS)
++    return q, k, v
++# -------------------------------------------------------------------------------------------------------------------
++
++
++def _ak_x12_forward(qkv, q_freqs, k_freqs, split):
++    global _ak_x12_announced
++    if not _ak_x12_announced:
++        _ak_x12_announced = True
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        if rank == 0:
++            import hashlib as _h
++            path = _ak_x12_mod.__file__
++            sha = _h.sha256(open(path, "rb").read()).hexdigest()[:16]
++            print("[auto_kernel x12] fused QKV RoPE ARMED: qkv {} split {} freqs {} module {} sha256={}".format(
++                tuple(qkv.shape), list(split), tuple(q_freqs.shape), path, sha), flush=True)
++    s, b, h, total = qkv.shape
++    d = q_freqs.shape[-1]
++    qs, ks, vs = split
++    if _AK_QKV_PACK:  # auto_kernel QKV-pack (sec 168): the same kernel and stores, q/k/v as views of one buffer
++        q, k, v = _ak_x12_packed_forward(_ak_x12_instance(qkv.device), qkv.contiguous(), q_freqs.contiguous(),
++                                         k_freqs.contiguous(), list(split))
++    else:
++        q, k, v = _ak_x12_instance(qkv.device).forward(qkv.contiguous(), q_freqs.contiguous(), k_freqs.contiguous(), list(split))
++    # TE's output shapes: q [s, b, h * (qs // d), d], k and v [s, b, h * (ks // d), d]
++    out = (q.view(s, b, h * (qs // d), d), k.view(s, b, h * (ks // d), d), v.view(s, b, h * (vs // d), d))
++    if not _AK_X12_CHECKED["fwd"] and not torch.cuda.is_current_stream_capturing():
++        ref = tex.fused_qkv_rope_forward(qkv.contiguous(), q_freqs.contiguous(), k_freqs.contiguous(), None, list(split),
++                                         QKVFormat["sbhd"], False, 1, 0)
++        _ak_x12_check("fwd", out, ref, "qkv {} split {}".format(tuple(qkv.shape), list(split)))
++        del ref
++    return out
++
++
++def _ak_x12_backward(dq, dk, dv, q_freqs, k_freqs, split):
++    s, b = dq.shape[0], dq.shape[1]
++    d = q_freqs.shape[-1]
++    qs, ks, vs = split
++    h = dk.shape[2] * d // ks
++    rope = _ak_x12_instance(dq.device)
++    dqkv = None
++    if _AK_QKV_GRAD_AMAX and _ak_qkvx is not None:     # auto_kernel QKV gradient amaxes (2026-10-07)
++        dqkv = _ak_qkvg_backward(rope, dq.contiguous().view(s, b, h * (qs // d), d),
++                                 dk.contiguous().view(s, b, h * (ks // d), d), dv.contiguous().view(s, b, h * (vs // d), d),
++                                 q_freqs, k_freqs, list(split), s, b, d)
++    if dqkv is None:
++        dqkv = rope.backward(dq.contiguous().view(s, b, h * (qs // d), d), dk.contiguous().view(s, b, h * (ks // d), d),
++                             dv.contiguous().view(s, b, h * (vs // d), d), q_freqs.contiguous(), k_freqs.contiguous(),
++                             list(split))
++    out = dqkv.view(s, b, h, qs + ks + vs)
++    if not _AK_X12_CHECKED["bwd"] and not torch.cuda.is_current_stream_capturing():
++        ref = tex.fused_qkv_rope_backward(dq.contiguous(), dk.contiguous(), dv.contiguous(), q_freqs.contiguous(),
++                                          k_freqs.contiguous(), list(split), QKVFormat["sbhd"], False, 1, 0)
++        _ak_x12_check("bwd", (out,), (ref,), "dq {} split {}".format(tuple(dq.shape), list(split)))
++        del ref
++    return out
++
++
+ class FusedQKVRoPEFunc(torch.autograd.Function):
+     """
+     Function for FusedQKVRoPE
+@@ -209,17 +495,20 @@
+         assert qkv.is_contiguous(), "QKV Tensor should be contiguous."
+         assert q_freqs.is_contiguous(), "q_freqs Tensor should be contiguous."
+         assert k_freqs.is_contiguous(), "k_freqs Tensor should be contiguous."
+-        output = tex.fused_qkv_rope_forward(
+-            qkv,
+-            q_freqs,
+-            k_freqs,
+-            start_positions,
+-            qkv_split_arg_list,
+-            QKVFormat[tensor_format],
+-            interleaved,
+-            cp_size,
+-            cp_rank,
+-        )
++        if _ak_x12_armed(tensor_format, interleaved, cp_size, start_positions, qkv):
++            output = _ak_x12_forward(qkv, q_freqs, k_freqs, qkv_split_arg_list)
++        else:
++            output = tex.fused_qkv_rope_forward(
++                qkv,
++                q_freqs,
++                k_freqs,
++                start_positions,
++                qkv_split_arg_list,
++                QKVFormat[tensor_format],
++                interleaved,
++                cp_size,
++                cp_rank,
++            )
+         ctx.save_for_backward(q_freqs, k_freqs)
+         ctx.tensor_format = tensor_format
+         ctx.qkv_split_arg_list = qkv_split_arg_list
+@@ -239,18 +528,22 @@
+         grad_output_k = grad_output_k.contiguous()
+         grad_output_v = grad_output_v.contiguous()
+ 
+-        grad_input = tex.fused_qkv_rope_backward(
+-            grad_output_q,
+-            grad_output_k,
+-            grad_output_v,
+-            q_freqs,
+-            k_freqs,
+-            ctx.qkv_split_arg_list,
+-            QKVFormat[ctx.tensor_format],
+-            ctx.interleaved,
+-            ctx.cp_size,
+-            ctx.cp_rank,
+-        )
++        if _ak_x12_armed(ctx.tensor_format, ctx.interleaved, ctx.cp_size, None, grad_output_q):
++            grad_input = _ak_x12_backward(grad_output_q, grad_output_k, grad_output_v, q_freqs, k_freqs,
++                                          ctx.qkv_split_arg_list)
++        else:
++            grad_input = tex.fused_qkv_rope_backward(
++                grad_output_q,
++                grad_output_k,
++                grad_output_v,
++                q_freqs,
++                k_freqs,
++                ctx.qkv_split_arg_list,
++                QKVFormat[ctx.tensor_format],
++                ctx.interleaved,
++                ctx.cp_size,
++                ctx.cp_rank,
++            )
+ 
+         return grad_input, None, None, None, None, None, None, None, None
+ 

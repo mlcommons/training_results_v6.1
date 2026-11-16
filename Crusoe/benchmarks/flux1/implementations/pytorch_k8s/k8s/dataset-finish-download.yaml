@@ -1,0 +1,56 @@
+# Finishes the Flux.1 reference-data download onto the shared PVC (coco val +
+# empty_encodings) via AMD's mlc-r2-downloader (md5-verified, public bucket).
+# Idempotent — md5-matching files are skipped; safe to re-run.
+# Logs: kubectl logs -f job/flux-finish-download
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flux-finish-download
+  labels: { app: mlperf-training-v60, role: dataset-download }
+spec:
+  backoffLimit: 6
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: { app: mlperf-training-v60, role: dataset-download }
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector: { crusoe.ai/nodepool.id: 4901849f-1a0a-4e28-bbd6-bb48fbc8e9b5 }
+      containers:
+        - name: dl
+          image: mirror.gcr.io/library/ubuntu:24.04
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq wget ca-certificates coreutils curl >/dev/null
+              ROOT=/data/datasets/flux1
+              # NOTE: mlc-r2-downloader FLATTENS into -d (the .uri base is the leaf
+              # dir), so point -d at the per-dataset subdir process_ref_data.sh reads.
+              mkdir -p "$ROOT/coco_preprocessed" "$ROOT/empty_encodings"
+              # Reclaim any coco shards a prior (flat) run left in $ROOT so md5-verify
+              # skips them instead of re-downloading. coco shards are *-of-00129.arrow.
+              for f in "$ROOT"/data-*-of-00129.arrow; do
+                [ -e "$f" ] || continue
+                mv -f "$f" "$ROOT/coco_preprocessed/"
+              done
+              curl -fsSL https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh > /tmp/dl.sh
+              echo "==================== flux-1-coco-preprocessed ===================="
+              bash /tmp/dl.sh -d "$ROOT/coco_preprocessed" "https://training.mlcommons-storage.org/metadata/flux-1-coco-preprocessed.uri"
+              echo "==================== flux-1-empty-encodings ===================="
+              bash /tmp/dl.sh -d "$ROOT/empty_encodings" "https://training.mlcommons-storage.org/metadata/flux-1-empty-encodings.uri"
+              echo "==================== verify ===================="
+              echo "coco  .arrow: $(ls "$ROOT"/coco_preprocessed/*.arrow 2>/dev/null | wc -l) (expect 129)"
+              echo "empty_encodings:"; ls -la "$ROOT"/empty_encodings 2>/dev/null | head
+              echo "ALL_DONE"
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits:   { cpu: "8", memory: 16Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: mlperf-training-shared }

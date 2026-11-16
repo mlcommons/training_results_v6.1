@@ -1,0 +1,44 @@
+batch_size = 16
+dataset = "debug"
+
+# Keep the model and collate paths configured together.
+compacted_preprocessor = @cp/env_int()
+cp/env_int.key = "COMPACTED_PREPROCESSOR"
+cp/env_int.default = 1
+make_model.use_compacted_preprocessor = %compacted_preprocessor
+make_train_test_dataloaders.use_compacted_preprocessor = %compacted_preprocessor
+make_streaming_dataloader.use_compacted_preprocessor = %compacted_preprocessor
+make_persistent_streaming_dataloader.use_compacted_preprocessor = %compacted_preprocessor
+
+# model parameters
+make_model.dataset = %dataset
+
+# dense model optimizer
+dense_optimizer_factory_and_class.learning_rate = 0.001
+dense_optimizer_factory_and_class.optimizer_name = "Adam"
+dense_optimizer_factory_and_class.momentum = 0
+dense_optimizer_factory_and_class.weight_decay = 0
+dense_optimizer_factory_and_class.eps = 1e-8
+dense_optimizer_factory_and_class.betas = (0.95, 0.999)
+
+# sparse model optimizer
+sparse_optimizer_factory_and_class.learning_rate = 0.001
+sparse_optimizer_factory_and_class.optimizer_name = "RowWiseAdagrad"
+sparse_optimizer_factory_and_class.momentum = 0
+sparse_optimizer_factory_and_class.weight_decay = 0
+sparse_optimizer_factory_and_class.eps = 1e-8
+sparse_optimizer_factory_and_class.betas = (0.95, 0.999)
+
+# dataloader configs
+make_train_test_dataloaders.batch_size = %batch_size
+make_train_test_dataloaders.dataset_type = %dataset
+make_train_test_dataloaders.train_split_percentage = 0.75
+
+# train loop variables
+train_loop.num_batches = 10
+train_loop.num_epochs = 1000
+train_loop.output_trace = True
+train_loop.metric_log_frequency = 10
+
+# logger variables
+MetricsLogger.tensorboard_log_path = "/tmp/tensorboard_log_path.log"

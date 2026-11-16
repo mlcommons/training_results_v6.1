@@ -1,0 +1,133 @@
+--- a/transformer_engine/pytorch/quantization.py
++++ b/transformer_engine/pytorch/quantization.py
+@@ -52,6 +52,13 @@
+ _NVFP4_SUPPORT: Optional[Tuple[bool, str]] = None
+ _FP8_BLOCK_SCALING_SUPPORT: Optional[Tuple[bool, str]] = None
+ 
++# LoRA perf patch: batch the delayed-scaling amax reductions of per-layer autocast regions.
++# It needs the fused update kernel, because only that kernel skips rows with zero amax.
++_batch_ds_amax = (
++    os.getenv("NVTE_LORA_PATCH_BATCH_DPA_AMAX", "0") == "1"
++    and not int(os.getenv("NVTE_UNFUSED_FP8_UPDATE", "0"))
++)
++
+ 
+ @dataclasses.dataclass(frozen=True)
+ class QuantizerRole:
+@@ -410,6 +417,12 @@
+         default_factory=dict
+     )
+     skip_fp8_weight_update_tensor: Optional[torch.Tensor] = None
++    # NVTE_LORA_PATCH_BATCH_DPA_AMAX state, see FP8GlobalStateManager._batched_forward_reduction
++    batch_fwd_in_pass: bool = False
++    batch_fwd_pending: bool = False
++    batch_bwd_pending: bool = False
++    batch_last_layer_ran: bool = False
++    batch_max_layer_number: int = 0
+ 
+ 
+ class FP8GlobalStateManager:
+@@ -658,6 +671,59 @@
+         forward: bool = True,
+     ) -> None:
+         """Delayed scaling only. Concatenate, reduce, and split amaxes in the global buffer."""
++        if _batch_ds_amax and not forward:
++            cls._defer_backward_reduction()
++            return
++        cls._reduce_and_update_fp8_tensors(forward)
++
++    @classmethod
++    def _batched_forward_reduction(cls) -> None:
++        """Reduce the forward amaxes only at the first and at the last layer exit of a pass.
++
++        At a skipped exit, the amaxes stay in amax_history[0]. The update kernel does
++        not change a row that has zero amax. Thus each row gets the same update with
++        the same amax as in the per-layer reduction. The first exit also reduces the
++        amaxes that eval passes added.
++        """
++        qstate = cls.quantization_state
++        if not qstate.batch_fwd_in_pass:
++            qstate.batch_fwd_in_pass = True
++        elif qstate.batch_last_layer_ran:
++            qstate.batch_fwd_in_pass = False
++        else:
++            qstate.batch_fwd_pending = True
++            return
++        qstate.batch_fwd_pending = False
++        qstate.batch_last_layer_ran = False
++        cls._reduce_and_update_fp8_tensors(forward=True)
++
++    @classmethod
++    def _defer_backward_reduction(cls) -> None:
++        """Keep the backward amaxes until the next forward pass starts (see autocast_enter)."""
++        qstate = cls.quantization_state
++        if qstate.batch_fwd_pending:
++            warnings.warn(
++                "NVTE_LORA_PATCH_BATCH_DPA_AMAX: last layer not found in the forward pass."
++                " Forward amaxes are reduced late, in the backward pass.",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++            qstate.batch_fwd_pending = False
++            cls._reduce_and_update_fp8_tensors(forward=True)
++        qstate.batch_fwd_in_pass = False
++        qstate.batch_bwd_pending = True
++
++    @classmethod
++    def batch_mark_layer_forward(cls, layer_number: int) -> None:
++        """Record that the layer with the highest number ran forward."""
++        qstate = cls.quantization_state
++        if layer_number >= qstate.batch_max_layer_number:
++            qstate.batch_max_layer_number = layer_number
++            qstate.batch_last_layer_ran = True
++
++    @classmethod
++    def _reduce_and_update_fp8_tensors(cls, forward: bool) -> None:
++        """Original reduce_and_update_fp8_tensors: reduce and update all amaxes now."""
+         # global_amax_buffer should only be non-empty for fp8 delayed scaling
+         qstate = cls.quantization_state
+         for (
+@@ -753,6 +819,10 @@
+ 
+         if qstate.autocast_depth == 0:
+             qstate.is_first_fp8_module = True
++            if _batch_ds_amax and qstate.batch_bwd_pending and torch.is_grad_enabled():
++                # Backward amaxes of the last backward pass, before a module uses their scales
++                qstate.batch_bwd_pending = False
++                cls._reduce_and_update_fp8_tensors(forward=False)
+         qstate.autocast_depth += 1
+ 
+         if enabled:
+@@ -779,7 +849,10 @@
+         if enabled and qstate.autocast_depth == 0 and not _graph and torch.is_grad_enabled():
+             # delayed scaling only function, for other recipes (current scaling with any granularity),
+             # this is noop for other recipes because cls.global_amax_buffer is empty list
+-            cls.reduce_and_update_fp8_tensors(forward=True)
++            if _batch_ds_amax:
++                cls._batched_forward_reduction()
++            else:
++                cls.reduce_and_update_fp8_tensors(forward=True)
+ 
+     @classmethod
+     def copy_forward_fp8_meta_tensors_for_recompute(cls, fp8_meta: Dict[str, Any]) -> None:
+--- a/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py
+@@ -406,6 +406,8 @@
+ _dpa_fp8ds_amax_algo = os.getenv("NVTE_DPA_FP8DS_AMAX_ALGO", "most_recent")
+ _dpa_fp8ds_amax_histlen = int(os.getenv("NVTE_DPA_FP8DS_AMAX_HISTLEN", "1"))
+ _dpa_fp8ds_reduce_amax = os.getenv("NVTE_DPA_FP8DS_REDUCE_AMAX", "1") == "1"
++# LoRA perf patch: batch the delayed-scaling amax reductions of per-layer autocast regions
++_batch_ds_amax = os.getenv("NVTE_LORA_PATCH_BATCH_DPA_AMAX", "0") == "1"
+ 
+ 
+ # Plugin system: override FlashAttention and get_attention_backend if enabled
+@@ -2351,6 +2353,9 @@
+                 ], """DotProductAttention only supports "E4M3" and "E5M2" FP8 data types."""
+             else:
+                 fp8_output = False
++            if _batch_ds_amax and self.fp8 and torch.is_grad_enabled():
++                # Lets the batched amax reduction find the exit of the last layer
++                FP8GlobalStateManager.batch_mark_layer_forward(self.layer_number)
+ 
+             # checks for q/k/v shapes
+             assert (

@@ -1,0 +1,715 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import sys
+
+import hydra
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Subset
+import utils
+import custom_kernels.attn_bwd_hook as _attn_bwd_hook  # fused FP8 SDPA backward
+import custom_kernels.qkv_rope_hook as _qkv_rope_hook  # fused QKV RoPE + FP8 quantize chain
+import custom_kernels.norm_bwd_hook as _norm_bwd_hook  # single-pass fused RMSNorm backward
+import custom_kernels.residual_bias_hook as _rbf_hook  # proj bias in the GEMM epilogue, residual adds in the MoE combine / dispatch bwd
+import custom_kernels.moe_qperm_hook as _qperm_hook  # MoE permute fused with the MXFP8 quantize (pre-quantized grouped MLP input)
+import custom_kernels.moe_dglu_strip_hook as _dglu_hook  # routing probability + dbias out of the expert GEMM epilogues (probability in the combine, bias grads via ones-operand wgrad GEMMs)
+import custom_kernels.opt_side_stream_hook as _optss_hook  # per-bucket optimizer on a side stream inside the full-iteration graph
+import custom_kernels.grad_batch_hook as _gbatch_hook  # DDP main_grad writes of autograd-produced grads batched per bucket (one foreach launch, not one per parameter)
+import custom_kernels.sgw_hook as _sgw_hook  # single-grouped expert weights -- grouped-quantize output buffers sized to TE's uniform kernel's write extent
+
+_HOOKS = (
+    ("attn_bwd", _attn_bwd_hook),
+    ("qkv_rope", _qkv_rope_hook),
+    ("norm_bwd", _norm_bwd_hook),
+    ("residual_bias", _rbf_hook),
+    ("moe_qperm", _qperm_hook),
+    ("moe_dglu_strip", _dglu_hook),
+    ("opt_side_stream", _optss_hook),
+    ("grad_batch", _gbatch_hook),
+    ("sgw", _sgw_hook),
+)
+
+
+def _install_hooks():
+    names = [n for n, _ in _HOOKS]
+    spec = os.getenv("CUSTOM_OPTIMIZATIONS", "all").strip().lower()
+    if spec in ("", "none"):
+        enabled = set()
+    elif spec == "all":
+        enabled = set(names)
+    else:
+        enabled = {x.strip() for x in spec.split(",") if x.strip()}
+        unknown = sorted(enabled - set(names))
+        if unknown:
+            raise ValueError(f"CUSTOM_OPTIMIZATIONS={spec!r}: unknown hook(s) {unknown}; known: {names}")
+    rank = os.getenv("RANK", os.getenv("SLURM_PROCID", "0"))
+    for name, mod in _HOOKS:
+        on = name in enabled
+        sys.__stdout__.write(f"CUSTOM_OPTIMIZATIONS rank={rank} {name}: {'enabled' if on else 'disabled'}\n")
+        sys.__stdout__.flush()
+        if on:
+            mod.install()
+
+
+_install_hooks()
+
+from callback_warmup import WarmupCallback, create_mock_dataset_config
+from callback_logging import DeltaTimingCallback, MLPerfLoggingCallback, mllogger
+from megatron.bridge.models import GPTModelProvider
+from megatron.bridge.training.config import (
+    CheckpointConfig,
+    CommOverlapConfig,
+    ConfigContainer,
+    DistributedDataParallelConfig,
+    DistributedInitConfig,
+    GPTDatasetConfig,
+    LoggerConfig,
+    MixedPrecisionConfig,
+    OptimizerConfig,
+    ProfilingConfig,
+    RerunStateMachineConfig,
+    RNGConfig,
+    SchedulerConfig,
+    TrainingConfig,
+    ValidationConfig,
+)
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.bridge.training.gpt_step import forward_step
+from megatron.bridge.training.pretrain import pretrain
+from megatron.bridge.training.tokenizers.config import TokenizerConfig
+from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
+from megatron.core.transformer.cuda_graph_config import normalize_cuda_graph_modules
+import opt_kernels.qknorm_rope_patch as _qknorm_rope  # noqa: E402
+from omegaconf import OmegaConf
+
+OmegaConf.register_new_resolver("add", lambda x, y: x + y)
+OmegaConf.register_new_resolver("multiply", lambda x, y: x * y)
+OmegaConf.register_new_resolver("ceil_div", lambda x, y: (x + y - 1) // y)
+OmegaConf.register_new_resolver("floor_div", lambda x, y: x // y)
+OmegaConf.register_new_resolver("div", lambda x, y: x / y)
+OmegaConf.register_new_resolver("if", lambda x, y, z: y if x else z)
+OmegaConf.register_new_resolver("lt", lambda x, y: x < y)
+OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
+OmegaConf.register_new_resolver("neq", lambda x, y: x != y)
+OmegaConf.register_new_resolver("or", lambda *args: any(args))
+OmegaConf.register_new_resolver("min", lambda x, y: min(x, y))
+OmegaConf.register_new_resolver("floor", lambda x: int(x // 1))
+
+
+def _normalize_cuda_graph_modules(value):
+    modules = value
+    if isinstance(modules, str):
+        modules = [
+            stripped_module
+            for module in modules.split(",")
+            if (stripped_module := module.strip())
+        ]
+    normalized_modules, deprecated_scopes, _ = normalize_cuda_graph_modules(modules)
+    if deprecated_scopes:
+        raise ValueError(
+            "Deprecated CUDA graph module values are not supported; "
+            f"use CUDA_GRAPH_MODULES with module names only: {deprecated_scopes}"
+        )
+    return normalized_modules
+
+
+def get_data(config):
+    if config.model.data.mock_dataset:
+        return create_mock_dataset_config(config)
+
+    r = [6]
+    train_datasets = [f"/preproc_data/c4-train.en_{idx}_text_document" for idx in r]
+    train_datasets_weights = [50] * len(r)
+    val_test_path = "/preproc_data/c4-validation-91205-samples.en_text_document"
+
+    data_paths = [(train_datasets, train_datasets_weights), ([val_test_path], None), ([val_test_path], None)]
+
+    return GPTDatasetConfig(
+        blend_per_split=data_paths,
+        sequence_length=config.model.encoder_seq_length,
+        random_seed=config.model.seed,
+        dataloader_type="single",
+        num_workers=config.model.data.num_workers,
+        path_to_cache="/npy_index",
+        defer_npy_index_mmap=True,
+        fast_cache_load=True,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=True,
+        create_attention_mask=False,
+    )
+
+
+def evaluate_on_fixed_validation_window(eval_samples):
+    """Build the validation loader over the first eval_samples samples, sequentially, so every evaluation scores the same samples."""
+    from megatron.bridge.data import loaders
+
+    build_pretraining_data_loader = loaders.build_pretraining_data_loader
+
+    def build_fixed_window_validation_loader(dataset, consumed_samples, dataloader_type, *args, **kwargs):
+        # Bridge requests the "cyclic" sampler only for the validation loader.
+        if dataloader_type != "cyclic":
+            return build_pretraining_data_loader(dataset, consumed_samples, dataloader_type, *args, **kwargs)
+        return build_pretraining_data_loader(Subset(dataset, range(eval_samples)), 0, "single", *args, **kwargs)
+
+    loaders.build_pretraining_data_loader = build_fixed_window_validation_loader
+
+
+def get_model(config):
+    tp = config.model.tensor_model_parallel_size
+    ep = config.model.expert_model_parallel_size
+    pp = config.model.pipeline_model_parallel_size
+    pp_dtype = torch.bfloat16 if config.model.pipeline_model_parallel_size != 1 else None
+    vp = config.model.virtual_pipeline_model_parallel_size
+    cp = config.model.context_parallel_size
+    sp = config.model.sequence_parallel
+
+    # WAR for Megatron constraint: ETP * EP * PP must equal TP * CP * PP
+    # for DP-last mapping compatibility.
+    etp = tp * cp // ep
+    etp = 1
+    ep = int(os.getenv("EXPERT_PARALLEL", 1))
+
+    asym_pp_embed = config.model.account_for_embedding_in_pipeline_split
+    asym_pp_loss = config.model.account_for_loss_in_pipeline_split
+
+    if config.model.overwritten_attributes.num_layers is not None:
+        num_layers = config.model.overwritten_attributes.num_layers
+    else:
+        num_layers = 24
+
+    if config.model.clamped_quick_gelu_activation:
+        activation_func, activation_func_clamp_value, glu_linear_offset = quick_gelu, 7.0, 1.0
+    else:
+        activation_func, activation_func_clamp_value, glu_linear_offset = F.silu, None, 0.0
+
+    model_cfg = GPTModelProvider(
+        # GPT-OSS 20B architecture
+        num_layers=num_layers,
+        num_moe_experts=32,
+        # GPT-OSS base defaults
+        hidden_size=2880,
+        num_attention_heads=64,
+        num_query_groups=8,
+        ffn_hidden_size=2880,
+        kv_channels=64,
+        normalization="RMSNorm",
+        layernorm_epsilon=config.model.rmsnorm_eps,
+        init_method_std=0.008,
+        gated_linear_unit=True,
+        add_bias_linear=config.model.add_bias_linear,
+        share_embeddings_and_output_weights=False,
+        vocab_size=128256,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        bias_activation_fusion=True,
+        bias_dropout_fusion=False,
+        activation_func_clamp_value=activation_func_clamp_value,
+        glu_linear_offset=glu_linear_offset,
+        window_attn_skip_freq=2,
+        # position embeddings
+        rotary_base=150000,
+        # MoE settings
+        moe_router_topk=4,
+        moe_token_dispatcher_type=config.model.moe_token_dispatcher_type,
+        moe_ffn_hidden_size=2880,
+        moe_router_load_balancing_type=config.model.moe_router_load_balancing_type,
+        window_size=(config.model.sliding_window_keys - 1, 0),
+        softmax_type=config.model.attention_softmax_type,
+        qk_layernorm=config.model.qk_layernorm,
+        activation_func=activation_func,
+        # Parallelism configuration
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=pp,
+        virtual_pipeline_model_parallel_size=vp,
+        expert_tensor_parallel_size=etp,
+        expert_model_parallel_size=ep,
+        context_parallel_size=cp,
+        sequence_parallel=sp,
+        # CP comm
+        cp_comm_type=config.model.cp_comm_type,
+        # MoE
+        moe_grouped_gemm=config.model.moe_grouped_gemm,
+        moe_router_pre_softmax=config.model.moe_router_pre_softmax,
+        moe_flex_dispatcher_backend=config.model.moe_flex_dispatcher_backend,
+        moe_permute_fusion=config.model.moe_permute_fusion,
+        moe_hybridep_num_sms=config.model.moe_hybridep_num_sms,
+        moe_router_fusion=config.model.moe_router_fusion,
+        moe_router_force_load_balancing=config.model.moe_router_force_load_balancing,
+        # Pipeline configuration
+        pipeline_dtype=pp_dtype,
+        account_for_embedding_in_pipeline_split=asym_pp_embed,
+        account_for_loss_in_pipeline_split=asym_pp_loss,
+        # Model configuration
+        seq_length=config.model.encoder_seq_length,
+        init_model_with_meta_device=config.model.mcore_fsdp,
+        position_embedding_type=config.model.position_embedding_type,
+        # Optimization features
+        cross_entropy_loss_fusion=config.model.cross_entropy_loss_fusion,
+        cross_entropy_fusion_impl=config.model.cross_entropy_fusion_impl,
+        cuda_graph_impl=config.model.overwritten_attributes.cuda_graph_implementation,
+        fused_single_qkv_rope=config.model.fused_single_qkv_rope
+        and (not config.model.qk_layernorm or _qknorm_rope.ACTIVE),
+        apply_rope_fusion=config.model.qk_layernorm and not _qknorm_rope.ACTIVE,
+        gradient_accumulation_fusion=config.model.gradient_accumulation_fusion,
+        tp_only_amax_red=config.model.tp_only_amax_red,
+        use_te_rng_tracker=config.model.use_te_rng_tracker,
+        use_transformer_engine_op_fuser=config.model.use_transformer_engine_op_fuser,
+        cuda_graph_warmup_steps=config.model.custom.cuda_graph_warmup_steps,
+        # CPU offloading
+        cpu_offloading=config.model.cpu_offloading,
+        cpu_offloading_num_layers=config.model.cpu_offloading_num_layers,
+        cpu_offloading_weights=False,
+    )
+    set_cuda_graph_modules(
+        model_cfg,
+        _normalize_cuda_graph_modules(config.model.overwritten_attributes.cuda_graph_modules),
+    )
+    if config.model.use_transformer_engine_op_fuser:
+        model_cfg.moe_mlp_glu_interleave_size = 32
+    model_cfg.moe_router_padding_for_quantization = True
+    if config.model.moe_expert_rank_capacity_factor is not None:
+        model_cfg.moe_expert_rank_capacity_factor = config.model.moe_expert_rank_capacity_factor
+    model_cfg.moe_paged_stash = config.model.moe_paged_stash
+    if config.model.moe_paged_stash_buffer_size_factor_cuda is not None:
+        model_cfg.moe_paged_stash_buffer_size_factor_cuda = float(
+            config.model.moe_paged_stash_buffer_size_factor_cuda
+        )
+    model_cfg.moe_single_grouped_weight = config.model.moe_single_grouped_weight_bias
+    model_cfg.moe_single_grouped_bias = config.model.moe_single_grouped_weight_bias and config.model.add_bias_linear
+    model_cfg.moe_permute_fusion_into_hybridep = config.model.moe_permute_fusion_into_hybridep
+    return model_cfg
+
+
+def get_mixed_precision(config):
+    # fp8 knobs:
+    fp8_type = None
+    if config.model.fp8:
+        fp8_type = "hybrid" if config.model.fp8_hybrid else "e4m3"
+    fp8_margin = 0
+    fp8_amax_history_len = config.model.fp8_amax_history_len
+    fp8_amax_compute_algo = config.model.fp8_amax_compute_algo
+    fp8_param_gather = config.model.optim.fp8_param_gather
+    fp8_recipe = config.model.fp8_recipe
+    reuse_grad_buf_for_mxfp8_param_ag = config.model.reuse_grad_buf_for_mxfp8_param_ag
+    # fp4 knobs:
+    fp4_type = None
+    if config.model.fp4:
+        fp4_type = "e2m1"
+    fp4_recipe = config.model.fp4_recipe
+
+    first_last_layers_bf16 = config.model.first_last_layers_bf16
+    num_layers_at_start_in_bf16 = config.model.num_layers_at_start_in_bf16
+    num_layers_at_end_in_bf16 = config.model.num_layers_at_end_in_bf16
+
+    if config.model.fp8 or config.model.fp4:
+        mixed_precision = MixedPrecisionConfig(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            autocast_enabled=False,
+            grad_reduce_in_fp32=False,
+            # fp8
+            fp8=fp8_type,
+            fp8_margin=fp8_margin,
+            fp8_recipe=fp8_recipe,
+            fp8_amax_history_len=fp8_amax_history_len,
+            fp8_amax_compute_algo=fp8_amax_compute_algo,
+            fp8_param_gather=fp8_param_gather,
+            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+            fp8_dot_product_attention=config.model.fp8_dot_product_attention,
+            # fp4
+            fp4=fp4_type,
+            fp4_recipe=fp4_recipe,
+            # First/last layers in bf16
+            first_last_layers_bf16=first_last_layers_bf16,
+            num_layers_at_start_in_bf16=num_layers_at_start_in_bf16,
+            num_layers_at_end_in_bf16=num_layers_at_end_in_bf16,
+        )
+    else:
+        mixed_precision = MixedPrecisionConfig(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            autocast_enabled=False,
+            grad_reduce_in_fp32=False,
+        )
+
+    return mixed_precision
+
+
+def get_ddp_config(config):
+    overlap_grad_reduce = config.model.optim.overlap_grad_reduce
+    overlap_param_gather = config.model.optim.overlap_param_gather
+    align_param_gather = config.model.optim.align_param_gather
+    use_distributed_optimizer = config.model.optim.use_distributed_optimizer
+    bucket_size = config.model.optim.bucket_size
+    num_distributed_optimizer_instances = config.model.optim.num_distributed_optimizer_instances
+    fp8_param_gather = config.model.optim.fp8_param_gather
+    nccl_ub_dp = config.model.optim.nccl_ub_dp
+    outer_dp_sharding_strategy = config.model.optim.outer_dp_sharding_strategy
+    average_in_collective = config.model.optim.average_in_collective
+
+    return DistributedDataParallelConfig(
+        check_for_nan_in_grad=False,
+        grad_reduce_in_fp32=False,
+        average_in_collective=average_in_collective,
+        bucket_size=bucket_size,
+        # Overlap
+        overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather=overlap_param_gather,
+        align_param_gather=align_param_gather,
+        # Distributed optimizer
+        use_distributed_optimizer=use_distributed_optimizer,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+        data_parallel_sharding_strategy="optim_grads_params",
+        outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+        # FP8
+        fp8_param_gather=fp8_param_gather,
+        keep_fp8_transpose_cache=False,
+        # FSDP
+        fsdp_double_buffer=True,
+        use_megatron_fsdp=config.model.mcore_fsdp,
+        # NCCL
+        nccl_ub=nccl_ub_dp,
+    )
+
+
+def get_dist_config(config):
+    nccl_communicator_config_path = config.model.nccl_communicator_config_path
+    return DistributedInitConfig(
+        nccl_communicator_config_path=nccl_communicator_config_path,
+        use_tp_pp_dp_mapping=config.model.use_tp_pp_dp_mapping,
+        use_sharp=config.model.sharp,
+    )
+
+
+def get_optimizer_config(config):
+    opt_cfg = OptimizerConfig(
+        optimizer="adam",
+        lr=config.model.optim.lr,
+        weight_decay=0.1,
+        bf16=config.trainer.precision == "bf16",
+        fp16=config.trainer.precision == "fp16",
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        adam_eps=config.model.optim.adam_eps,
+        use_distributed_optimizer=True,
+        clip_grad=1.0,
+        min_lr=config.model.optim.sched.min_lr,
+    )
+    opt_cfg.optimizer_cuda_graph = config.model.optim.optimizer_cuda_graph
+    opt_cfg.overlap_param_gather = config.model.optim.overlap_param_gather
+    return opt_cfg
+
+
+def get_scheduler_config(config):
+    return SchedulerConfig(
+        lr_decay_style="cosine",
+        lr_decay_iters=int(os.environ.get("OPT_LR_DECAY_STEPS", 0)) - int(config.model.optim.sched.lr_warmup_iters),
+        lr_warmup_iters=config.model.optim.sched.lr_warmup_iters,
+        start_weight_decay=0.1,
+        end_weight_decay=0.1,
+    )
+
+
+def get_train_config(config):
+    return TrainingConfig(
+        global_batch_size=config.model.global_batch_size,
+        micro_batch_size=config.model.micro_batch_size,
+        rampup_batch_size=None,
+        train_iters=config.trainer.max_steps,
+    )
+
+
+def get_validation_config(config):
+    return ValidationConfig(
+        eval_interval=config.trainer.val_check_interval,
+        eval_iters=config.trainer.eval_iters,
+    )
+
+
+def get_tokenizer_config(config):
+    if config.model.data.mock_dataset:
+        vocab_size = config.model.data.mock_tokenizer_vocab_size
+        return TokenizerConfig(tokenizer_type="NullTokenizer", vocab_size=vocab_size)
+
+    return TokenizerConfig(
+        tokenizer_type="HuggingFaceTokenizer",
+        tokenizer_model=config.model.tokenizer.model,
+        hf_tokenizer_kwargs={"use_fast": True},
+    )
+
+
+def get_rerun_state_machine_config(config):
+    return RerunStateMachineConfig(
+        rerun_mode="disabled",
+        check_for_nan_in_loss=False,
+        check_for_spiky_loss=False,
+    )
+
+
+def get_logger_config(config):
+    if config.model.custom.disable_nemo_logs:
+        log_interval = config.trainer.max_steps + 1
+    else:
+        log_interval = config.trainer.log_every_n_steps
+    return LoggerConfig(log_interval=log_interval)
+
+
+def get_rng_config(config):
+    return RNGConfig(seed=config.model.seed, te_rng_tracker=config.model.use_te_rng_tracker)
+
+
+def get_comm_overlap_config(config):
+    tp_comm_overlap = config.model.ub_tp_comm_overlap
+
+    tp_comm_overlap_cfg = None
+    if tp_comm_overlap:
+        from megatron.bridge.training.comm_overlap import (
+            BulkOverlapCfg,
+            PipelineOverlapCfg,
+            RingExchangeOverlapCfg,
+            TransformerLayerTPOverlapCfg,
+        )
+
+        buffer_options = config.model.ub_tp_comm_overlap_cfg
+        userbuffer_args = {}
+
+        for key in [
+            "qkv_dgrad",
+            "qkv_wgrad",
+            "fc1_dgrad",
+            "fc1_wgrad",
+            "qkv_fprop",
+            "proj_dgrad",
+            "fc1_fprop",
+            "fc2_dgrad",
+            "proj_fprop",
+            "fc2_fprop",
+        ]:
+            if key in buffer_options:
+                attributes = buffer_options[key]
+                fp8_buf = False
+                try:
+                    fp8_buf = bool(attributes.fp8_buf)
+                except:
+                    pass
+                if attributes.method == "pipeline":
+                    userbuffer_args[key] = PipelineOverlapCfg(
+                        num_sm=attributes.num_sm,
+                        cga_size=attributes.cga_size,
+                        num_splits=attributes.num_splits,
+                        set_sm_margin=bool(attributes.set_sm_margin),
+                        fp8_buf=fp8_buf,
+                    )
+                elif attributes.method == "bulk":
+                    userbuffer_args[key] = BulkOverlapCfg(
+                        num_sm=attributes.num_sm,
+                        cga_size=attributes.cga_size,
+                        set_sm_margin=bool(attributes.set_sm_margin),
+                    )
+                elif attributes.method == "ring_exchange":
+                    userbuffer_args[key] = RingExchangeOverlapCfg(
+                        fp8_buf=fp8_buf,
+                    )
+                else:
+                    assert False, f"method {attributes.method} is not defined."
+
+        tp_comm_overlap_cfg = TransformerLayerTPOverlapCfg(**userbuffer_args)
+
+    return CommOverlapConfig(
+        tp_comm_overlap=tp_comm_overlap,
+        tp_comm_overlap_cfg=tp_comm_overlap_cfg,
+        # PP overlap
+        overlap_p2p_comm=config.model.overlap_p2p_comm,
+        batch_p2p_comm=config.model.batch_p2p_comm,
+        # DP overlap
+        overlap_grad_reduce=config.model.optim.overlap_grad_reduce,
+        overlap_param_gather=config.model.optim.overlap_param_gather,
+        overlap_param_gather_with_optimizer_step=config.model.optim.overlap_param_gather_with_optim_step,
+        align_param_gather=config.model.optim.align_param_gather,
+        bucket_size=config.model.optim.bucket_size,
+        # Pipeline bubble
+        defer_embedding_wgrad_compute=config.model.defer_embedding_wgrad_compute,
+        wgrad_deferral_limit=config.model.wgrad_deferral_limit,
+    )
+
+
+def get_profiling_config(config):
+    if config.misc.memory_profiler.enable:
+        return ProfilingConfig(
+            use_pytorch_profiler=True,
+            record_memory_history=True,
+            memory_snapshot_path=f"{config.misc.memory_profiler.file_prefix}.pickle",
+            profile_step_start=config.misc.memory_profiler.start_step,
+            profile_step_end=config.misc.memory_profiler.end_step,
+        )
+    nsys_profile = config.model.nsys_profile
+    if not nsys_profile.enabled and not nsys_profile.nvtx_ranges:
+        # mbridge skips ProfilingConfig validation entirely when profiling is
+        # None, but validates every field when it is set -- and since #5819 it
+        # rejects profile_step_end == profile_step_start, which our default
+        # window used. Returning None keeps runs that profile nothing off that
+        # path. nvtx_ranges is checked too: initialize.py reads it off
+        # cfg.profiling, so it must keep working with PROFILE unset.
+        return None
+
+    return ProfilingConfig(
+        use_nsys_profiler=config.model.nsys_profile.enabled,
+        profile_step_start=config.model.nsys_profile.start_step,
+        profile_step_end=config.model.nsys_profile.end_step,
+        profile_ranks=[int(r) for r in str(config.model.nsys_profile.ranks).split(",")],
+        record_shapes=config.model.nsys_profile.gen_shape,
+        nvtx_ranges=config.model.nsys_profile.nvtx_ranges,
+    )
+
+
+def get_checkpoint_config(config):
+    return CheckpointConfig(
+        load=None,
+        save=None,
+        fully_parallel_load=config.model.dist_ckpt_parallel_load,
+        dist_ckpt_strictness="log_all",
+        load_optim=False,
+        load_main_params_from_ckpt=config.model.optim.fp8_param_gather,
+    )
+
+
+def create_config(config):
+    return ConfigContainer(
+        checkpoint=get_checkpoint_config(config),
+        dataset=get_data(config),
+        ddp=get_ddp_config(config),
+        dist=get_dist_config(config),
+        logger=get_logger_config(config),
+        mixed_precision=get_mixed_precision(config),
+        model=get_model(config),
+        optimizer=get_optimizer_config(config),
+        rng=get_rng_config(config),
+        profiling=get_profiling_config(config),
+        rerun_state_machine=get_rerun_state_machine_config(config),
+        scheduler=get_scheduler_config(config),
+        tokenizer=get_tokenizer_config(config),
+        train=get_train_config(config),
+        validation=get_validation_config(config),
+    )
+
+
+def log_hyperparams(config):
+    mllogger.mlperf_submission_log("gpt_oss_20b")
+    if config.trainer.max_steps <= config.model.optim.sched.lr_warmup_iters:
+        config.model.optim.sched.lr_warmup_iters = config.trainer.max_steps
+
+    opt_lr_decay_steps = int(os.environ.get("OPT_LR_DECAY_STEPS", 0)) - int(config.model.optim.sched.lr_warmup_iters)
+
+    # Collects configs to be logged
+    logging_configs = {
+        # seeds
+        mllogger.constants.SEED: config.model.seed,
+        # HPs
+        mllogger.constants.GLOBAL_BATCH_SIZE: config.model.global_batch_size,
+        mllogger.constants.GRADIENT_ACCUMULATION_STEPS: (int(os.environ["MINIBS"]) / config.model.micro_batch_size),
+        mllogger.constants.MAX_SEQUENCE_LENGTH: config.model.encoder_seq_length,
+        mllogger.constants.EVAL_SAMPLES: int(os.environ.get("VAL_SAMPLES", 0)),
+        mllogger.constants.TRAIN_SAMPLES: 1574207408,
+        mllogger.constants.INIT_CHECKPOINT_STEP: config.model.custom.init_global_step,
+        # Optimizers
+        mllogger.constants.OPT_NAME: mllogger.constants.ADAMW,
+        mllogger.constants.OPT_BASE_LR: config.model.optim.lr,
+        mllogger.constants.OPT_ADAMW_BETA_1: 0.9,
+        mllogger.constants.OPT_ADAMW_BETA_2: 0.95,
+        mllogger.constants.OPT_ADAMW_EPSILON: 1e-5,
+        mllogger.constants.OPT_ADAMW_WEIGHT_DECAY: 0.1,
+        mllogger.constants.OPT_GRADIENT_CLIP_NORM: 1.0,
+        # Schedulers
+        mllogger.constants.OPT_END_LR: config.model.optim.sched.min_lr,
+        mllogger.constants.OPT_LR_WARMUP_STEPS: config.model.optim.sched.lr_warmup_iters,
+        mllogger.constants.OPT_LR_DECAY_STEPS: opt_lr_decay_steps,
+        mllogger.constants.MAX_STEPS: int(os.environ.get("MAX_STEPS", 0)),
+        mllogger.constants.OPT_LR_DECAY_SCHEDULE: "cosine with linear warmup",
+        # extra
+        mllogger.constants.TENSOR_PARALLELISM: config.model.tensor_model_parallel_size,
+        mllogger.constants.PIPELINE_PARALLELISM: config.model.pipeline_model_parallel_size,
+        mllogger.constants.CONTEXT_PARALLELISM: config.model.context_parallel_size,
+        mllogger.constants.EXPERT_PARALLELISM: config.model.expert_model_parallel_size,
+        mllogger.constants.MICRO_BATCH_SIZE: config.model.micro_batch_size,
+        mllogger.constants.CONFIG_FILENAME: f"config_{os.environ.get('DGXSYSTEM', 'UNKNOWN')}.sh",
+        mllogger.constants.LOWEST_NUMERICAL_PRECISION_IN_LINEAR: os.environ.get("MLPERF_LINEAR_PRECISION", ""),
+        mllogger.constants.LOWEST_NUMERICAL_PRECISION_IN_ATTN: os.environ.get("MLPERF_ATTN_PRECISION", ""),
+        mllogger.constants.LOWEST_NUMERICAL_PRECISION_IN_COMM: os.environ.get("MLPERF_COMM_PRECISION", ""), 
+        # custom
+        "target_accuracy": config.custom.target_log_ppl,
+    }
+
+    for key, value in logging_configs.items():
+        mllogger.event(key=key, value=value)
+
+
+@hydra.main(config_path="conf", config_name="gpt_oss", version_base="1.2")
+def main(cfg):
+    utils.init_logging()
+    OmegaConf.resolve(cfg)
+    config_container = create_config(cfg)
+    evaluate_on_fixed_validation_window(
+        config_container.validation.eval_iters * config_container.train.global_batch_size
+    )
+    if utils.rank == 0:
+        log_hyperparams(cfg)
+    callbacks = [
+        WarmupCallback(cfg, forward_step_func=forward_step),
+        DeltaTimingCallback(cfg),
+        MLPerfLoggingCallback(cfg),
+    ]
+    if os.getenv("NTRACE_ENABLE", "0") == "1":
+        try:
+            from ntrace import NtraceCallback
+        except ModuleNotFoundError as exc:
+            if exc.name != "ntrace":
+                raise
+            if utils.rank == 0:
+                print("NTRACE_ENABLE=1 but ntrace is not installed; skipping NtraceCallback", flush=True)
+        else:
+            callbacks.append(NtraceCallback())
+
+    # GC Config
+    config_container.train.manual_gc = True
+    config_container.train.manual_gc_interval = 500
+    config_container.train.manual_gc_eval = False
+
+    # Memory management
+    config_container.train.empty_unused_memory_level = 0
+    config_container.train.train_sync_interval = None
+
+    # Skip logging & timers
+    config_container.logger.skip_train_metrics_log = cfg.model.custom.disable_nemo_logs
+    config_container.logger.timing_log_level = -1 if config_container.logger.skip_train_metrics_log else 0
+
+    # Skip numeric checks
+    config_container.train.check_optimizer_step_success = False
+    config_container.train.skip_sync_grad_norm_across_mp = config_container.logger.skip_train_metrics_log
+
+    config_container.train.exit_signal_handler = False
+
+    pretrain(config_container, forward_step_func=forward_step, callbacks=callbacks)
+
+
+if __name__ == "__main__":
+    if utils.rank == 0:
+        mllogger.start(key=mllogger.constants.INIT_START)
+    main()

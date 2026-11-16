@@ -1,0 +1,176 @@
+75,76d74
+< # Set peak memory clock for Rubin
+< : "${SET_PEAK_MEM_CLK:=0}"
+81a80
+> : "${MEM_MONITOR:=0}"
+120c119,123
+< # make sure the log directory exists
+---
+> ##############################################
+> ## FIXME: this is only to deal with a slurm.conf where the
+> ## nodes aren't sorted in topological order
+> ## to use it use SLURM_HOSTFILE=$SORTED_HOSTFILE srun ...
+> ##############################################
+122,134c125,126
+< if [[ "${NCCL_INSPECTOR_ENABLE:-0}" == "1" ]]; then
+<     if [[ "${NCCL_INSPECTOR_DUMP_DIR:-}" != /results/* ]]; then
+<         echo "ERROR: NCCL_INSPECTOR_DUMP_DIR must be under /results" >&2
+<         exit 1
+<     fi
+<     _inspector_subdir="${NCCL_INSPECTOR_DUMP_DIR#/results/}"
+<     _inspector_subdir="${_inspector_subdir%/}"
+<     if [[ -z "${_inspector_subdir}" ]]; then
+<         echo "ERROR: NCCL_INSPECTOR_DUMP_DIR must name a subdirectory under /results" >&2
+<         exit 1
+<     fi
+<     mkdir -p "${LOGDIR}/${_inspector_subdir}"
+< fi
+---
+> export SORTED_HOSTFILE=$(realpath $(mktemp "$LOGDIR/hostfile.${SLURM_JOB_ID}.XXXX")) || exit 1
+> scontrol show hostnames "$SLURM_JOB_NODELIST" | sort | awk '{ for (i=0; i<'${DGXNGPU}'; i++) print }' > "$SORTED_HOSTFILE"
+197,201d188
+< if [ "${NVTX_FLAG:-0}" -gt 0 ]; then
+<     for rank in ${PROFILE_RANKS//,/ }; do
+<         EXTRA_ASSETS="${EXTRA_ASSETS} --asset ${NSYS_PREFIX}${rank}${NSYS_SUFFIX}"
+<     done
+< fi
+238a226,228
+>     if [[ -f "${SORTED_HOSTFILE:-}" ]]; then
+>         rm -f "${SORTED_HOSTFILE}"
+>     fi
+264d253
+< : "${CONTAINER_IMAGE_OVERRIDE:=}"
+266,301c255
+< srun --ntasks-per-node=1 --container-image="${CONTAINER_IMAGE_OVERRIDE:-$CONT}" --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" true
+< if [[ "${NCCL_INSPECTOR_ENABLE:-0}" == "1" ]]; then
+<     # Run a single task in the prepared benchmark container so an incompatible
+<     # Inspector installation fails before the multi-node benchmark starts.
+<     _inspector_preflight_log="${LOGDIR}/nccl_inspector_preflight.log"
+<     srun -N1 -n1 \
+<         --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" \
+<         --container-mounts="${_cont_mounts}" \
+<         bash -ceu '
+<             plugin="${NCCL_PROFILER_PLUGIN:?NCCL_PROFILER_PLUGIN not set}"
+<             expected_revision="${NCCL_INSPECTOR_EXPECTED_REVISION:?NCCL_INSPECTOR_EXPECTED_REVISION not set}"
+<             # Confirm the configured plugin is the pinned, unmodified binary
+<             # installed in the image.
+<             test -r "${plugin}"
+<             test "$(cat /opt/nccl-inspector/SOURCE_REVISION)" = "${expected_revision}"
+<             sha256sum -c /opt/nccl-inspector/SHA256SUMS
+<             # Confirm the plugin recognizes every setting required by this
+<             # profiling configuration, including P2P collection.
+<             for setting in \
+<                 NCCL_INSPECTOR_ENABLE_P2P \
+<                 NCCL_INSPECTOR_DUMP_COLL_RING_SIZE \
+<                 NCCL_INSPECTOR_DUMP_P2P_RING_SIZE \
+<                 NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING; do
+<                 strings "${plugin}" | grep -Fq "${setting}" || {
+<                     echo "ERROR: Inspector plugin lacks ${setting}" >&2
+<                     exit 1
+<                 }
+<             done
+<             printf "NCCL Inspector source revision: %s\n" "${expected_revision}"
+<         ' > "${_inspector_preflight_log}" 2>&1 || {
+<             # Preserve the validation details in the job log on failure.
+<             cat "${_inspector_preflight_log}" >&2
+<             exit 1
+<         }
+<     cat "${_inspector_preflight_log}"
+< fi
+---
+> srun --ntasks-per-node=1 --container-image="${CONT}" --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" true
+306a261,273
+> set +e
+> # Check vbios version and fabric integrity
+> srun --ntasks-per-node=1 \
+>      /bin/bash -c '
+>      printf "%s\t%s\t%s\t%s\n" \
+>          "$(hostname)" \
+>          "$(nvidia-smi -i 0 --query-gpu=vbios_version,driver_version --format=csv,noheader)" \
+>          "$(cat /sys/fs/cgroup/cpuset/slurm/cpuset.mems)" \
+>          "$(nvidia-smi -i 0 -q | grep CliqueId | grep --only-matching ":.*$")"
+> '
+> 
+> set -e
+> 
+323c290,295
+<     export MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST-}" | head -n1)"
+---
+>     if [[ "${SORTED_HOSTFILE:-}" ]]; then
+>         # need the node that will have rank 0
+>         export MASTER_ADDR="$(head -n1 ${SORTED_HOSTFILE})"
+>     else
+>         export MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST-}" | head -n1)"
+>     fi
+351,357c323,331
+<     (srun --mpi="${SLURM_MPI_TYPE:-pmix}" \
+<           --ntasks-per-node="${DGXNGPU}" \
+<           --container-name="${_cont_name}" \
+<           "${PYXIS_DEFAULTS[@]}" \
+<           --container-mounts="${_cont_mounts}" \
+<           --time="${NCCL_TEST_WALLTIME}" \
+<           reduce_scatter_perf_mpi -b 16M -e 4G -g 1 -d half -f 2) |& tee "${LOGDIR}/${SPREFIX}_nccl.log"
+---
+>     (SLURM_HOSTFILE=$SORTED_HOSTFILE srun --mpi="${SLURM_MPI_TYPE:-pmix}" \
+>                                     --distribution=arbitrary \
+>                                     --ntasks-per-node="${DGXNGPU}" \
+>                                     --container-name="${_cont_name}" \
+>                                     --container-env=NCCL_NVLS_ENABLE \
+>                                     "${PYXIS_DEFAULTS[@]}" \
+>                                     --container-mounts="${_cont_mounts}" \
+>                                     --time="${NCCL_TEST_WALLTIME}" \
+>                                     reduce_scatter_perf_mpi -b 16M -e 4G -g 1 -d half -f 2)
+405c379,382
+< NVSMI_QUIET='nvsmi_quiet() { local out rc=0; out=$(sudo nvidia-smi "$@" 2>&1) || rc=$?; if [[ "${SLURM_NODEID}" -eq 0 || "${rc}" -ne 0 ]]; then echo "${out}"; fi; return "${rc}"; }'
+---
+> #Memory monitor for debugging nccl error at large scale
+> if [ ${MEM_MONITOR} -gt 0 ]; then
+> 	( srun --overlap --ntasks-per-node=1 bash ${RUNSUB_DIR}/scripts/draco-cw/memory_monitor.sh ) &
+> fi
+415c392
+< 	srun --ntasks-per-node=1 bash -c "${NVSMI_QUIET}; nvsmi_quiet -lgc ${GPC_CLK}"
+---
+> 	srun --ntasks-per-node=1 bash -c "sudo nvidia-smi -lgc ${GPC_CLK}"
+420,424c397
+< 	srun --ntasks-per-node=1 bash -c "${NVSMI_QUIET}; nvsmi_quiet -pl ${POWER_CAP}"
+< fi
+< 
+< if [[ "${SET_PEAK_MEM_CLK:-0}" == "1" ]]; then
+< 	srun --ntasks-per-node=1 bash -c "${NVSMI_QUIET}"'; for idx in {0..3}; do nvsmi_quiet -lmc 4752,4752 -i "${idx}"; done'
+---
+> 	srun --ntasks-per-node=1 bash -c "sudo nvidia-smi -pl ${POWER_CAP}"
+429c402
+< 	srun --ntasks-per-node=1 bash -c "${NVSMI_QUIET}; nvsmi_quiet boost-slider --vboost ${VBOOST_VALUE}"
+---
+> 	srun --ntasks-per-node=1 bash -c "sudo nvidia-smi boost-slider --vboost ${VBOOST_VALUE}"
+501c474
+<                  '"${DROPCACHE_CMD}"'
+---
+>                  '"${DROPCACHE_CMD}"' || { echo "$host CACHE_CLEAR_FAILED: the drop command failed"; exit 1; }
+504c477,478
+<             '
+---
+>                  [ "${cache_after}" -lt "${cache_before}" ] || { echo "$host CACHE_CLEAR_FAILED: the page cache did not shrink"; exit 1; }
+>             ' || { echo "CACHE_CLEAR_FAILED -- this trial stops before RUNANDTIME_START (no run_start: not an attempt)"; exit 1; }
+513c487,488
+<         (NV_MLPERF_DEBUG=1 \
+---
+>         (SLURM_HOSTFILE=$SORTED_HOSTFILE \
+>              NV_MLPERF_DEBUG=1 \
+515a491
+>              --distribution=arbitrary \
+520c496
+<              --container-env=MASTER_PORT,MASTER_ADDR,NCCL_SHARP_GROUP_SIZE_THRESH \
+---
+>              --container-env=MASTER_PORT,MASTER_ADDR,NCCL_SHARP_GROUP_SIZE_THRESH,NCCL_NVLS_ENABLE \
+532,533c508
+<             --container-mounts="${_cont_mounts}"                  \
+<             --container-workdir="${WORK_DIR}"                     \
+---
+>             --container-mounts="$(realpath ${LOGDIR}):/results"   \
+536,540d510
+<         if [ -n "${PROFILE_RANKS}" ]; then
+<           for rank in ${PROFILE_RANKS//,/ }; do
+<             EXTRA_ASSETS="${EXTRA_ASSETS} --asset ${NSYS_PREFIX}${rank}.kernels.txt"
+<           done
+<         fi

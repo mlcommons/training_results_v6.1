@@ -1,0 +1,2784 @@
+diff --git a/transformer_engine/pytorch/csrc/quantizer.cpp b/transformer_engine/pytorch/csrc/quantizer.cpp
+index 17237fa9..0d7bfc0e 100644
+--- a/transformer_engine/pytorch/csrc/quantizer.cpp
++++ b/transformer_engine/pytorch/csrc/quantizer.cpp
+@@ -1910,7 +1910,11 @@ bool NVFP4Quantizer::is_eligible_for_rht_cast_fusion(const std::vector<size_t>&
+                                                      bool for_grouped_kernel) {
+   const auto [rows, cols] = get_2d_dims(shape);
+   const size_t row_align = for_grouped_kernel ? 128 : 64;
+-  return rows % row_align == 0 && cols % 128 == 0 && transformer_engine::cuda::sm_arch() >= 100 &&
++  const size_t col_align =
++      (!for_grouped_kernel && transformer_engine::getenv<bool>("NVTE_NVFP4_RHT_FUSION_COLS64"))
++          ? 64
++          : 128;
++  return rows % row_align == 0 && cols % col_align == 0 && transformer_engine::cuda::sm_arch() >= 100 &&
+          transformer_engine::cuda::sm_arch() <= 110;
+ }
+ 
+diff --git a/transformer_engine/pytorch/ops/fused/amax_dbias_ext.cu b/transformer_engine/pytorch/ops/fused/amax_dbias_ext.cu
+new file mode 100644
+index 00000000..94d2266b
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/amax_dbias_ext.cu
+@@ -0,0 +1,293 @@
++// Classification: Internal
++// Grouped NVFP4 dy statistics in one read: pre-RHT row amax and post-RHT column amax (the
++// instruction sequence of TE's GraphSafeGroupHadamardAmaxTmaKernel, so both are bitwise equal),
++// plus the per-group column sums (dbias) from the same shared-memory tile.
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_bf16.h>
++#include <torch/extension.h>
++
++#include <cstdint>
++
++namespace {
++
++constexpr int kRows = 64;        // rows per CTA (TE kChunkBlockYSmall)
++constexpr int kChunkCols = 256;  // columns per CTA (TE kChunkBlockXSmall)
++constexpr int kTile = 64;        // 64x64 bf16 sub-tile (TE kBuffDim)
++constexpr int kThreads = 128;    // 4 warps (TE kThreadBlockX)
++constexpr int kMaxCtaCols = 6144; // bias staging limit for the scaled variant
++
++__device__ __forceinline__ void ldsm_x4_trans(uint32_t& a0, uint32_t& a1, uint32_t& a2,
++                                              uint32_t& a3, const void* addr) {
++  auto smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(addr));
++  asm volatile("ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++               : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
++               : "r"(smem_addr));
++}
++
++__device__ __forceinline__ void mma_amax(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++                                         const uint32_t* b, uint32_t& amax_result) {
++  uint32_t zero = 0;
++  uint32_t t0, t1, t2, t3, t4, t5, t6, t7, c0, c1, c2, c3;
++  asm volatile(
++      "wmma.mma.sync.aligned.row.row.m16n16k16.f32.bf16.bf16.f32 \n"
++      "{%0, %1, %2, %3, %4, %5, %6, %7}, \n"
++      "{%8, %9, %10, %11}, \n"
++      "{%12, %13, %14, %15}, \n"
++      "{%16, %17, %18, %19, %20, %21, %22, %23};\n\t"
++      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7)
++      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
++        "r"(zero), "r"(zero), "r"(zero), "r"(zero), "r"(zero), "r"(zero), "r"(zero), "r"(zero));
++  asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n\t" : "=r"(c0) : "r"(t1), "r"(t0));
++  asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n\t" : "=r"(c1) : "r"(t3), "r"(t2));
++  asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n\t" : "=r"(c2) : "r"(t5), "r"(t4));
++  asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n\t" : "=r"(c3) : "r"(t7), "r"(t6));
++  uint32_t max_even, max_odd;
++  asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t" : "=r"(max_even) : "r"(c0), "r"(c2));
++  asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t" : "=r"(max_odd) : "r"(c1), "r"(c3));
++  asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t"
++               : "=r"(amax_result)
++               : "r"(max_even), "r"(max_odd));
++}
++
++__device__ __forceinline__ uint32_t bmax(uint32_t a, uint32_t b) {
++  uint32_t r;
++  asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;\n\t" : "=r"(r) : "r"(a), "r"(b));
++  return r;
++}
++
++__device__ __forceinline__ float unpack_max(uint32_t packed) {
++  __nv_bfloat162 v = *reinterpret_cast<__nv_bfloat162*>(&packed);
++  float a = __bfloat162float(v.x), b = __bfloat162float(v.y), r;
++  asm volatile("max.xorsign.abs.f32 %0, %1, %2;\n\t" : "=f"(r) : "f"(a), "f"(b));
++  return fabsf(r);
++}
++
++// TE get_hadamard_matrix_fragment<false, true, false, false>: transposed, non-inverse.
++__device__ __forceinline__ void hadamard_fragment_t(uint32_t* frag, uint16_t mask) {
++  const int tid = threadIdx.x % 32;
++#pragma unroll
++  for (int i = 0; i < 2; i++) {
++    const uint32_t r = i * 8 + tid / 4;
++#pragma unroll
++    for (int j = 0; j < 2; j++) {
++      float t[2];
++#pragma unroll
++      for (int k = 0; k < 2; k++) {
++        const uint32_t c = j * 8 + k + tid % 4 * 2;
++        const int32_t sign = ((mask >> c) ^ __popc(r & c));
++        t[k] = copysignf(0.25f, __int_as_float(sign << 31));
++      }
++      asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n\t" : "=r"(frag[i * 2 + j]) : "f"(t[1]), "f"(t[0]));
++    }
++  }
++}
++
++// kScaled (FC2): dbias[g, h] = sum_r dy[r, h] * scales[r], dscales[r] = sum_h dy[r, h] * bias[g, h].
++template <bool kDbias, bool kScaled>
++__global__ void __launch_bounds__(kThreads)
++    amax_dbias_kernel(const __nv_bfloat16* __restrict__ dy, const int64_t* __restrict__ offsets,
++                      int num_groups, int hidden, uint16_t mask_t, float* __restrict__ amax_row,
++                      float* __restrict__ amax_col, float* __restrict__ dbias,
++                      const float* __restrict__ scales, const __nv_bfloat16* __restrict__ bias,
++                      float* __restrict__ dscales, int cols_per_cta) {
++  static_assert(kDbias || !kScaled);
++  __shared__ __align__(128) uint4 tile[2][kTile * kTile * 2 / 16];
++  __shared__ float part[4][kTile];
++  __shared__ float red[2][kThreads / 32];
++
++  const int row0 = blockIdx.y * kRows;
++  if (row0 >= offsets[num_groups]) return;
++  int lo = 0, hi = num_groups;
++  while (lo < hi) {
++    const int mid = (lo + hi) / 2;
++    if (offsets[mid] <= row0) lo = mid + 1; else hi = mid;
++  }
++  const int g = lo == 0 ? 0 : lo - 1;
++
++  uint32_t had_t[4];
++  hadamard_fragment_t(had_t, mask_t);
++
++  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++  const int ld_row = lane % 16, ld_col = lane / 16 + warp * 2;
++  const int swz = ld_row * 8 + (ld_col ^ ((ld_row * 2) % 8));
++  uint32_t amax_pre = 0, amax_t = 0;
++
++  // Each CTA covers cols_per_cta columns (a multiple of 64); amax is a max, so the column split
++  // does not change it. With one CTA per row, dscales is stored without atomics.
++  const int col_base = blockIdx.x * cols_per_cta;
++  const int n_stages = min(cols_per_cta, hidden - col_base) / kTile;
++
++  // Each thread moves 4 of the 512 16-byte chunks of a 64x64 tile, stored with TE's
++  // 128B_ATOM_32B swizzle (chunk ch of row r at r * 8 + (ch ^ (2r mod 8))).
++  constexpr int kChunksPerThread = kTile * 8 / kThreads;
++  uint4 nxt[kChunksPerThread];
++  auto fetch = [&](int s) {
++    const int c0 = col_base + s * kTile;
++#pragma unroll
++    for (int i = 0; i < kChunksPerThread; ++i) {
++      const int k = threadIdx.x + i * kThreads, r = k >> 3, ch = k & 7;
++      nxt[i] = __ldg(reinterpret_cast<const uint4*>(dy + static_cast<size_t>(row0 + r) * hidden +
++                                                    c0 + ch * 8));
++    }
++  };
++  auto store = [&](int buf) {
++#pragma unroll
++    for (int i = 0; i < kChunksPerThread; ++i) {
++      const int k = threadIdx.x + i * kThreads, r = k >> 3, ch = k & 7;
++      tile[buf][r * 8 + (ch ^ ((r * 2) & 7))] = nxt[i];
++    }
++  };
++
++  // dbias: thread (warp q, lane cp) owns column pair 2cp..2cp+1 of rows 16q..16q+15.
++  // dscales: thread t owns row t / 2, columns 32 (t % 2) .. +31 of each stage.
++  constexpr int kRowsPerWarp = kRows / (kThreads / 32);
++  __shared__ float sc_sh[kScaled ? kRows : 1];
++  __shared__ uint4 bias_sh[kScaled ? kMaxCtaCols / 8 : 1];
++  float ds = 0.f;
++  if constexpr (kScaled) {
++    if (threadIdx.x < kRows) sc_sh[threadIdx.x] = scales[row0 + threadIdx.x];
++    const uint4* bsrc =
++        reinterpret_cast<const uint4*>(bias + static_cast<size_t>(g) * hidden + col_base);
++    for (int i = threadIdx.x; i < n_stages * kTile / 8; i += kThreads) bias_sh[i] = __ldg(bsrc + i);
++  }
++
++  fetch(0);
++  store(0);
++  for (int s = 0; s < n_stages; ++s) {
++    if (s + 1 < n_stages) fetch(s + 1);
++    __syncthreads();
++    const uint4* t = tile[s & 1];
++#pragma unroll
++    for (int cy = 0; cy < kRows / 16; ++cy) {
++      uint32_t a0, a1, a2, a3, m;
++      ldsm_x4_trans(a0, a1, a2, a3, t + cy * 16 * 8 + swz);
++      mma_amax(a0, a2, a1, a3, had_t, m);
++      amax_t = bmax(amax_t, m);
++      a0 = bmax(a0, a1);
++      a2 = bmax(a2, a3);
++      a0 = bmax(a0, a2);
++      amax_pre = bmax(a0, amax_pre);
++    }
++    if constexpr (kDbias) {
++      const int cp = lane, q = warp;
++      float s0 = 0.f, s1 = 0.f;
++#pragma unroll
++      for (int i = 0; i < kRowsPerWarp; ++i) {
++        const int r = q * kRowsPerWarp + i;
++        const __nv_bfloat162 v = reinterpret_cast<const __nv_bfloat162*>(
++            t + r * 8 + ((cp >> 2) ^ ((r * 2) & 7)))[cp & 3];
++        const float x0 = __bfloat162float(v.x), x1 = __bfloat162float(v.y);
++        if constexpr (kScaled) {
++          s0 = fmaf(x0, sc_sh[r], s0);
++          s1 = fmaf(x1, sc_sh[r], s1);
++        } else {
++          s0 += x0;
++          s1 += x1;
++        }
++      }
++      if constexpr (kScaled) {
++        const int r = threadIdx.x >> 1, half = threadIdx.x & 1;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++          const uint4 xv = t[r * 8 + ((half * 4 + j) ^ ((r * 2) & 7))];
++          const uint4 bv = bias_sh[s * 8 + half * 4 + j];
++          const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv);
++          const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&bv);
++#pragma unroll
++          for (int e = 0; e < 4; ++e) {
++            ds = fmaf(__bfloat162float(x2[e].x), __bfloat162float(b2[e].x), ds);
++            ds = fmaf(__bfloat162float(x2[e].y), __bfloat162float(b2[e].y), ds);
++          }
++        }
++      }
++      part[q][2 * cp] = s0;
++      part[q][2 * cp + 1] = s1;
++      __syncthreads();
++      if (threadIdx.x < kTile) {
++        const int c = threadIdx.x;
++        const float sum = ((part[0][c] + part[1][c]) + part[2][c]) + part[3][c];
++        atomicAdd(dbias + static_cast<size_t>(g) * hidden + col_base + s * kTile + c, sum);
++      }
++    }
++    if (s + 1 < n_stages) store((s + 1) & 1);
++  }
++
++  if constexpr (kScaled) {
++    ds += __shfl_xor_sync(0xffffffff, ds, 1);
++    if ((threadIdx.x & 1) == 0) {
++      float* dst = dscales + row0 + (threadIdx.x >> 1);
++      if (gridDim.x == 1) *dst = ds; else atomicAdd(dst, ds);
++    }
++  }
++
++  float vp = unpack_max(amax_pre), vt = unpack_max(amax_t);
++#pragma unroll
++  for (int o = 16; o > 0; o >>= 1) {
++    vp = fmaxf(vp, __shfl_xor_sync(0xffffffff, vp, o));
++    vt = fmaxf(vt, __shfl_xor_sync(0xffffffff, vt, o));
++  }
++  if (lane == 0) {
++    red[0][warp] = vp;
++    red[1][warp] = vt;
++  }
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    float p = red[0][0], tt = red[1][0];
++#pragma unroll
++    for (int w = 1; w < kThreads / 32; ++w) {
++      p = fmaxf(p, red[0][w]);
++      tt = fmaxf(tt, red[1][w]);
++    }
++    atomicMax(reinterpret_cast<int*>(amax_row + g), __float_as_int(p));
++    atomicMax(reinterpret_cast<int*>(amax_col + g), __float_as_int(tt));
++  }
++}
++
++}  // namespace
++
++// dy [rows, hidden] bf16; offsets [G+1] int64 row offsets (multiples of 64); amax_row/amax_col
++// [G] fp32, dbias [G, hidden] fp32 and dscales [rows] fp32, all zero-initialised by the caller;
++// scales [rows] fp32 and bias [G, hidden] bf16 select the FC2 (scaled) variant.
++void amax_dbias(torch::Tensor dy, torch::Tensor offsets, int64_t mask_t, torch::Tensor amax_row,
++                torch::Tensor amax_col, c10::optional<torch::Tensor> dbias,
++                c10::optional<torch::Tensor> scales, c10::optional<torch::Tensor> bias,
++                c10::optional<torch::Tensor> dscales, int64_t cols_per_cta) {
++  TORCH_CHECK(dy.is_cuda() && dy.scalar_type() == torch::kBFloat16 && dy.is_contiguous());
++  TORCH_CHECK(offsets.scalar_type() == torch::kInt64);
++  const int rows = dy.size(0), hidden = dy.size(1);
++  TORCH_CHECK(rows % kRows == 0 && hidden % kTile == 0, "rows % 64 and hidden % 64 required");
++  const int num_groups = offsets.numel() - 1;
++  const bool scaled = scales.has_value();
++  TORCH_CHECK(scaled == bias.has_value() && scaled == dscales.has_value());
++  TORCH_CHECK(!scaled || dbias.has_value(), "scaled variant computes dbias");
++  if (scaled) {
++    TORCH_CHECK(scales->scalar_type() == torch::kFloat32 && scales->is_contiguous());
++    TORCH_CHECK(bias->scalar_type() == torch::kBFloat16 && bias->is_contiguous());
++    TORCH_CHECK(dscales->scalar_type() == torch::kFloat32 && dscales->numel() >= rows);
++  }
++  const int cpc = cols_per_cta > 0 ? static_cast<int>(cols_per_cta) : kChunkCols;
++  TORCH_CHECK(cpc % kTile == 0, "cols_per_cta must be a multiple of 64");
++  TORCH_CHECK(!scaled || cpc <= kMaxCtaCols, "cols_per_cta above the bias staging limit");
++  dim3 grid((hidden + cpc - 1) / cpc, rows / kRows);
++  auto stream = c10::cuda::getCurrentCUDAStream();
++  auto* dyp = reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr());
++  auto args = [&](auto kernel) {
++    kernel<<<grid, kThreads, 0, stream>>>(
++        dyp, offsets.data_ptr<int64_t>(), num_groups, hidden, static_cast<uint16_t>(mask_t),
++        amax_row.data_ptr<float>(), amax_col.data_ptr<float>(),
++        dbias.has_value() ? dbias->data_ptr<float>() : nullptr,
++        scaled ? scales->data_ptr<float>() : nullptr,
++        scaled ? reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr()) : nullptr,
++        scaled ? dscales->data_ptr<float>() : nullptr, cpc);
++  };
++  if (scaled) {
++    args(amax_dbias_kernel<true, true>);
++  } else if (dbias.has_value()) {
++    args(amax_dbias_kernel<true, false>);
++  } else {
++    args(amax_dbias_kernel<false, false>);
++  }
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("amax_dbias", &amax_dbias); }
+diff --git a/transformer_engine/pytorch/ops/fused/grouped_mlp.py b/transformer_engine/pytorch/ops/fused/grouped_mlp.py
+index 71581c1c..4cc3cc81 100644
+--- a/transformer_engine/pytorch/ops/fused/grouped_mlp.py
++++ b/transformer_engine/pytorch/ops/fused/grouped_mlp.py
+@@ -85,6 +85,135 @@ _DUMP_DGLU_DONE = [False]
+ _DGLU_TRITON_DBIAS = os.environ.get("NVFP4_DGLU_TRITON_DBIAS", "0") in ("1", "2")
+ _DGLU_TRITON_DBIAS_SIDE = os.environ.get("NVFP4_DGLU_TRITON_DBIAS", "0") == "2"
+ _dbias_streams = {}
++# One pass over FC2/FC1 dy for both NVFP4 amaxes plus dbias/dscales, instead of TE's amax
++# kernel inside group_quantize and a second dbias pass.
++_DY_STATS = os.environ.get("NVFP4_DY_STATS", "0") == "1"
++_DY_STATS_FC2 = os.environ.get("NVFP4_DY_STATS_FC2", "1") == "1"
++# CUDA extension (nvfp4_amax_dbias): amaxes bitwise equal to TE's; FC2 scaled dbias + dscales
++# only with NVFP4_DY_STATS_CUDA_FC2=1.
++_DY_STATS_CUDA = os.environ.get("NVFP4_DY_STATS_IMPL", "triton") == "cuda"
++_FP4_AG = os.environ.get("NVFP4_FP4_AG", "0") == "1"
++
++
++_v7_modules = {}
++
++
++def _v7_module(name):
++    """V7 helper module: next to this file, else from NVFP4_V7_OV_DIR (file mounts onto paths
++    absent from the image do not show up in the container, directory mounts do)."""
++    mod = _v7_modules.get(name)
++    if mod is None:
++        import importlib
++        import importlib.util
++        import sys
++
++        try:
++            mod = importlib.import_module(f".{name}", __package__)
++        except ModuleNotFoundError:
++            path = os.path.join(os.environ.get("NVFP4_V7_OV_DIR", "/opt/v7ov"), f"{name}.py")
++            spec = importlib.util.spec_from_file_location(f"nvfp4_v7_{name}", path)
++            mod = importlib.util.module_from_spec(spec)
++            sys.modules[spec.name] = mod
++            spec.loader.exec_module(mod)
++        _v7_modules[name] = mod
++    return mod
++
++
++def _dy_stats_for(dy, quantizer, offsets, num_groups, **kwargs):
++    """(amax_row, amax_col, dbias, dscales) from one read of dy, or None if unsupported."""
++    if not (
++        _DY_STATS
++        and num_groups > 1
++        and isinstance(quantizer, NVFP4Quantizer)
++        and quantizer.with_rht
++        and quantizer.with_post_rht_amax
++        and dy is not None
++        and dy.dtype == torch.bfloat16
++    ):
++        return None
++    if _DY_STATS_CUDA:
++        fad = _v7_module("nvfp4_amax_dbias")
++        if fad.supported(dy, kwargs.get("scales"), kwargs.get("bias")):
++            return fad.dy_stats(dy, offsets, quantizer.rht_matrix_random_sign_mask_t, num_groups,
++                                dbias=kwargs.get("dbias", True), scales=kwargs.get("scales"),
++                                bias=kwargs.get("bias"))
++    mod = _v7_module("nvfp4_dy_stats")
++    dy_stats, rht_operand = mod.dy_stats, mod.rht_operand
++
++    return dy_stats(dy, offsets, rht_operand(quantizer.rht_matrix), num_groups, **kwargs)
++
++
++# Triton replacement for the cast half of TE's grouped NVFP4 RHT quantize (bitwise equal with
++# round-to-nearest under NVTE_USE_FAST_MATH=1; own Philox stream for stochastic rounding).
++_TRITON_ACT_QUANT = os.environ.get("NVFP4_TRITON_ACT_QUANT", "0") == "1"
++_TRITON_SR_ROUNDS = int(os.environ.get("NVFP4_TRITON_SR_ROUNDS", "10"))
++_sr_seed_tensors = {}
++
++
++def _sr_seed(device):
++    """Device seed counter, bumped after every stochastic-rounding cast (graph-safe)."""
++    seed = _sr_seed_tensors.get(device)
++    if seed is None:
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        base = (torch.initial_seed() * 1000003 + rank * 7919) % (1 << 62)
++        seed = torch.tensor([base], dtype=torch.int64, device=device)
++        _sr_seed_tensors[device] = seed
++    return seed
++
++
++def _triton_group_quantize(x, quantizer, num_groups, split_sizes, row_offsets, amax_row,
++                           amax_col, tensor_offsets):
++    act_quant = _v7_module("nvfp4_act_quant").act_quant
++    rht_operand = _v7_module("nvfp4_dy_stats").rht_operand
++
++    rows, hidden = x.shape
++    rowwise, columnwise = quantizer.rowwise_usage, quantizer.columnwise_usage
++    n = rows * hidden
++
++    def buf(size, used):
++        return torch.empty(size, dtype=torch.uint8, device=x.device) if used else None
++
++    row_data, row_scale = buf(n // 2, rowwise), buf(n // 16, rowwise)
++    col_data, col_scale = buf(n // 2, columnwise), buf(n // 16, columnwise)
++    seed = _sr_seed(x.device) if quantizer.stochastic_rounding else None
++    act_quant(x, row_offsets, num_groups, amax_row, amax_col, rht_operand(quantizer.rht_matrix),
++              (row_data, row_scale, col_data, col_scale), rowwise=rowwise,
++              columnwise=columnwise, seed=seed, n_rounds=_TRITON_SR_ROUNDS)
++    if seed is not None:
++        seed.add_(1)
++    return GroupedTensor(
++        shape=(rows, hidden),
++        dtype=x.dtype,
++        quantizer=quantizer,
++        num_tensors=num_groups,
++        data=row_data,
++        columnwise_data=col_data,
++        scale_inv=row_scale,
++        columnwise_scale_inv=col_scale,
++        amax=amax_row if rowwise else None,
++        columnwise_amax=amax_col if columnwise else None,
++        first_dims=split_sizes,
++        tensor_offsets=tensor_offsets,
++        with_gemm_swizzled_scales=True,
++    )
++
++
++def _group_quantize_with_stats(dy, quantizer, num_groups, split_sizes, stats, tensor_offsets,
++                               row_offsets=None):
++    if _TRITON_ACT_QUANT and row_offsets is not None:
++        return _triton_group_quantize(dy, quantizer, num_groups, split_sizes, row_offsets,
++                                      stats[0], stats[1], tensor_offsets)
++    # TE's grouped NVFP4 quantize does not reduce activation amaxes across ranks; the
++    # precomputed-amax entry point would add a blocking all-reduce per call.
++    reduce_amax = quantizer.with_amax_reduction
++    quantizer.with_amax_reduction = False
++    try:
++        return _group_quantize_with_amax_for_grouped_mlp(
++            dy, quantizer, num_groups, split_sizes, stats[0], stats[1],
++            tensor_offsets=tensor_offsets,
++        )
++    finally:
++        quantizer.with_amax_reduction = reduce_amax
+ 
+ 
+ def _patch_dglu_kernel_class(path: str) -> None:
+@@ -436,6 +565,10 @@ def _quantize_expert_weights_impl(linear_op, weights, input_requires_grad):
+         if not is_quantized_tensor(weight):
+             quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
+         quantizers.append(quantizer)
++    if _FP4_AG:
++        gathered = _v7_module("nvfp4_fp4_ag").lookup(weights, quantizers)
++        if gathered is not None:
++            return gathered
+     if os.environ.get("NVFP4_GROUP_WEIGHT_QUANT", "0") == "1" and not any(
+         is_quantized_tensor(w) for w in weights
+     ):
+@@ -530,9 +663,96 @@ def launch_expert_weight_prequant(fc1_op, input_requires_grad):
+             weights = [getattr(op, f"weight{idx}") for idx in range(num_groups)]
+             quantized = _quantize_expert_weights(op, weights, input_requires_grad)
+             op.__dict__[_PREQUANT_KEY] = (quantized, side, input_requires_grad)
++            if _PREQUANT_SWIZZLE and all(isinstance(w, NVFP4TensorStorage) for w in quantized):
++                op.__dict__[_PREQUANT_PACKED] = (
++                    tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
++                        [w._rowwise_data for w in quantized],
++                        [w._rowwise_scale_inv for w in quantized],
++                        "nvfp4",
++                        main.device,
++                    )
++                )
++            if (
++                _PREQUANT_SWIZZLE_BWD
++                and input_requires_grad
++                and all(
++                    isinstance(w, NVFP4TensorStorage) and w._columnwise_data is not None
++                    for w in quantized
++                )
++            ):
++                op.__dict__[_PREQUANT_BWD] = _swizzle_columnwise_for_bwd(quantized, main.device)
+     return True
+ 
+ 
++_PREQUANT_SWIZZLE = os.environ.get("NVFP4_PREQUANT_SWIZZLE", "0") == "1"
++_PREQUANT_PACKED = "_nvfp4_prequant_packed"
++_PREQUANT_SWIZZLE_BWD = os.environ.get("NVFP4_PREQUANT_SWIZZLE_BWD", "0") == "1"
++_PREQUANT_BWD = "_nvfp4_prequant_bwd"
++
++
++def _swizzle_columnwise_for_bwd(weights, device):
++    """Column-wise expert weight scales swizzled for the backward GEMMs.
++
++    Returns the data pointers of the weights, packed pointers and buffer for the
++    discrete-weight kernel, and column-only storages flagged as swizzled (views of the
++    same buffer) for the cuBLAS grouped GEMM.
++    """
++    scales = [w._columnwise_scale_inv for w in weights]
++    b_ptrs, sfb_ptrs, buf = (
++        tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
++            [w._columnwise_data for w in weights], scales, "nvfp4", device
++        )
++    )
++    nbytes = scales[0].numel() * scales[0].element_size()
++    stride = (nbytes + 15) // 16 * 16
++    storages = [
++        NVFP4TensorStorage(
++            None,
++            None,
++            w._columnwise_data,
++            buf[i * stride : i * stride + nbytes].view(s.dtype).view(s.shape),
++            w._amax_rowwise,
++            w._amax_columnwise,
++            w._fp4_dtype,
++            w._quantizer,
++            True,
++            fake_dtype=w.dtype if isinstance(w, torch.Tensor) else w._dtype,
++        )
++        for i, (w, s) in enumerate(zip(weights, scales))
++    ]
++    key = tuple(w._columnwise_data.data_ptr() for w in weights)
++    return key, (b_ptrs, sfb_ptrs, buf), storages
++
++
++def _take_prequant_bwd(linear_op, weights):
++    """Backward swizzled column-wise scales stashed by the forward prequant, if they match."""
++    entry = linear_op.__dict__.pop(_PREQUANT_BWD, None)
++    if entry is None or not isinstance(weights, (list, tuple)):
++        return None
++    key, packed, storages = entry
++    if key != tuple(getattr(w, "_columnwise_data", None) is not None and w._columnwise_data.data_ptr()
++                    for w in weights):
++        return None
++    main = torch.cuda.current_stream()
++    for t in packed:
++        t.record_stream(main)
++    return packed, storages
++
++
++def _take_prequant_packed(linear_op):
++    """Forward GEMM pointers and swizzled scales built on the prequant side stream, if any.
++
++    Only valid right after _take_prequant joined the side stream for the same weights.
++    """
++    packed = linear_op.__dict__.pop(_PREQUANT_PACKED, None)
++    if packed is not None:
++        main = torch.cuda.current_stream()
++        for t in packed:
++            if isinstance(t, torch.Tensor):
++                t.record_stream(main)
++    return packed
++
++
+ def _take_prequant(linear_op, input_requires_grad):
+     """Join the prequant side stream and return the stashed weights if usable."""
+     entry = linear_op.__dict__.pop(_PREQUANT_KEY, None)
+@@ -1311,6 +1531,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         scales = basic_op_extra_inputs[1][0]
+ 
+         # Prepare FC1 grouped weight tensor for fused kernels.
++        fc1_prepacked = None
+         #  - single_grouped_weight=True: op.weight is already a GroupedTensor
+         #  - single_grouped_weight=False: cute DSL kernel works with discrete weight tensors
+         #   as long as host pointers for addresses are packed as contiguous device tensor.
+@@ -1335,7 +1556,9 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                 )
+         else:
+             grouped_fc1_weight = _take_prequant(fc1_op, input_requires_grad)
++            fc1_prepacked = _take_prequant_packed(fc1_op)
+             if grouped_fc1_weight is None:
++                fc1_prepacked = None
+                 fc1_weights = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
+                 grouped_fc1_weight = _quantize_expert_weights(
+                     fc1_op, fc1_weights, input_requires_grad
+@@ -1348,6 +1571,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                 fc1_op.__dict__[_PREQUANT_PEER] = (fc2_op, num_groups)
+ 
+         # Prepare FC2 grouped weight tensor for fused kernels.
++        fc2_prepacked = None
+         if fc2_op.single_grouped_weight:
+             if not isinstance(fc2_op.weight, GroupedTensor):
+                 raise RuntimeError(
+@@ -1369,7 +1593,9 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                 )
+         else:
+             grouped_fc2_weight = _take_prequant(fc2_op, input_requires_grad)
++            fc2_prepacked = _take_prequant_packed(fc2_op)
+             if grouped_fc2_weight is None:
++                fc2_prepacked = None
+                 fc2_weights = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
+                 grouped_fc2_weight = _quantize_expert_weights(
+                     fc2_op, fc2_weights, input_requires_grad
+@@ -1653,7 +1879,9 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         else:
+             # Discrete-weight kernel: per-expert data/scale pointers
+             fc1_b_ptrs, fc1_sfb_ptrs, _fc1_sfb_buffer = (
+-                tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
++                fc1_prepacked
++                if fc1_prepacked is not None and use_nvfp4
++                else tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                     [w._rowwise_data for w in grouped_fc1_weight],
+                     [w._rowwise_scale_inv for w in grouped_fc1_weight],
+                     "nvfp4" if use_nvfp4 else "mxfp8_rowwise",
+@@ -1721,7 +1949,18 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             fc2_in = fc2_in.view(in_shape[0], fc2_weight_shape[1]).contiguous()
+             fc2_input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
+             fc2_input_quantizer.optimize_for_gemm = True
+-            if use_fc1_act_hadamard:
++            if use_fc1_act_hadamard and _TRITON_ACT_QUANT and num_groups > 1:
++                grouped_fc2_x = _triton_group_quantize(
++                    fc2_in,
++                    fc2_input_quantizer,
++                    num_groups,
++                    split_sizes,
++                    base_split_offsets,
++                    fc1_kernel_out["amax_tensor"].view(-1),
++                    fc1_kernel_out["post_rht_amax_tensor"].view(-1),
++                    fc2_x_tensor_offsets,
++                )
++            elif use_fc1_act_hadamard:
+                 grouped_fc2_x = _group_quantize_with_amax_for_grouped_mlp(
+                     fc2_in,
+                     fc2_input_quantizer,
+@@ -1885,7 +2124,9 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                 fc2_quant_kwargs["sfb_tensor"] = fc2_w_scales
+             else:
+                 fc2_b_ptrs, fc2_sfb_ptrs, _fc2_sfb_buffer = (
+-                    tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
++                    fc2_prepacked
++                    if fc2_prepacked is not None and use_nvfp4
++                    else tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                         [w._rowwise_data for w in grouped_fc2_weight],
+                         [w._rowwise_scale_inv for w in grouped_fc2_weight],
+                         "nvfp4" if use_nvfp4 else "mxfp8_rowwise",
+@@ -2075,6 +2316,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         output_fc2_dbias = fc2_op.has_bias
+         fc2_dbias_packed = None
+         fc2_dy = None
++        fc2_stats = None
+         grad_output_quantizer = getattr(grad_output, "quantizer", None)
+         fc2_grad_output_quantizer_matches = (
+             isinstance(fc2_grad_output_quantizer, MXFP8Quantizer)
+@@ -2091,7 +2333,27 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             grouped_fc2_dy = grad_output
+         else:
+             fc2_dy = maybe_dequantize(grad_output, dtype)
+-            if output_fc2_dbias and not scale_bias:
++            if _DY_STATS_FC2 and (not output_fc2_dbias or scale_bias):
++                fc2_stats = _dy_stats_for(
++                    fc2_dy,
++                    fc2_grad_output_quantizer,
++                    base_split_offsets,
++                    num_groups,
++                    dbias=scale_bias,
++                    scales=scales.detach().to(dtype=torch.float32).reshape(-1) if scale_bias else None,
++                    bias=torch.stack(fc2_op._get_bias_tensors(dtype)) if scale_bias else None,
++                )
++            if fc2_stats is not None:
++                grouped_fc2_dy = _group_quantize_with_stats(
++                    fc2_dy,
++                    fc2_grad_output_quantizer,
++                    num_groups,
++                    split_sizes,
++                    fc2_stats,
++                    tensor_offsets=base_split_offsets * fc2_weight_shape[0],
++                    row_offsets=base_split_offsets,
++                )
++            elif output_fc2_dbias and not scale_bias:
+                 grouped_fc2_dy, fc2_dbias_packed = tex.bgrad_group_quantize(
+                     fc2_dy,
+                     fc2_grad_output_quantizer,
+@@ -2302,8 +2564,11 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             fc2_dactivation_kwargs["b_tensor"] = fc2_w_data
+             fc2_dactivation_kwargs["sfb_tensor"] = fc2_w_scales
+         else:
++            fc2_bwd_pre = _take_prequant_bwd(fc2_op, grouped_fc2_weight) if use_nvfp4 else None
+             fc2_b_ptrs, fc2_sfb_ptrs, _fc2_sfb_buffer = (
+-                tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
++                fc2_bwd_pre[0]
++                if fc2_bwd_pre is not None
++                else tex.grouped_mlp_experimental.swizzle_scales_and_pack_ptrs_for_discrete_weights(
+                     [w._columnwise_data for w in grouped_fc2_weight],
+                     [w._columnwise_scale_inv for w in grouped_fc2_weight],
+                     "nvfp4" if use_nvfp4 else "mxfp8_columnwise",
+@@ -2411,16 +2676,20 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+ 
+         fc2_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
+         fc2_bias_grad_packed: Optional[torch.Tensor] = None
++        if scale_bias and fc2_stats is not None:
++            fc2_dbias_packed_result = fc2_stats[2]
++            grad_scales = grad_scales.add_(fc2_stats[3])
+         if scale_bias:
+-            fc2_biases = fc2_op._get_bias_tensors(dtype)
+-            bias_packed = torch.stack(fc2_biases)
+-            fc2_dbias_packed_result, grad_scales = compute_grouped_dbias_dscales(
+-                fc2_dy,
+-                scales_f32,
+-                bias_packed,
+-                offsets=base_split_offsets,
+-                dscales=grad_scales,
+-            )
++            if fc2_stats is None:
++                fc2_biases = fc2_op._get_bias_tensors(dtype)
++                bias_packed = torch.stack(fc2_biases)
++                fc2_dbias_packed_result, grad_scales = compute_grouped_dbias_dscales(
++                    fc2_dy,
++                    scales_f32,
++                    bias_packed,
++                    offsets=base_split_offsets,
++                    dscales=grad_scales,
++                )
+             fc2_dbias_packed_result = fc2_dbias_packed_result.to(dtype=dtype)
+             if fc2_op.single_grouped_bias:
+                 fc2_bias_grad_packed = fc2_dbias_packed_result
+@@ -2440,8 +2709,19 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         fc1_bias_grad_packed: Optional[torch.Tensor] = None
+         dbias_2d = None
+         fc1_dbias_side = None
++        fc1_stats = None
++        if use_nvfp4 and (triton_fc1_dbias or not fc1_op.has_bias):
++            fc1_stats = _dy_stats_for(
++                fc1_dy_bf16,
++                fc1_ctx.grad_output_quantizers[0],
++                base_split_offsets,
++                num_groups,
++                dbias=fc1_op.has_bias,
++            )
+         if fc1_op.has_bias:
+-            if triton_fc1_dbias and _DGLU_TRITON_DBIAS_SIDE:
++            if fc1_stats is not None:
++                dbias_t = fc1_stats[2]
++            elif triton_fc1_dbias and _DGLU_TRITON_DBIAS_SIDE:
+                 # Memory-bound; overlaps the FC1 dgrad GEMM and is joined before FC1 wgrad.
+                 main = torch.cuda.current_stream()
+                 fc1_dbias_side = _dbias_stream(main.device)
+@@ -2619,6 +2899,16 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                     )
+                 finally:
+                     fc1_grad_output_quantizer.with_amax_reduction = reduce_amax
++            elif fc1_stats is not None:
++                grouped_fc1_dy = _group_quantize_with_stats(
++                    fc1_dy_bf16,
++                    fc1_grad_output_quantizer,
++                    num_groups,
++                    split_sizes,
++                    fc1_stats,
++                    tensor_offsets=fc1_dy_tensor_offsets,
++                    row_offsets=base_split_offsets,
++                )
+             else:
+                 grouped_fc1_dy = _group_quantize_for_grouped_mlp(
+                     fc1_dy_bf16,
+@@ -2713,8 +3003,13 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                         first_dims=split_sizes,
+                         tensor_offsets=fc1_x_tensor_offsets,
+                     )
++                    fc1_bwd_pre = (
++                        None
++                        if fc1_op.single_grouped_weight
++                        else _take_prequant_bwd(fc1_op, grouped_fc1_weight)
++                    )
+                     general_grouped_gemm_for_grouped_tensor(
+-                        grouped_fc1_weight,
++                        fc1_bwd_pre[1] if fc1_bwd_pre is not None else grouped_fc1_weight,
+                         grouped_fc1_dy,
+                         grouped_grad_input,
+                         layout="NN",
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_amax_dbias.py b/transformer_engine/pytorch/ops/fused/nvfp4_amax_dbias.py
+new file mode 100644
+index 00000000..763313a3
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_amax_dbias.py
+@@ -0,0 +1,75 @@
++# Classification: Internal
++"""Grouped NVFP4 dy amaxes (bitwise equal to TE's RHT amax kernel) plus per-group dbias (and,
++for FC2, scaled dbias + dscales) in one read of dy.
++
++The extension is built once with `build(dir)`; training ranks load the built .so from
++NVFP4_AMAX_DBIAS_EXT.
++"""
++import importlib.util
++import os
++
++import torch
++
++EXT_NAME = "nvfp4_amax_dbias_ext"
++_ext = None
++
++
++def build(build_dir, name=EXT_NAME, arch="10.3", verbose=True):
++    from torch.utils.cpp_extension import load
++
++    os.environ["TORCH_CUDA_ARCH_LIST"] = arch  # max.xorsign.abs needs sm_86+
++    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amax_dbias_ext.cu")
++    os.makedirs(build_dir, exist_ok=True)
++    return load(name=name, sources=[src], build_directory=build_dir,
++                extra_cuda_cflags=["-O3"], verbose=verbose)
++
++
++def _get_ext():
++    global _ext
++    if _ext is None:
++        path = os.environ["NVFP4_AMAX_DBIAS_EXT"]
++        spec = importlib.util.spec_from_file_location(os.path.basename(path).split(".")[0], path)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        _ext = mod
++    return _ext
++
++
++def set_ext(mod):
++    global _ext
++    _ext = mod
++
++
++def supported(dy, scales=None, bias=None):
++    if dy.shape[0] % 64 or dy.shape[1] % 64 or (scales is None) != (bias is None):
++        return False
++    if scales is None:
++        return True
++    return (os.environ.get("NVFP4_DY_STATS_CUDA_FC2", "0") == "1"
++            and scales.dtype == torch.float32 and scales.is_contiguous()
++            and bias.dtype == torch.bfloat16 and bias.is_contiguous())
++
++
++_COLS = int(os.environ.get("NVFP4_AMAX_DBIAS_COLS", "1024"))
++_COLS_SCALED = int(os.environ.get("NVFP4_AMAX_DBIAS_COLS_SCALED", "256"))
++
++
++def dy_stats(dy, offsets, mask_t, num_groups, *, dbias=True, scales=None, bias=None,
++             cols_per_cta=None):
++    """Returns (amax_row[G], amax_col[G], dbias[G, H] fp32 or None, dscales[M] fp32 or None)."""
++    rows, hidden = dy.shape
++    scaled = scales is not None
++    if cols_per_cta is None:
++        cols_per_cta = _COLS_SCALED if scaled else _COLS
++    cols_per_cta = min(cols_per_cta, -(-hidden // 64) * 64)
++    amax = torch.zeros(2, num_groups, device=dy.device, dtype=torch.float32)
++    db = (torch.zeros(num_groups, hidden, device=dy.device, dtype=torch.float32)
++          if dbias or scaled else None)
++    ds = torch.zeros(rows, device=dy.device, dtype=torch.float32) if scaled else None
++    if scaled:
++        _get_ext().amax_dbias(dy, offsets, int(mask_t), amax[0], amax[1], db, scales, bias, ds,
++                              cols_per_cta)
++    else:
++        _get_ext().amax_dbias(dy, offsets, int(mask_t), amax[0], amax[1], db, None, None, None,
++                              cols_per_cta)
++    return amax[0], amax[1], db, ds
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_dy_stats.py b/transformer_engine/pytorch/ops/fused/nvfp4_dy_stats.py
+new file mode 100644
+index 00000000..ef3f489d
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_dy_stats.py
+@@ -0,0 +1,191 @@
++# Classification: Internal
++"""One pass over a grouped BF16 gradient for everything the NVFP4 MoE backward reads from it.
++
++Per group g (rows offsets[g]:offsets[g+1]) of dy (rows x hidden):
++    amax_row[g] = max |dy|                               (row-wise NVFP4 amax, no RHT)
++    amax_col[g] = max |bf16(R' dy_b)| over 16-row blocks b (post-RHT column-wise amax)
++    dbias[g, :] = sum_i dy[i, :] * s_i                    (s_i = scales[i], or 1)
++    dscales[i]  = sum_j dy[i, j] * bias[g, j]             (only with scales)
++
++TE computes these with GraphSafeGroupHadamardAmax plus a separate grouped dbias kernel,
++each re-reading dy from HBM. The amaxes feed tex.nvfp4_group_quantize_with_amax and match
++TE's bitwise (TE takes the column amax of the bf16-rounded RHT output).
++Group starts must be multiples of 16 (true for the 128-padded MoE layout).
++"""
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _block_diag(rht_ptr, BM: tl.constexpr):
++    """[BM, BM] bf16 block-diagonal matrix with the 16x16 RHT operand on the diagonal."""
++    i = tl.arange(0, BM)
++    m = tl.load(rht_ptr + (i[:, None] % 16) * 16 + (i[None, :] % 16))
++    return tl.where((i[:, None] // 16) == (i[None, :] // 16), m, 0.0).to(tl.bfloat16)
++
++
++@triton.jit
++def _dy_stats_kernel(
++    dy_ptr,
++    offsets_ptr,
++    rht_ptr,
++    amax_row_ptr,
++    amax_col_ptr,
++    dbias_ptr,
++    scales_ptr,
++    bias_ptr,
++    dscales_ptr,
++    hidden,
++    HAS_DBIAS: tl.constexpr,
++    HAS_SCALES: tl.constexpr,
++    HAS_COL: tl.constexpr,
++    TRANS_DOT: tl.constexpr,
++    MMA_RED: tl.constexpr,
++    N_ROW_SPLITS: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    g = tl.program_id(0)
++    split = tl.program_id(1)
++    cb = tl.program_id(2)
++
++    row_start = tl.load(offsets_ptr + g)
++    row_end = tl.load(offsets_ptr + g + 1)
++    tiles = (row_end - row_start + BLOCK_M - 1) // BLOCK_M
++    per_split = (tiles + N_ROW_SPLITS - 1) // N_ROW_SPLITS
++    first = split * per_split
++    last = tl.minimum(first + per_split, tiles)
++
++    cols = cb * BLOCK_H + tl.arange(0, BLOCK_H)
++    col_mask = cols < hidden
++    rows = tl.arange(0, BLOCK_M)
++    bdiag = _block_diag(rht_ptr, BLOCK_M)
++
++    if HAS_SCALES:
++        if MMA_RED:
++            # [BLOCK_H, 16] with the (bf16) bias in column 0: dscales = row sums of x @ bmat
++            k16 = tl.arange(0, 16)
++            bmat = tl.load(bias_ptr + g * hidden + cols[:, None] + k16[None, :] * 0,
++                           mask=col_mask[:, None] & (k16[None, :] == 0), other=0.0)
++        else:
++            bias_vals = tl.load(bias_ptr + g * hidden + cols, mask=col_mask,
++                                other=0.0).to(tl.float32)
++    if MMA_RED:
++        # [BLOCK_M, 2 BLOCK_M]: bdiag^T in the first BLOCK_M columns, ones in column BLOCK_M
++        jj = tl.arange(0, 2 * BLOCK_M)[None, :]
++        kk = rows[:, None]
++        m = tl.load(rht_ptr + (jj % 16) * 16 + (kk % 16))
++        ext = tl.where((jj < BLOCK_M) & (kk // 16 == jj // 16), m,
++                       tl.where(jj == BLOCK_M, 1.0, 0.0)).to(tl.bfloat16)
++
++    amax_r = tl.zeros([BLOCK_H], dtype=tl.float32)
++    amax_c = tl.zeros([BLOCK_H], dtype=tl.float32)
++    dbias_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
++    for t in range(first, last):
++        grow = row_start + t * BLOCK_M + rows
++        row_mask = grow < row_end
++        x = tl.load(
++            dy_ptr + grow[:, None].to(tl.int64) * hidden + cols[None, :],
++            mask=row_mask[:, None] & col_mask[None, :],
++            other=0.0,
++        )
++        xf = x.to(tl.float32)
++        amax_r = tl.maximum(amax_r, tl.max(tl.abs(xf), axis=0))
++        if MMA_RED:
++            yt2 = tl.dot(tl.trans(x), ext)  # [BLOCK_H, 2 BLOCK_M] fp32
++            yb = yt2.to(tl.bfloat16).to(tl.float32)
++            amax_c = tl.maximum(amax_c, tl.max(tl.where(jj < BLOCK_M, tl.abs(yb), 0.0), axis=1))
++        elif HAS_COL:
++            if TRANS_DOT:
++                # y^T = x^T @ bdiag^T keeps the wide hidden dim on the MMA M side
++                yt = tl.dot(tl.trans(x), tl.trans(bdiag)).to(tl.bfloat16).to(tl.float32)
++                amax_c = tl.maximum(amax_c, tl.max(tl.abs(yt), axis=1))
++            else:
++                y = tl.dot(bdiag, x).to(tl.bfloat16).to(tl.float32)
++                amax_c = tl.maximum(amax_c, tl.max(tl.abs(y), axis=0))
++
++        if HAS_DBIAS:
++            if HAS_SCALES:
++                s = tl.load(scales_ptr + grow, mask=row_mask, other=0.0)
++                dbias_acc += tl.sum(xf * s[:, None], axis=0)
++                if MMA_RED:
++                    ds = tl.sum(tl.dot(x, bmat), axis=1)
++                else:
++                    ds = tl.sum(xf * bias_vals[None, :], axis=1)
++                tl.atomic_add(dscales_ptr + grow, ds, mask=row_mask)
++            elif MMA_RED:
++                dbias_acc += tl.sum(tl.where(jj == BLOCK_M, yt2, 0.0), axis=1)
++            else:
++                dbias_acc += tl.sum(xf, axis=0)
++
++    if last > first:
++        tl.atomic_max(amax_row_ptr + g, tl.max(amax_r, axis=0))
++        tl.atomic_max(amax_col_ptr + g, tl.max(amax_c, axis=0))
++        if HAS_DBIAS:
++            tl.atomic_add(dbias_ptr + g * hidden + cols, dbias_acc, mask=col_mask)
++
++
++_RHT_T = os.environ.get("NVFP4_DYSTATS_RHT_T", "1") == "1"
++_rht_cache = {}
++
++
++def rht_operand(rht_matrix):
++    """The 16x16 left operand R' with column-wise RHT block = R' @ dy_block."""
++    key = (rht_matrix.data_ptr(), rht_matrix.device)
++    op = _rht_cache.get(key)
++    if op is None:
++        op = (rht_matrix.t() if _RHT_T else rht_matrix).contiguous()
++        _rht_cache[key] = op
++    return op
++
++
++def _cfg(hidden):
++    block_m = int(os.environ.get("NVFP4_DYSTATS_BLOCK_M", "64"))
++    block_h = int(os.environ.get("NVFP4_DYSTATS_BLOCK_H", "128"))
++    splits = int(os.environ.get("NVFP4_DYSTATS_SPLITS", "16"))
++    warps = int(os.environ.get("NVFP4_DYSTATS_WARPS", "4"))
++    stages = int(os.environ.get("NVFP4_DYSTATS_STAGES", "3"))
++    return block_m, block_h, splits, warps, stages
++
++
++_TRANS_DOT = os.environ.get("NVFP4_DYSTATS_TRANS", "1") == "1"
++_MMA_RED = os.environ.get("NVFP4_DYSTATS_MMA_RED", "0") == "1"
++
++
++def dy_stats(dy, offsets, rht_matrix, num_groups, *, dbias=True, scales=None, bias=None, cfg=None,
++             col=True, trans=None, mma_red=None):
++    """Returns (amax_row[G], amax_col[G], dbias[G, H] fp32 or None, dscales[M] fp32 or None)."""
++    rows, hidden = dy.shape
++    dev = dy.device
++    amax = torch.zeros(2, num_groups, dtype=torch.float32, device=dev)
++    has_scales = scales is not None
++    dbias_out = torch.zeros(num_groups, hidden, dtype=torch.float32, device=dev) if dbias else None
++    dscales = torch.zeros(rows, dtype=torch.float32, device=dev) if has_scales else None
++    block_m, block_h, splits, warps, stages = cfg or _cfg(hidden)
++    grid = (num_groups, splits, triton.cdiv(hidden, block_h))
++    _dy_stats_kernel[grid](
++        dy,
++        offsets,
++        rht_matrix,
++        amax[0],
++        amax[1],
++        dbias_out if dbias else amax,
++        scales if has_scales else amax,
++        bias if has_scales else amax,
++        dscales if has_scales else amax,
++        hidden,
++        HAS_DBIAS=dbias,
++        HAS_SCALES=has_scales,
++        HAS_COL=col,
++        TRANS_DOT=_TRANS_DOT if trans is None else trans,
++        MMA_RED=(_MMA_RED if mma_red is None else mma_red) and col,
++        N_ROW_SPLITS=splits,
++        BLOCK_M=block_m,
++        BLOCK_H=block_h,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return amax[0], amax[1], dbias_out, dscales
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_fp4_ag.py b/transformer_engine/pytorch/ops/fused/nvfp4_fp4_ag.py
+new file mode 100644
+index 00000000..99ac8f79
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_fp4_ag.py
+@@ -0,0 +1,665 @@
++# Classification: Internal
++"""NVFP4 param all-gather for the 2D-quantized expert weights (NVFP4_FP4_AG=1).
++
++Every rank used to all-gather the BF16 expert weights and cast all of them to NVFP4.
++Here each rank casts only the weights in its own distributed-optimizer shard and the
++ranks all-gather the NVFP4 row-wise and column-wise data and scales instead.
++
++Layout: tagged expert weights get their own DDP buckets (``layout``) in which every
++weight size is a multiple of ``unit`` = lcm(16 * cols) and buckets are padded to
++``dp * unit``, so every shard boundary inside a weight falls on a 16-row boundary. A
++16-row slice cast with the full-tensor amax reproduces the full 2D cast bit for bit
++(rows, scales and the slice's columns), so each rank's piece is exact.
++
++Per FP4 bucket of ``n`` elements there are four gather buffers proportional to the
++element order: row data (n/2 B), row scales (n/16 B), column data (n/2 B), column
++scales (n/16 B). A weight that lies in one shard has its final [cols, rows/2] column
++layout in place; a weight cut by a shard boundary has one [cols, (r1-r0)/2] piece per
++rank and is reassembled after the gather. Scale tensors that TE pads (rows to 128,
++tiles to 4) are copied into persistent padded buffers.
++
++The BF16 copies of these weights outside the local shard go stale once a bucket has
++been gathered in FP4, so from then on the weights must only be read through
++``lookup``. The first gathers (before any amax slot exists) stay in BF16. The first
++``lookup`` of a bucket (eager, e.g. CUDA graph warmup) fills the buffers from the
++replicated BF16 weights; the TE tensors it returns are persistent, so graphs captured
++afterwards read every later gather, and the per-weight fixup copies are captured with them.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++
++import torch
++
++ENABLED = os.environ.get("NVFP4_FP4_AG", "0") == "1"
++DEBUG_CHECK = int(os.environ.get("NVFP4_FP4_AG_CHECK", "0"))
++USE_KERNEL = os.environ.get("NVFP4_FP4_AG_KERNEL", "1") == "1"
++SHARD_CAST_CUDA = os.environ.get("NVFP4_SHARD_CAST_IMPL", "triton") == "cuda"
++_TAG = "_nvfp4_fp4_ag"
++
++_buckets = {}  # param_data.data_ptr() -> _Bucket
++_by_param = {}  # param -> (_Bucket, item index)
++_bucket_groups = []
++_copiers = {}  # tuple of weight ids -> BatchCopy2D (or False) for one lookup call
++_state = {"folding": False, "installed": False}
++stats = {"fp4_ag": 0, "bf16_ag": 0, "fixup": 0, "refresh": 0, "lookup": 0, "check_bad": 0}
++
++
++def _round(x, m):
++    return (x + m - 1) // m * m
++
++
++# ---------------------------------------------------------------------------- tagging
++
++
++def tag_module(module, num_layers, num_tail_layers, num_head_layers=0):
++    """Mark the 2D expert weights of every layer outside the BF16/MXFP8 head and tail."""
++    from megatron.core.transformer.transformer_layer import TransformerLayer
++
++    n = 0
++    for layer in module.modules():
++        if not isinstance(layer, TransformerLayer):
++            continue
++        if layer.layer_number > num_layers - num_tail_layers or layer.layer_number <= num_head_layers:
++            continue
++        experts = getattr(getattr(layer, "mlp", None), "experts", None)
++        if experts is None:
++            continue
++        owners = []
++        for mod in experts.modules():
++            hit = False
++            for name, p in mod._parameters.items():
++                if (p is not None and p.dim() == 2 and p.dtype == torch.bfloat16
++                        and name.startswith("weight") and name[6:].isdigit()):
++                    setattr(p, _TAG, True)
++                    hit = True
++                    n += 1
++            if hit:
++                owners.append(mod)
++        # The param buffer walks params in reverse registration order and needs each
++        # bucket to be one contiguous run, so keep the tagged weights adjacent.
++        for i, mod in enumerate(owners):
++            items = list(mod._parameters.items())
++            tagged = [kv for kv in items if kv[1] is not None and is_tagged(kv[1])]
++            other = [kv for kv in items if not (kv[1] is not None and is_tagged(kv[1]))]
++            mod._parameters.clear()
++            mod._parameters.update(other + tagged if i == 0 else tagged + other)
++    return n
++
++
++def is_tagged(p):
++    return getattr(p, _TAG, False)
++
++
++# ---------------------------------------------------------------------------- layout
++
++
++def make_layout(orig):
++    """Wrap DistributedOptimizer._compute_per_buffer_param_layout (see module docstring)."""
++    from megatron.core.optimizer.param_layout import (
++        PerBufferParamLayout,
++        bucket_end_divisor,
++        pad_bucket_end,
++        pad_param_start,
++        pad_to_divisor,
++    )
++
++    def layout(params, bucket_size, data_parallel_world_size, ddp_config, param_indices=None):
++        tagged = [p for p in params if is_tagged(p)]
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++            print(
++                f"NVFP4_FP4_AG layout call: {len(params)} params, {len(tagged)} tagged, "
++                f"bucket_size {bucket_size}, dp {data_parallel_world_size}",
++                flush=True,
++            )
++        if not tagged or bucket_size is None:
++            return orig(params, bucket_size, data_parallel_world_size, ddp_config, param_indices)
++        unit = math.lcm(*{16 * p.shape[1] for p in tagged})
++        for p in tagged:
++            if p.numel() % unit or p.shape[0] % 16:
++                setattr(p, _TAG, False)
++        dp = data_parallel_world_size
++        fp4_div = math.lcm(dp * unit, bucket_end_divisor(dp, ddp_config.pad_buckets_for_high_nccl_busbw))
++
++        index_map, bucket_indices, unpadded = {}, [], []
++        cursor = [0]
++
++        def emit(plist, fp4):
++            if not plist:
++                return
++            start = cursor[0]
++            pos = start
++            for p in plist:
++                if not fp4:
++                    pos = pad_param_start(pos)
++                index_map[p] = (pos, pos + p.numel(), len(bucket_indices))
++                pos += p.numel()
++            unpadded.append(pos - start)
++            if fp4:
++                end = start + pad_to_divisor(pos - start, fp4_div)
++            else:
++                end = pad_bucket_end(pos, dp, ddp_config.pad_buckets_for_high_nccl_busbw)
++            bucket_indices.append((start, end))
++            cursor[0] = end
++            plist.clear()
++
++        # Buckets must be contiguous runs of params[::-1]: cut at every tagged/untagged switch.
++        # A layer's expert weights stay in one FP4 bucket rather than leaving a small remainder.
++        run, run_fp4, run_n = [], False, 0
++        for p in params[::-1]:
++            shared = getattr(p, "shared_embedding", False)
++            t = is_tagged(p)
++            if run and (t != run_fp4 or shared):
++                emit(run, run_fp4)
++                run_n = 0
++            run_fp4 = t
++            run.append(p)
++            run_n += p.numel()
++            if (not t and run_n >= bucket_size) or shared:
++                emit(run, run_fp4)
++                run_n = 0
++        emit(run, run_fp4)
++
++        index_map = {p: index_map[p] for p in params[::-1]}
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++            nfp4 = sum(1 for p in params if is_tagged(p))
++            print(
++                f"NVFP4_FP4_AG layout: {len(bucket_indices)} buckets, {nfp4} FP4 weights, unit {unit}, "
++                f"numel {cursor[0]} (orig unpadded {sum(p.numel() for p in params)})",
++                flush=True,
++            )
++        return PerBufferParamLayout(
++            param_index_map=index_map,
++            bucket_indices=bucket_indices,
++            per_bucket_numel_unpadded=unpadded,
++            param_indices=param_indices if param_indices is not None else [],
++            num_optimizer_shards=dp,
++        )
++
++    return staticmethod(layout)
++
++
++# ---------------------------------------------------------------------------- buckets
++
++
++class _Item:
++    __slots__ = ("param", "off", "rows", "cols", "pieces", "local", "tensor", "row_scale_pad",
++                 "col_data_full", "col_scale_pad")
++
++    def __init__(self, param, off):
++        self.param = param
++        self.off = off
++        self.rows, self.cols = param.shape
++        self.pieces = []  # (r0, r1) per shard that holds rows of this weight
++        self.local = None  # (r0, r1) held by this rank
++        self.tensor = None
++
++
++class _Bucket:
++    def __init__(self, bucket, group):
++        pd = bucket.param_data
++        self.param_data = pd
++        self.n = pd.numel()
++        self.size = group.intra_distributed_optimizer_instance_size
++        self.rank = group.intra_distributed_optimizer_instance_rank
++        self.group = group
++        assert self.n % (32 * self.size) == 0, self.n
++        dev = pd.device
++        self.data_r = torch.zeros(self.n // 2, dtype=torch.uint8, device=dev)
++        self.scale_r = torch.zeros(self.n // 16, dtype=torch.uint8, device=dev)
++        self.data_c = torch.zeros(self.n // 2, dtype=torch.uint8, device=dev)
++        self.scale_c = torch.zeros(self.n // 16, dtype=torch.uint8, device=dev)
++        shard = self.n // self.size
++        self.items = []
++        for p in bucket.params_list:
++            off = (p.data_ptr() - pd.data_ptr()) // pd.element_size()
++            it = _Item(p, off)
++            for r in range(self.size):
++                lo, hi = max(off, r * shard), min(off + p.numel(), (r + 1) * shard)
++                if hi <= lo:
++                    continue
++                assert (lo - off) % (16 * it.cols) == 0 and (hi - off) % (16 * it.cols) == 0, (
++                    "FP4 bucket shard boundary not on a 16-row boundary"
++                )
++                piece = ((lo - off) // it.cols, (hi - off) // it.cols)
++                it.pieces.append(piece)
++                if r == self.rank:
++                    it.local = piece
++            self.items.append(it)
++            _by_param[p] = (self, len(self.items) - 1)
++        lo, hi = self.rank * shard, (self.rank + 1) * shard
++        self.shards = (
++            self.data_r[lo // 2 : hi // 2],
++            self.scale_r[lo // 16 : hi // 16],
++            self.data_c[lo // 2 : hi // 2],
++            self.scale_c[lo // 16 : hi // 16],
++        )
++        self.prepared = False  # local pieces cast for the next gather
++        self.valid = False  # an FP4 gather has been issued (BF16 copies are stale)
++        self.armed = False  # buffers hold the current weights; every later gather is FP4
++        self.quantizer = None
++        self.kernel = None
++
++    def ready(self, shard_amax):
++        return all(shard_amax.slot_for(it.param) is not None for it in self.items)
++
++    def _store(self, it, t, r0, r1, base):
++        """Copy rows [r0, r1) of ``t`` (a cast of the weight rows from ``base``) into the buffers."""
++        cols = it.cols
++        e0, e1 = it.off + r0 * cols, it.off + r1 * cols
++        a, b = r0 - base, r1 - base
++        k = cols // 16
++        self.data_r[e0 // 2 : e1 // 2].view(r1 - r0, cols // 2).copy_(t._rowwise_data[a:b])
++        self.scale_r[e0 // 16 : e1 // 16].view(r1 - r0, k).copy_(
++            t._rowwise_scale_inv.view(torch.uint8)[a:b, :k]
++        )
++        self.data_c[e0 // 2 : e1 // 2].view(cols, (r1 - r0) // 2).copy_(
++            t._columnwise_data[:, a // 2 : b // 2]
++        )
++        self.scale_c[e0 // 16 : e1 // 16].view(cols, (r1 - r0) // 16).copy_(
++            t._columnwise_scale_inv.view(torch.uint8)[:cols, a // 16 : b // 16]
++        )
++
++    def cast_local(self, shard_amax):
++        if USE_KERNEL:
++            if self.kernel is None:
++                from transformer_engine.pytorch.ops.fused import grouped_mlp as _gm
++
++                pieces = []
++                for it in self.items:
++                    if it.local is None:
++                        continue
++                    r0, r1 = it.local
++                    e0 = it.off + r0 * it.cols
++                    pieces.append((e0, r1 - r0, it.cols, shard_amax._slots[it.param],
++                                   e0 // 2, e0 // 16, e0 // 2, e0 // 16))
++                if not pieces:
++                    self.kernel = False
++                elif SHARD_CAST_CUDA and _gm._v7_module("nvfp4_shard_cast_cuda").supported(pieces):
++                    self.kernel = _gm._v7_module("nvfp4_shard_cast_cuda").ShardCastCUDA(pieces, self.data_r.device)
++                else:
++                    self.kernel = _gm._v7_module("nvfp4_shard_cast").ShardCast(pieces, self.data_r.device)
++                if pieces and not stats.get("cast_impl") and torch.distributed.get_rank() == 0:
++                    stats["cast_impl"] = type(self.kernel).__name__
++                    print(f"NVFP4_FP4_AG shard cast: {stats['cast_impl']}", flush=True)
++            if self.kernel:
++                self.kernel(self.param_data, shard_amax._amax_buf, self.data_r, self.scale_r, self.data_c, self.scale_c)
++            return
++        import transformer_engine_torch as tex
++
++        q = self.quantizer
++        for it in self.items:
++            if it.local is None:
++                continue
++            r0, r1 = it.local
++            amax = shard_amax.slot_for(it.param)
++            w = it.param.detach().view(it.rows, it.cols)[r0:r1]
++            self._store(it, tex.nvfp4_quantize_with_amax(w, q, amax, amax), r0, r1, r0)
++
++    def arm(self, shard_amax):
++        """Fill every rank's region from the (still replicated) BF16 weights, eager only."""
++        import transformer_engine_torch as tex
++
++        if self.armed:
++            return
++        if self.quantizer is None:
++            self.quantizer = _row_col_quantizer()
++        if not self.valid:
++            for it in self.items:
++                amax = shard_amax.slot_for(it.param)
++                if amax is None:
++                    amax = shard_amax.register(it.param)
++                if amax is None:
++                    raise RuntimeError("NVFP4_FP4_AG: no amax slot for an FP4 weight")
++                t = tex.nvfp4_quantize_with_amax(it.param.detach(), self.quantizer, amax, amax)
++                for r0, r1 in it.pieces:
++                    self._store(it, t, r0, r1, 0)
++        self.armed = True
++
++    # -- TE tensors over the gathered buffers
++
++    def _build_tensor(self, it, template):
++        rows, cols = it.rows, it.cols
++        whole = len(it.pieces) == 1
++        e0, e1 = it.off // 2, (it.off + rows * cols) // 2
++        s0, s1 = it.off // 16, (it.off + rows * cols) // 16
++        t = template
++        dev = self.data_r.device
++        t._rowwise_data = self.data_r[e0:e1].view(rows, cols // 2)
++        rs_shape = (_round(rows, 128), _round(cols // 16, 4))
++        if rs_shape == (rows, cols // 16):
++            it.row_scale_pad = None
++            t._rowwise_scale_inv = self.scale_r[s0:s1].view(rows, cols // 16).view(t._rowwise_scale_inv.dtype)
++        else:
++            it.row_scale_pad = torch.zeros(rs_shape, dtype=torch.uint8, device=dev)
++            t._rowwise_scale_inv = it.row_scale_pad.view(t._rowwise_scale_inv.dtype)
++        if whole:
++            it.col_data_full = None
++            t._columnwise_data = self.data_c[e0:e1].view(cols, rows // 2)
++        else:
++            it.col_data_full = torch.zeros((cols, rows // 2), dtype=torch.uint8, device=dev)
++            t._columnwise_data = it.col_data_full
++        cs_shape = (_round(cols, 128), _round(rows // 16, 4))
++        if whole and cs_shape == (cols, rows // 16):
++            it.col_scale_pad = None
++            t._columnwise_scale_inv = self.scale_c[s0:s1].view(cols, rows // 16).view(
++                t._columnwise_scale_inv.dtype
++            )
++        else:
++            it.col_scale_pad = torch.zeros(cs_shape, dtype=torch.uint8, device=dev)
++            t._columnwise_scale_inv = it.col_scale_pad.view(t._columnwise_scale_inv.dtype)
++        it.tensor = t
++
++    def fixup_entries(self, it):
++        """(src, dst) copies that assemble one weight's padded scales and cut pieces."""
++        rows, cols = it.rows, it.cols
++        s0, s1 = it.off // 16, (it.off + rows * cols) // 16
++        out = []
++        if it.row_scale_pad is not None:
++            out.append((self.scale_r[s0:s1].view(rows, cols // 16), it.row_scale_pad[:rows, : cols // 16]))
++        if len(it.pieces) == 1:
++            if it.col_scale_pad is not None:
++                out.append((self.scale_c[s0:s1].view(cols, rows // 16), it.col_scale_pad[:cols, : rows // 16]))
++            return out
++        for r0, r1 in it.pieces:
++            e0, e1 = it.off + r0 * cols, it.off + r1 * cols
++            out.append((self.data_c[e0 // 2 : e1 // 2].view(cols, (r1 - r0) // 2),
++                        it.col_data_full[:, r0 // 2 : r1 // 2]))
++            out.append((self.scale_c[e0 // 16 : e1 // 16].view(cols, (r1 - r0) // 16),
++                        it.col_scale_pad[:cols, r0 // 16 : r1 // 16]))
++        return out
++
++    def fixup(self, it):
++        """Assemble one weight's padded scales and cut pieces (current stream, graph-safe)."""
++        for src, dst in self.fixup_entries(it):
++            dst.copy_(src)
++
++
++# ---------------------------------------------------------------------------- hooks
++
++
++def _shard_amax():
++    from transformer_engine.pytorch.ops.fused import nvfp4_shard_weight_amax
++
++    return nvfp4_shard_weight_amax
++
++
++def _discover():
++    for group in _bucket_groups:
++        for bucket in group.buckets:
++            key = bucket.param_data.data_ptr() if bucket.param_data is not None else None
++            if key is None or key in _buckets:
++                continue
++            if bucket.params_list and all(is_tagged(p) for p in bucket.params_list):
++                _buckets[key] = _Bucket(bucket, group)
++    _state["discovered"] = len(_bucket_groups)
++
++
++def _group_fp4_buckets(group):
++    if _state.get("discovered") != len(_bucket_groups):
++        _discover()
++    return [_buckets[b.param_data.data_ptr()] for b in group.buckets
++            if b.param_data is not None and b.param_data.data_ptr() in _buckets]
++
++
++def _prepare(group):
++    """Cast this group's local FP4 pieces before its gather is dispatched."""
++    stats["prepare_calls"] = stats.get("prepare_calls", 0) + 1
++    fbs = _group_fp4_buckets(group)
++    if not fbs:
++        return
++    sa = _shard_amax()
++    if not all(fb.ready(sa) for fb in fbs):
++        if any(fb.armed or fb.valid for fb in fbs):
++            raise RuntimeError("NVFP4_FP4_AG: amax slots missing for an armed FP4 bucket")
++        stats["not_ready"] = stats.get("not_ready", 0) + 1
++        if DEBUG_CHECK > 0 and stats["not_ready"] <= 2 and torch.distributed.get_rank() == 0:
++            print(f"NVFP4_FP4_AG not ready: {len(sa._slots)} amax slots, {stats}", flush=True)
++        return
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("NVFP4_FP4_AG: param gather dispatched under graph capture")
++    if _state["folding"]:
++        # Early phased gathers run before the amax fold is all-reduced.
++        sa.refresh_subset(_bucket_groups, [group])
++        stats["refresh"] += 1
++    for fb in fbs:
++        if fb.quantizer is None:
++            fb.quantizer = _row_col_quantizer()
++        fb.cast_local(sa)
++        fb.prepared = True
++
++
++def _row_col_quantizer():
++    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
++
++    return NVFP4Quantizer(rowwise=True, columnwise=True, with_2d_quantization=True, stochastic_rounding=False)
++
++
++def install():
++    """Patch Megatron's layout, bucket-group tracking, param sync and all-gather function."""
++    if not ENABLED or _state["installed"]:
++        return
++    _state["installed"] = True
++    from megatron.core.distributed import distributed_data_parallel as mc_ddp
++    from megatron.core.distributed import param_and_grad_buffer as pgb
++    from megatron.core.optimizer import distrib_optimizer as mc_do
++
++    num_layers = int(os.environ.get("OVERWRITTEN_NUM_LAYERS", "24"))
++    num_tail = int(os.environ.get("NUM_LAYERS_AT_END_IN_BF16", "0"))
++    num_head = int(os.environ.get("NUM_LAYERS_AT_START_IN_BF16", "0"))
++    if os.environ.get("NVTE_NVFP4_4OVER6", "none") != "none":
++        raise RuntimeError("NVFP4_FP4_AG: the shard cast kernel does not implement 4over6")
++
++    from megatron.core.transformer.transformer_layer import TransformerLayer
++
++    # compute_full_param_layout runs before DDP is built, so tag at layer construction.
++    orig_layer_init = TransformerLayer.__init__
++
++    def layer_init(self, *args, **kwargs):
++        orig_layer_init(self, *args, **kwargs)
++        tag_module(self, num_layers, num_tail, num_head)
++
++    TransformerLayer.__init__ = layer_init
++
++    orig_ddp_init = mc_ddp.DistributedDataParallel.__init__
++
++    def ddp_init(self, config, ddp_config, module, *args, **kwargs):
++        n = tag_module(module, num_layers, num_tail, num_head)
++        if torch.distributed.get_rank() == 0:
++            print(
++                f"NVFP4_FP4_AG: tagged {n} expert weights (head {num_head} / tail {num_tail} "
++                "layers excluded); "
++                f"DDP args {len(args)} kwargs {sorted(kwargs)}",
++                flush=True,
++            )
++        out = orig_ddp_init(self, config, ddp_config, module, *args, **kwargs)
++        if torch.distributed.get_rank() == 0:
++            groups = list(getattr(self, "bucket_groups", [])) + list(
++                getattr(self, "expert_parallel_bucket_groups", [])
++            )
++            buckets = [b for g in groups for b in g.buckets]
++            nfp4 = sum(1 for b in buckets if b.params_list and all(is_tagged(p) for p in b.params_list))
++            print(f"NVFP4_FP4_AG: DDP has {len(buckets)} buckets, {nfp4} all-FP4", flush=True)
++        return out
++
++    mc_ddp.DistributedDataParallel.__init__ = ddp_init
++    mc_do.DistributedOptimizer._compute_per_buffer_param_layout = make_layout(
++        mc_do.DistributedOptimizer._compute_per_buffer_param_layout
++    )
++
++    orig_group_init = pgb._ParamAndGradBucketGroup.__init__
++
++    def group_init(self, *args, **kwargs):
++        orig_group_init(self, *args, **kwargs)
++        _bucket_groups.append(self)
++
++    pgb._ParamAndGradBucketGroup.__init__ = group_init
++
++    orig_start = pgb._ParamAndGradBucketGroup.start_param_sync
++
++    def start_param_sync(self, force_sync=False):
++        stats["sps_calls"] = stats.get("sps_calls", 0) + 1
++        if not (force_sync and self.param_gather_handle is not None):
++            _prepare(self)
++        return orig_start(self, force_sync)
++
++    pgb._ParamAndGradBucketGroup.start_param_sync = start_param_sync
++
++    orig_ag = pgb.dist_all_gather_func
++
++    def all_gather(out, inp, group=None, async_op=False):
++        stats["ag_calls"] = stats.get("ag_calls", 0) + 1
++        fb = _buckets.get(out.data_ptr())
++        if fb is None:
++            return orig_ag(out, inp, group=group, async_op=async_op)
++        if not fb.prepared:
++            if fb.valid or fb.armed:
++                raise RuntimeError("NVFP4_FP4_AG: FP4 bucket gathered without a local cast")
++            stats["bf16_ag"] += 1
++            return orig_ag(out, inp, group=group, async_op=async_op)
++        fb.prepared = False
++        fb.valid = True
++        stats["fp4_ag"] += 1
++        work = None
++        for full, shard in zip((fb.data_r, fb.scale_r, fb.data_c, fb.scale_c), fb.shards):
++            work = orig_ag(full, shard, group=group, async_op=async_op)
++        return work
++
++    pgb.dist_all_gather_func = all_gather
++
++    sa = _shard_amax()
++    orig_begin, orig_finish = sa.begin_fold, sa.finish_fold
++
++    def begin_fold(*args, **kwargs):
++        ok = orig_begin(*args, **kwargs)
++        _state["folding"] = bool(ok)
++        return ok
++
++    def finish_fold(*args, **kwargs):
++        _state["folding"] = False
++        return orig_finish(*args, **kwargs)
++
++    sa.begin_fold, sa.finish_fold = begin_fold, finish_fold
++
++    if DEBUG_CHECK > 0:
++        import atexit
++
++        def _dump():
++            print(
++                f"NVFP4_FP4_AG exit: {stats} groups {len(_bucket_groups)} fp4 buckets {len(_buckets)} "
++                f"sps is ours {pgb._ParamAndGradBucketGroup.start_param_sync is start_param_sync} "
++                f"ag is ours {pgb.dist_all_gather_func is all_gather}",
++                flush=True,
++            )
++
++        atexit.register(_dump)
++
++
++def lookup(weights, quantizers):
++    """NVFP4 tensors over the gathered buffers for ``weights``, or None if not all valid."""
++    if not ENABLED or not weights:
++        return None
++    stats["lookup_calls"] = stats.get("lookup_calls", 0) + 1
++    if DEBUG_CHECK > 0 and stats["lookup_calls"] in (400, 2000, 4000) and torch.distributed.get_rank() == 0:
++        sa = _shard_amax()
++        print(
++            f"NVFP4_FP4_AG diag: {stats} groups {len(_bucket_groups)} fp4 buckets {len(_buckets)} "
++            f"ready {[fb.ready(sa) for fb in _buckets.values()][:4]} "
++            f"valid {sum(fb.valid for fb in _buckets.values())} known {sum(w in _by_param for w in weights)}",
++            flush=True,
++        )
++    if _state.get("discovered") != len(_bucket_groups):
++        _discover()
++    entries = [_by_param.get(w) for w in weights]
++    if any(e is None for e in entries):
++        return None
++    sa = _shard_amax()
++    for fb in {id(e[0]): e[0] for e in entries}.values():
++        # TE fused ops are not called as modules, so DDP's forward pre-hooks never finish
++        # an expert-only bucket group in eager mode (the graph replay path does).
++        if fb.group.param_gather_handle is not None and not torch.cuda.is_current_stream_capturing():
++            fb.group.finish_param_sync()
++            stats["eager_finish"] = stats.get("eager_finish", 0) + 1
++        if not fb.armed:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("NVFP4_FP4_AG: first use of an FP4 bucket under graph capture")
++            fb.arm(sa)
++            stats["armed"] = stats.get("armed", 0) + 1
++    out = []
++    for (fb, idx), w, q in zip(entries, weights, quantizers):
++        it = fb.items[idx]
++        if it.tensor is None:
++            both = q.copy()
++            both.set_usage(rowwise=True, columnwise=True)
++            fb._build_tensor(it, both.make_empty(w.shape, dtype=w.dtype, device=w.device))
++            amax = sa.slot_for(w)
++            it.tensor._amax_rowwise = amax
++            it.tensor._amax_columnwise = amax
++        out.append(it.tensor)
++    if USE_KERNEL:
++        key = tuple(id(w) for w in weights)
++        copier = _copiers.get(key)
++        if copier is None:
++            pairs = [p for (fb, idx) in entries for p in fb.fixup_entries(fb.items[idx])]
++            if pairs:
++                from transformer_engine.pytorch.ops.fused import grouped_mlp as _gm
++
++                copier = _gm._v7_module("nvfp4_shard_cast").BatchCopy2D(pairs, weights[0].device)
++            else:
++                copier = False
++            _copiers[key] = copier
++        if copier:
++            copier()
++    else:
++        for fb, idx in entries:
++            fb.fixup(fb.items[idx])
++    stats["lookup"] += 1
++    n = stats["lookup"]
++    if DEBUG_CHECK > 0 and (n <= DEBUG_CHECK or n % 200 == 0) and not torch.cuda.is_current_stream_capturing():
++        _check(weights, out)
++    return out
++
++
++def _check(weights, out):
++    """Local rows against a fresh cast of the local shard, full tensors against the other ranks."""
++    import transformer_engine_torch as tex
++
++    sa = _shard_amax()
++    bad = 0
++    sums = []
++    for w, t in zip(weights, out):
++        fb, idx = _by_param[w]
++        it = fb.items[idx]
++        rows, cols = it.rows, it.cols
++        parts = (
++            t._rowwise_data, t._rowwise_scale_inv.view(torch.uint8)[:rows, : cols // 16],
++            t._columnwise_data, t._columnwise_scale_inv.view(torch.uint8)[:cols, : rows // 16],
++        )
++        sums += [p.to(torch.int64).sum() for p in parts]
++        if it.local is None:
++            continue
++        r0, r1 = it.local
++        ref = tex.nvfp4_quantize_with_amax(w.detach()[r0:r1], _row_col_quantizer(), sa.slot_for(w), sa.slot_for(w))
++        ok = (
++            torch.equal(t._rowwise_data[r0:r1], ref._rowwise_data)
++            and torch.equal(parts[1][r0:r1], ref._rowwise_scale_inv.view(torch.uint8)[: r1 - r0, : cols // 16])
++            and torch.equal(t._columnwise_data[:, r0 // 2 : r1 // 2], ref._columnwise_data)
++            and torch.equal(parts[3][:, r0 // 16 : r1 // 16],
++                            ref._columnwise_scale_inv.view(torch.uint8)[:cols, : (r1 - r0) // 16])
++        )
++        bad += not ok
++    fb = _by_param[weights[0]][0]
++    s = torch.stack(sums)
++    lo, hi = s.clone(), s.clone()
++    pg = fb.group.intra_distributed_optimizer_instance_group
++    torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=pg)
++    torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=pg)
++    diverged = int((lo != hi).sum())
++    stats["check_bad"] += bad
++    stats["check_diverged"] = stats.get("check_diverged", 0) + diverged
++    stats["checks"] = stats.get("checks", 0) + 1
++    if bad or diverged or stats["lookup"] in (1, DEBUG_CHECK) or stats["checks"] % 10 == 0:
++        print(f"NVFP4_FP4_AG check rank{torch.distributed.get_rank()}: {bad} bad {diverged} diverged {stats}",
++              flush=True)
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_qkv_packed.py b/transformer_engine/pytorch/ops/fused/nvfp4_qkv_packed.py
+new file mode 100644
+index 00000000..fddccb78
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_qkv_packed.py
+@@ -0,0 +1,221 @@
++# Classification: Internal
++"""Q, K, V from the Triton QKV RoPE written back to back into one buffer (NVFP4_QKV_PACKED=1).
++
++For separate sbhd Q, K, V the FP8 DPA quantizes them together: ``combine_and_quantize``
++flattens and concatenates them into a fresh BF16 buffer first (a full copy, ~70 us per
++full-attention layer). With the RoPE outputs already consecutive in one storage,
++``get_qkv_layout`` still reports ``sbhd_sbhd_sbhd`` and the flat view of that storage
++holds exactly the concatenation, so it is quantized in place. Bit-identical.
++
++NVFP4_QKV_PACKED_AMAX=1 also drops the current-scaling amax pass (~47 us per layer): the
++RoPE kernel writes the max |output| of each program, one program reduces those and
++computes the scale exactly as ``compute_scale_from_amax`` (__fdiv_rn(max_fp8, amax)),
++and the cast runs through a delayed-scaling quantizer with that scale (the same cast
++kernel the current-scaling quantizer launches).
++"""
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra.cuda import libdevice
++
++_AMAX = os.environ.get("NVFP4_QKV_PACKED_AMAX", "0") == "1"
++_stats = {"packed": 0, "fallback": 0, "amax": 0}
++_last = [None]  # (storage data_ptr, per-program amax parts) of the latest packed RoPE output
++
++
++@triton.jit
++def _qkv_rope_fwd_amax_kernel(
++    qkv_ptr, fq_ptr, fk_ptr, q_ptr, k_ptr, v_ptr, parts_ptr, batch, freq_stride,
++    G: tl.constexpr, HQ: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr,
++):
++    # nvfp4_triton_qkv_rope._qkv_rope_fwd_kernel plus the max |output| of the program.
++    HALF: tl.constexpr = D // 2
++    HG: tl.constexpr = HQ + 2
++    row = tl.program_id(0).to(tl.int64)
++    g = tl.program_id(1)
++    pos = row // batch
++    r = tl.arange(0, BLOCK_R)[:, None]
++    j = tl.arange(0, HALF)[None, :]
++    rmask = r < HG
++    isq = r < HQ
++    isv = r == HQ + 1
++
++    base = qkv_ptr + row * (G * HG * D) + (g * HG + r) * D + j
++    x1 = tl.load(base, mask=rmask, other=0.0).to(tl.float32)
++    x2 = tl.load(base + HALF, mask=rmask, other=0.0).to(tl.float32)
++    fb = pos * freq_stride + j
++    fq1 = tl.load(fq_ptr + fb)
++    fq2 = tl.load(fq_ptr + fb + HALF)
++    fk1 = tl.load(fk_ptr + fb)
++    fk2 = tl.load(fk_ptr + fb + HALF)
++    c1 = tl.where(isq, libdevice.cos(fq1), libdevice.cos(fk1))
++    s1 = tl.where(isq, libdevice.sin(fq1), libdevice.sin(fk1))
++    c2 = tl.where(isq, libdevice.cos(fq2), libdevice.cos(fk2))
++    s2 = tl.where(isq, libdevice.sin(fq2), libdevice.sin(fk2))
++    o1 = x1 * c1 + (-x2) * s1
++    o2 = x2 * c2 + x1 * s2
++    o1 = tl.where(isv, x1, o1).to(q_ptr.dtype.element_ty)
++    o2 = tl.where(isv, x2, o2).to(q_ptr.dtype.element_ty)
++
++    qo = q_ptr + row * (G * HQ * D) + (g * HQ + r) * D + j
++    mq = rmask & isq
++    tl.store(qo, o1, mask=mq)
++    tl.store(qo + HALF, o2, mask=mq)
++    kvo = row * (G * D) + g * D + j + r * 0
++    mk = r == HQ
++    tl.store(k_ptr + kvo, o1, mask=mk)
++    tl.store(k_ptr + kvo + HALF, o2, mask=mk)
++    tl.store(v_ptr + kvo, o1, mask=isv)
++    tl.store(v_ptr + kvo + HALF, o2, mask=isv)
++    a = tl.maximum(tl.abs(o1.to(tl.float32)), tl.abs(o2.to(tl.float32)))
++    a = tl.where(rmask, a, 0.0)
++    tl.store(parts_ptr + row * G + g, tl.max(tl.max(a, axis=1), axis=0))
++
++
++@triton.jit
++def _amax_scale_kernel(parts_ptr, n, amax_ptr, scale_ptr, max_fp8, epsilon,
++                       POW2: tl.constexpr, BLOCK: tl.constexpr):
++    offs = tl.arange(0, BLOCK)
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for start in range(0, n, BLOCK):
++        acc = tl.maximum(acc, tl.load(parts_ptr + start + offs, mask=start + offs < n, other=0.0))
++    amax = tl.max(acc, axis=0)
++    tl.store(amax_ptr, amax)
++    am = tl.where(amax < epsilon, epsilon, amax)
++    scale = libdevice.div_rn(max_fp8, am)
++    scale = tl.where(scale == float("inf"), 3.4028234663852886e38, scale)
++    if POW2:
++        scale = (scale.to(tl.uint32, bitcast=True) & 0xFF800000).to(tl.float32, bitcast=True)
++    scale = tl.where((am == 0.0) | (am == float("inf")) | (am != am), 1.0, scale)
++    tl.store(scale_ptr, scale)
++
++
++def _packed_forward(tqr):
++    def forward(ctx, qkv, q_freqs, k_freqs, split):
++        s, b, g, _ = qkv.shape
++        d = split[1]
++        hq = split[0] // d
++        nq = s * b * g * hq * d
++        nk = s * b * g * d
++        buf = qkv.new_empty(nq + 2 * nk)
++        q = buf[:nq].view(s, b, g * hq, d)
++        k = buf[nq : nq + nk].view(s, b, g, d)
++        v = buf[nq + nk :].view(s, b, g, d)
++        fq = q_freqs.float().contiguous()
++        fk = k_freqs.float().contiguous()
++        block_r = triton.next_power_of_2(hq + 2)
++        if _AMAX:
++            parts = torch.empty(s * b * g, dtype=torch.float32, device=qkv.device)
++            _qkv_rope_fwd_amax_kernel[(s * b, g)](
++                qkv, fq, fk, q, k, v, parts, b, fq.stride(0),
++                G=g, HQ=hq, D=d, BLOCK_R=block_r, num_warps=1,
++            )
++            _last[0] = (buf.untyped_storage().data_ptr(), parts)
++        else:
++            tqr._qkv_rope_fwd_kernel[(s * b, g)](
++                qkv, fq, fk, q, k, v, b, fq.stride(0),
++                G=g, HQ=hq, D=d, BLOCK_R=block_r, num_warps=1,
++            )
++        ctx.save_for_backward(fq, fk)
++        ctx.meta = (g, hq, d, b, block_r, qkv.shape, qkv.dtype)
++        return q, k, v
++
++    return forward
++
++
++def packed_flat(q, k, v):
++    """Flat view of ``q|k|v`` if they are contiguous and consecutive in one storage, else None."""
++    if not (q.dtype == k.dtype == v.dtype and all(x.is_contiguous() for x in (q, k, v))):
++        return None
++    st = q.untyped_storage().data_ptr()
++    if k.untyped_storage().data_ptr() != st or v.untyped_storage().data_ptr() != st:
++        return None
++    if (
++        k.storage_offset() != q.storage_offset() + q.numel()
++        or v.storage_offset() != k.storage_offset() + k.numel()
++    ):
++        return None
++    return q.as_strided((q.numel() + k.numel() + v.numel(),), (1,), q.storage_offset())
++
++
++def _quantize_with_parts(utils, qkv, quantizer, parts):
++    max_fp8 = 448.0 if int(quantizer.dtype) == int(utils.tex.DType.kFloat8E4M3) else 57344.0
++    amax = torch.empty(1, dtype=torch.float32, device=qkv.device)
++    scale = torch.empty(1, dtype=torch.float32, device=qkv.device)
++    _amax_scale_kernel[(1,)](
++        parts, parts.numel(), amax, scale, max_fp8, float(quantizer.amax_epsilon),
++        POW2=bool(quantizer.force_pow_2_scales), BLOCK=4096, num_warps=8,
++    )
++    fq = utils.Float8Quantizer(scale, amax, quantizer.dtype, rowwise=quantizer.rowwise_usage,
++                               columnwise=quantizer.columnwise_usage)
++    fq.internal = quantizer.internal
++    out = fq(qkv)
++    out._quantizer = quantizer
++    return out
++
++
++def make_combine_and_quantize(utils):
++    orig = utils.combine_and_quantize
++
++    def combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer, used_in_forward=True,
++                             used_in_backward=False, keep_same_data_and_scale_inv_format=False):
++        n = _stats["packed"] + _stats["fallback"]
++        if n == 64 and int(os.environ.get("RANK", "0")) == 0:
++            print(f"NVFP4_QKV_PACKED stats {_stats} layout {qkv_layout} q {tuple(q.shape)} "
++                  f"{q.stride()} off {q.storage_offset()} k off {k.storage_offset()} "
++                  f"quantizer {type(qkv_quantizer).__name__}", flush=True)
++        layout = qkv_layout.replace("paged_kv_", "")
++        qkv = None
++        if (
++            layout in ("sbhd_sbhd_sbhd", "bshd_bshd_bshd")
++            and qkv_layout == layout
++            and isinstance(qkv_quantizer, (utils.Float8Quantizer, utils.Float8CurrentScalingQuantizer))
++        ):
++            qkv = packed_flat(q, k, v)
++        if qkv is None:
++            _stats["fallback"] += 1
++            return orig(qkv_layout, q, k, v, qkv_quantizer, used_in_forward, used_in_backward,
++                        keep_same_data_and_scale_inv_format)
++        _stats["packed"] += 1
++        last, _last[0] = _last[0], None
++        if (
++            last is not None
++            and last[0] == q.untyped_storage().data_ptr()
++            and q.storage_offset() == 0
++            and isinstance(qkv_quantizer, utils.Float8CurrentScalingQuantizer)
++            and not qkv_quantizer.with_amax_reduction
++        ):
++            _stats["amax"] += 1
++            qkv_fp8 = _quantize_with_parts(utils, qkv, qkv_quantizer, last[1])
++        else:
++            qkv_fp8 = qkv_quantizer(qkv)
++        tensors = [q, k, v]
++        shapes = [x.shape for x in tensors]
++        numels = [x.numel() for x in tensors]
++        numels = [sum(numels[:i]) for i in range(4)]
++        q_data, k_data, v_data = [
++            qkv_fp8._data[numels[i] : numels[i + 1]].view(shapes[i]) for i in range(3)
++        ]
++        q_fp8, k_fp8, v_fp8 = [
++            utils.Float8Tensor.make_like(qkv_fp8, data=x, dtype=q.dtype)
++            for x in [q_data, k_data, v_data]
++        ]
++        return q_fp8, k_fp8, v_fp8, qkv_layout, None
++
++    return combine_and_quantize
++
++
++def install():
++    from transformer_engine.pytorch.attention.dot_product_attention import backends
++    from transformer_engine.pytorch.attention.dot_product_attention import utils
++    from transformer_engine.pytorch.ops.basic import nvfp4_triton_qkv_rope as tqr
++
++    tqr.TritonQKVRoPE.forward = staticmethod(_packed_forward(tqr))
++    cq = make_combine_and_quantize(utils)
++    utils.combine_and_quantize = cq
++    backends.combine_and_quantize = cq
++    if int(os.environ.get("RANK", "0")) == 0:
++        print(f"NVFP4_QKV_PACKED installed (amax {int(_AMAX)})", flush=True)
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_resgrad.py b/transformer_engine/pytorch/ops/fused/nvfp4_resgrad.py
+new file mode 100644
+index 00000000..cdb88b93
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_resgrad.py
+@@ -0,0 +1,400 @@
++# Classification: Internal
++"""Gradient sums folded into the Triton RMSNorm backward (NVFP4_RESGRAD=1).
++
++A layer input ``h`` feeds both the residual add and the RMSNorm in front of the
++sublayer, so autograd sums ``d_residual + d_norm`` with a separate BF16 add over
++the whole [tokens, hidden] tensor. Here the residual add's backward hands its
++gradient to the RMSNorm backward of the same input (keyed by the input's storage),
++which adds it while writing dx.
++
++With NVFP4_RESGRAD_ROUTER=1 the pre-MLP norm output's two consumers (router and
++token permutation) are treated the same way: the router's input gradient is handed
++to the norm backward, which sums it with the permutation gradient while loading dz.
++
++Both sums are rounded exactly as the PyTorch BF16 adds they replace, so results
++are bit-identical. Every handed-over gradient must be consumed before the next
++forward starts; otherwise ``check_empty`` raises.
++"""
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++_STAGES = int(os.environ.get("NVFP4_RMSNORM_BWD_STAGES", "1"))
++_pending = {}  # norm input key -> residual gradient
++_pending_dz = {}  # norm input key -> extra output gradient (router)
++_norm_inputs = {}  # pre-MLP norm output key -> norm input key
++_stats = {"handed": 0, "handed_dz": 0, "fused": 0}
++
++
++def _key(t):
++    # LayerNormLinear saves its input as a [-1, hidden] view of the [s, b, h] residual.
++    return (t.untyped_storage().data_ptr(), t.storage_offset(), t.numel(), t.dtype)
++
++
++def check_empty():
++    _norm_inputs.clear()
++    if _preadded:
++        raise RuntimeError("NVFP4_RESGRAD_FWD: an unpermute output with the residual added was not "
++                           "consumed by the MLP bias-dropout-add")
++    if _pending or _pending_dz:
++        raise RuntimeError(
++            f"NVFP4_RESGRAD: {len(_pending)} residual and {len(_pending_dz)} router gradients were "
++            "not consumed by an RMSNorm backward; the tensor is used by another op"
++        )
++
++
++def hand_over(residual, grad):
++    k = _key(residual)
++    if k in _pending:
++        raise RuntimeError("NVFP4_RESGRAD: residual gradient handed over twice")
++    _pending[k] = grad
++    _stats["handed"] += 1
++
++
++def record_norm(y, x):
++    _norm_inputs[_key(y)] = _key(x)
++
++
++class _TapGrad(torch.autograd.Function):
++    """Identity whose input gradient is handed to the norm backward of ``key`` instead."""
++
++    @staticmethod
++    def forward(ctx, y, key):
++        ctx.key = key
++        return y.view_as(y)
++
++    @staticmethod
++    def backward(ctx, grad):
++        if ctx.key in _pending_dz:
++            raise RuntimeError("NVFP4_RESGRAD: router gradient handed over twice")
++        _pending_dz[ctx.key] = grad
++        _stats["handed_dz"] += 1
++        return None, None
++
++
++def tap_norm_output(y):
++    """``y`` unchanged if it is not a recorded norm output, else a tapped alias of it."""
++    k = _norm_inputs.pop(_key(y), None)
++    if k is None or not (torch.is_grad_enabled() and y.requires_grad):
++        return y
++    return _TapGrad.apply(y, k)
++
++
++@triton.jit
++def _rmsnorm_bwd_res_kernel(
++    dz_ptr, dz2_ptr, x_ptr, rsigma_ptr, gamma_ptr, dres_ptr, dx_ptr, dgamma_part_ptr,
++    rows, cols, stride_row,
++    ZERO_CENTERED: tl.constexpr, HAS_DZ2: tl.constexpr, HAS_RES: tl.constexpr,
++    BLOCK_N: tl.constexpr, STAGES: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    num_programs = tl.num_programs(0)
++    offs = tl.arange(0, BLOCK_N)
++    mask = offs < cols
++    gamma = tl.load(gamma_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++    if ZERO_CENTERED:
++        gamma = gamma + 1.0
++    dgamma_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
++    for row in tl.range(pid, rows, num_programs, num_stages=STAGES):
++        base = row.to(tl.int64) * stride_row
++        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
++        dz = tl.load(dz_ptr + base + offs, mask=mask, other=0.0)
++        if HAS_DZ2:
++            dz2 = tl.load(dz2_ptr + base + offs, mask=mask, other=0.0)
++            dz = (dz.to(tl.float32) + dz2.to(tl.float32)).to(dz_ptr.dtype.element_ty)
++        dz = dz.to(tl.float32)
++        rs = tl.load(rsigma_ptr + row)
++        xhat = x * rs
++        gdz = dz * gamma
++        mdot = tl.sum(gdz * xhat, axis=0) / cols
++        # Explicit fma: the contraction the Triton bwd gets; with the extra loads the
++        # compiler otherwise contracts dz * gamma instead and dx differs by 1 ulp.
++        dx = (rs * tl.fma(-xhat, mdot, gdz)).to(dx_ptr.dtype.element_ty)
++        if HAS_RES:
++            dres = tl.load(dres_ptr + base + offs, mask=mask, other=0.0)
++            dx = (dx.to(tl.float32) + dres.to(tl.float32)).to(dx_ptr.dtype.element_ty)
++        tl.store(dx_ptr + base + offs, dx, mask=mask)
++        dgamma_acc += dz * xhat
++    tl.store(dgamma_part_ptr + pid.to(tl.int64) * BLOCK_N + offs, dgamma_acc, mask=mask)
++
++
++_NUM_SMS = {}
++
++
++def _rows(t, cols):
++    t = t.reshape(-1, cols)
++    return t if t.is_contiguous() else t.contiguous()
++
++
++def make_rmsnorm_bwd(base_bwd, reduce_rows_kernel):
++    """Wrap the Triton ``rmsnorm_bwd`` so handed-over gradients are summed in."""
++
++    def rmsnorm_bwd(dz, x, rsigma, gamma, sm_margin=0, zero_centered_gamma=False):
++        dres = dz_extra = None
++        if _pending or _pending_dz:
++            k = _key(x)
++            dres = _pending.pop(k, None)
++            dz_extra = _pending_dz.pop(k, None)
++        if dres is None and dz_extra is None:
++            return base_bwd(dz, x, rsigma, gamma, sm_margin, zero_centered_gamma)
++        cols = gamma.numel()
++        x2 = _rows(x, cols)
++        dz2 = _rows(dz, cols)
++        r2 = _rows(dres, cols) if dres is not None else dz2
++        e2 = _rows(dz_extra, cols) if dz_extra is not None else dz2
++        rows = x2.shape[0]
++        device = x2.device
++        if device not in _NUM_SMS:
++            _NUM_SMS[device] = torch.cuda.get_device_properties(device).multi_processor_count
++        block_n = triton.next_power_of_2(cols)
++        programs = max(1, min(rows, 2 * (_NUM_SMS[device] - int(sm_margin))))
++        dx = torch.empty_like(x2)
++        part = torch.empty((programs, block_n), dtype=torch.float32, device=device)
++        _rmsnorm_bwd_res_kernel[(programs,)](
++            dz2, e2, x2, rsigma.reshape(-1), gamma.reshape(-1), r2, dx, part,
++            rows, cols, x2.stride(0),
++            ZERO_CENTERED=bool(zero_centered_gamma), HAS_DZ2=dz_extra is not None,
++            HAS_RES=dres is not None, BLOCK_N=block_n, STAGES=_STAGES, num_warps=8,
++        )
++        dgamma = torch.empty_like(gamma)
++        block_c = 128
++        reduce_rows_kernel[(triton.cdiv(cols, block_c),)](
++            part, dgamma.reshape(-1), programs, cols, BLOCK_P=32, BLOCK_C=block_c, STRIDE=block_n,
++            num_warps=4,
++        )
++        _stats["fused"] += 1
++        return dx.view(x.shape), dgamma
++
++    return rmsnorm_bwd
++
++
++@triton.jit
++def _unpermute_bias_residual_kernel(
++    input_ptr, row_id_map_ptr, bias_ptr, scale_ptr, residual_ptr, output_ptr,
++    stride_row_id_map_token, stride_row_id_map_expert, stride_input_token, stride_output_token,
++    stride_bias_expert,
++    num_experts: tl.constexpr, hidden_size: tl.constexpr, UNROLL: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    # TE's _unpermute_expert_bias_unrolled_kernel (same sum, same order), then
++    # ``residual + out`` rounded as the PyTorch BF16 add of the two.
++    pid_t = tl.program_id(0)
++    offs = tl.arange(0, BLOCK_SIZE)
++    mask = offs < hidden_size
++    map_row = row_id_map_ptr + pid_t * stride_row_id_map_token
++    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
++    n_routed = tl.load(map_row + num_experts * 2 * stride_row_id_map_expert)
++    for idx in tl.static_range(UNROLL):
++        valid = idx < n_routed
++        src_row = tl.load(map_row + idx * stride_row_id_map_expert, mask=valid, other=0).to(tl.int64)
++        expert = tl.load(map_row + (num_experts + idx) * stride_row_id_map_expert, mask=valid, other=0)
++        x = tl.load(input_ptr + src_row * stride_input_token + offs, mask=mask & valid, other=0.0).to(
++            tl.float32
++        )
++        b = tl.load(bias_ptr + expert * stride_bias_expert + offs, mask=mask & valid, other=0.0).to(
++            tl.float32
++        )
++        s = tl.load(scale_ptr + src_row, mask=valid, other=0.0)
++        v = tl.fma(b, s, x).to(input_ptr.dtype.element_ty).to(tl.float32)
++        accumulator += tl.where(valid, v, 0.0)
++    for idx in tl.range(UNROLL, n_routed):
++        src_row = tl.load(map_row + idx * stride_row_id_map_expert).to(tl.int64)
++        expert = tl.load(map_row + (num_experts + idx) * stride_row_id_map_expert)
++        x = tl.load(input_ptr + src_row * stride_input_token + offs, mask=mask).to(tl.float32)
++        b = tl.load(bias_ptr + expert * stride_bias_expert + offs, mask=mask).to(tl.float32)
++        s = tl.load(scale_ptr + src_row)
++        accumulator += tl.fma(b, s, x).to(input_ptr.dtype.element_ty).to(tl.float32)
++    out = accumulator.to(output_ptr.dtype.element_ty)
++    row = pid_t.to(tl.int64) * stride_output_token
++    r = tl.load(residual_ptr + row + offs, mask=mask, other=0.0)
++    out = (r.to(tl.float32) + out.to(tl.float32)).to(output_ptr.dtype.element_ty)
++    tl.store(output_ptr + row + offs, out, mask=mask)
++
++
++_fwd_residual = [None]  # residual of the MLP sublayer being run
++_preadded = {}  # unpermute output key -> residual already added into it
++
++
++def make_unpermute(tp, orig_unpermute):
++    """Unpermute with deferred FC2 bias that also adds the pending MLP residual."""
++
++    def unpermute_with_mask_map(inp, row_id_map, merging_probs, permuted_probs, pad_offsets,
++                                num_tokens, num_experts, hidden_size):
++        residual = _fwd_residual[0]
++        if (
++            residual is None
++            or merging_probs is not None
++            or permuted_probs is not None
++            or pad_offsets is not None
++            or inp.data_ptr() not in tp._PENDING_EXPERT_BIAS
++            or tp._EXPERT_BIAS_UNROLL <= 0
++            or residual.dtype != inp.dtype
++            or residual.numel() != num_tokens * hidden_size
++            or not residual.is_contiguous()
++            or inp.stride(1) != 1
++        ):
++            return orig_unpermute(inp, row_id_map, merging_probs, permuted_probs, pad_offsets,
++                                  num_tokens, num_experts, hidden_size)
++        _fwd_residual[0] = None
++        bias, scale = tp._PENDING_EXPERT_BIAS.pop(inp.data_ptr())
++        output = torch.empty((num_tokens, hidden_size), dtype=inp.dtype, device="cuda")
++        _unpermute_bias_residual_kernel[(num_tokens,)](
++            inp, row_id_map, bias, scale, residual, output,
++            row_id_map.stride(0), row_id_map.stride(1), inp.stride(0), output.stride(0),
++            bias.stride(0), num_experts, hidden_size,
++            UNROLL=tp._EXPERT_BIAS_UNROLL, BLOCK_SIZE=triton.next_power_of_2(hidden_size),
++            num_warps=tp._EXPERT_BIAS_WARPS,
++        )
++        _preadded[_key(output)] = residual
++        return output, None
++
++    return unpermute_with_mask_map
++
++
++class _PreAdded(torch.autograd.Function):
++    """``x`` already holds ``residual + mlp_out``; routes the residual gradient like _ResidualAdd."""
++
++    @staticmethod
++    def forward(ctx, x, residual):
++        ctx.residual = residual
++        return x.view_as(x)
++
++    @staticmethod
++    def backward(ctx, grad):
++        hand_over(ctx.residual, grad)
++        ctx.residual = None
++        return grad, None
++
++
++class _ResidualAdd(torch.autograd.Function):
++    """``residual + x``; the residual gradient goes to the RMSNorm backward of ``residual``."""
++
++    @staticmethod
++    def forward(ctx, x, residual):
++        ctx.residual = residual
++        return residual + x
++
++    @staticmethod
++    def backward(ctx, grad):
++        hand_over(ctx.residual, grad)
++        ctx.residual = None
++        return grad, None
++
++
++def make_bias_residual_add(kernel):
++    class _BiasResidualAdd(torch.autograd.Function):
++        @staticmethod
++        def forward(ctx, x, bias, residual):
++            out = torch.empty_like(x)
++            numel = x.numel()
++            block = 4096
++            kernel[(triton.cdiv(numel, block),)](
++                x, bias, residual, out, numel, x.shape[-1], BLOCK=block, num_warps=8
++            )
++            ctx.bias_shape = bias.shape
++            ctx.residual = residual
++            return out
++
++        @staticmethod
++        def backward(ctx, grad):
++            hand_over(ctx.residual, grad)
++            ctx.residual = None
++            return grad, grad.sum_to_size(ctx.bias_shape), None
++
++    return _BiasResidualAdd
++
++
++def install():
++    """Patch the RMSNorm backward call sites, Megatron's bias-dropout-add and (optionally) the router input."""
++    import megatron.core.fusions.fused_bias_dropout as mc_bda
++    import transformer_engine.pytorch.ops.basic.rmsnorm as te_rmsnorm_op
++    import transformer_engine_torch as tex
++    from megatron.core.transformer.transformer_layer import TransformerLayer
++    from transformer_engine.pytorch.ops.basic import nvfp4_triton_bias_residual as tbr
++    from transformer_engine.pytorch.ops.basic import nvfp4_triton_rmsnorm_bwd as trb
++
++    if tex.rmsnorm_bwd is not trb.rmsnorm_bwd:
++        raise RuntimeError("NVFP4_RESGRAD needs NVFP4_TRITON_RMSNORM_BWD=1")
++    if int(os.environ.get("NVFP4_RMSNORM_BWD_UNROLL", "1")) != 1:
++        raise RuntimeError("NVFP4_RESGRAD supports NVFP4_RMSNORM_BWD_UNROLL=1 only")
++    fused_bwd = make_rmsnorm_bwd(trb.rmsnorm_bwd, trb._reduce_rows_kernel)
++    tex.rmsnorm_bwd = fused_bwd
++    te_rmsnorm_op.rmsnorm_bwd = fused_bwd
++
++    bias_res = make_bias_residual_add(tbr._bias_residual_add_kernel)
++    orig_bda = mc_bda._bias_dropout_add_func
++
++    def bda(x_with_bias, residual, prob, training):
++        x, bias = x_with_bias
++        pre = _preadded.pop(_key(x), None) if _preadded else None
++        if pre is not None:
++            if pre is not residual or bias is not None or prob != 0.0:
++                raise RuntimeError("NVFP4_RESGRAD_FWD: unpermute output reached a different add")
++            return _PreAdded.apply(x, residual)
++        if not (training and torch.is_grad_enabled() and residual.requires_grad):
++            return orig_bda(x_with_bias, residual, prob, training)
++        if bias is not None and tbr.eligible(x, bias, residual, prob, training):
++            return bias_res.apply(x, bias, residual)
++        if bias is None and prob == 0.0 and x.dtype == residual.dtype and x.shape == residual.shape:
++            return _ResidualAdd.apply(x, residual)
++        return orig_bda(x_with_bias, residual, prob, training)
++
++    mc_bda._bias_dropout_add_func = bda
++
++    orig_forward = TransformerLayer.forward
++
++    def forward(self, *args, **kwargs):
++        if self.layer_number == 1:
++            check_empty()
++        return orig_forward(self, *args, **kwargs)
++
++    TransformerLayer.forward = forward
++
++    router = os.environ.get("NVFP4_RESGRAD_ROUTER", "0") == "1"
++    if router:
++        from megatron.core.transformer.moe.moe_layer import MoELayer
++
++        if os.environ.get("NVFP4_FUSED_PERMUTE_PAD", "0") != "1" and int(
++            os.environ.get("NVFP4_PADDED_EXPERT_HIDDEN", "0")
++        ):
++            raise RuntimeError("NVFP4_RESGRAD_ROUTER needs NVFP4_FUSED_PERMUTE_PAD=1 with padding")
++        orig_pre_mlp = TransformerLayer._forward_pre_mlp_layernorm
++
++        def pre_mlp(self, hidden_states):
++            out = orig_pre_mlp(self, hidden_states)
++            if self.training and torch.is_grad_enabled() and isinstance(out, torch.Tensor):
++                record_norm(out, hidden_states)
++            return out
++
++        TransformerLayer._forward_pre_mlp_layernorm = pre_mlp
++        orig_route = MoELayer.route
++
++        def route(self, hidden_states, *args, **kwargs):
++            return orig_route(self, tap_norm_output(hidden_states), *args, **kwargs)
++
++        MoELayer.route = route
++
++    fwd = os.environ.get("NVFP4_RESGRAD_FWD", "0") == "1"
++    if fwd:
++        import transformer_engine.pytorch.triton.permutation as tp
++
++        if os.environ.get("NVFP4_DEFER_FC2_BIAS", "0") != "1" or tp._EXPERT_BIAS_UNROLL <= 0:
++            raise RuntimeError("NVFP4_RESGRAD_FWD needs NVFP4_DEFER_FC2_BIAS=1 and "
++                               "NVFP4_UNPERMUTE_BIAS_UNROLL>0")
++        tp.unpermute_with_mask_map = make_unpermute(tp, tp.unpermute_with_mask_map)
++        orig_run_mlp = TransformerLayer._run_mlp
++
++        def run_mlp(self, pre_mlp_layernorm_output, residual, *args, **kwargs):
++            if self.training and torch.is_grad_enabled():
++                _fwd_residual[0] = residual
++            try:
++                return orig_run_mlp(self, pre_mlp_layernorm_output, residual, *args, **kwargs)
++            finally:
++                _fwd_residual[0] = None
++
++        TransformerLayer._run_mlp = run_mlp
++    if int(os.environ.get("RANK", "0")) == 0:
++        print(f"NVFP4_RESGRAD installed (router {int(router)}, fwd {int(fwd)})", flush=True)
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_shard_cast.py b/transformer_engine/pytorch/ops/fused/nvfp4_shard_cast.py
+new file mode 100644
+index 00000000..b1051860
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_shard_cast.py
+@@ -0,0 +1,128 @@
++# Classification: Internal
++"""One-launch NVFP4 2D cast of every local piece of an FP4 all-gather bucket.
++
++Each piece is rows [r0, r1) of one expert weight (a multiple of 16 rows). The kernel writes
++the row-wise data and scales and the column-wise data and scales straight into the gather
++buffers in the unpadded layouts of nvfp4_fp4_ag (row data [R, K/2], row scales [R, K/16],
++column data [K, R/2], column scales [K, R/16]). Numerics follow nvfp4_group_weight_quant
++(TE ``quantize_transpose_nvfp4_2D_kernel``, round-to-nearest) with the amax taken from the
++piece's shard-amax slot.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++_FLT_MAX = tl.constexpr(3.4028234663852886e38)
++_FIELDS = 8  # src elem offset, rows, K, amax slot, row data, row scale, col data, col scale
++
++
++@triton.jit
++def _cvt_e2m1x2(lo, hi):
++    return tl.inline_asm_elementwise(
++        """
++        {
++        .reg .b8 b0, b1, b2, b3;
++        cvt.rn.satfinite.e2m1x2.f32 b0, $5, $1;
++        cvt.rn.satfinite.e2m1x2.f32 b1, $6, $2;
++        cvt.rn.satfinite.e2m1x2.f32 b2, $7, $3;
++        cvt.rn.satfinite.e2m1x2.f32 b3, $8, $4;
++        mov.b32 $0, {b0, b1, b2, b3};
++        }
++        """,
++        "=r,r,r,r,r,r,r,r,r",
++        [lo, hi],
++        dtype=tl.uint8,
++        is_pure=True,
++        pack=4,
++    )
++
++
++@triton.jit
++def _shard_cast_kernel(
++    table_ptr,
++    src_ptr,
++    amax_ptr,
++    data_r_ptr,
++    scale_r_ptr,
++    data_c_ptr,
++    scale_c_ptr,
++    MB: tl.constexpr,
++    KB: tl.constexpr,
++):
++    pid_k = tl.program_id(0)
++    pid_m = tl.program_id(1)
++    t = table_ptr + tl.program_id(2).to(tl.int64) * 8
++    src_off = tl.load(t)
++    R = tl.load(t + 1)
++    K = tl.load(t + 2)
++    slot = tl.load(t + 3)
++    o_dr = tl.load(t + 4)
++    o_sr = tl.load(t + 5)
++    o_dc = tl.load(t + 6)
++    o_sc = tl.load(t + 7)
++    row0 = pid_m * (MB * 16)
++    col0 = pid_k * (KB * 16)
++    if (row0 >= R) | (col0 >= K):
++        return
++
++    amax = tl.load(amax_ptr + slot)
++    s_enc = tl.minimum(tl.math.div_rn(2688.0, amax), _FLT_MAX)
++    s_enc = tl.where((amax == 0.0) | (s_enc == 0.0), 1.0, s_enc)
++    s_dec = tl.math.div_rn(1.0, s_enc)
++
++    mb = tl.arange(0, MB)
++    kb = tl.arange(0, KB)
++    i16 = tl.arange(0, 16)
++    i8 = tl.arange(0, 8)
++    rows = row0 + mb[:, None, None, None] * 16 + i16[None, :, None, None]
++    cols = col0 + kb[None, None, :, None] * 16 + i16[None, None, None, :]
++    # Pieces are whole 16-row blocks and K is a multiple of 64, so masks are block-uniform.
++    mask = (rows < R) & (cols < K)
++    x = tl.load(src_ptr + src_off + rows.to(tl.int64) * K + cols, mask=mask, other=0.0).to(tl.float32)
++
++    blk = tl.max(tl.max(tl.abs(x), axis=3), axis=1)
++    sf = tl.minimum(blk * (s_enc * 0.16666666666666666), _FLT_MAX).to(tl.float8e4nv)
++    inv = tl.minimum(tl.math.div_rn(1.0, sf.to(tl.float32) * s_dec), _FLT_MAX)
++    y = x * inv[:, None, :, None]
++    sf_bits = sf.to(tl.uint8, bitcast=True)
++
++    lo, hi = tl.split(tl.reshape(y, [MB, 16, KB, 8, 2]))
++    packed = _cvt_e2m1x2(lo, hi)
++    hcols = col0 // 2 + kb[None, None, :, None] * 8 + i8[None, None, None, :]
++    tl.store(data_r_ptr + o_dr + rows.to(tl.int64) * (K // 2) + hcols, packed, mask=(rows < R) & (hcols < K // 2))
++
++    srow = row0 + mb[:, None, None] * 16 + i16[None, :, None]
++    scol = pid_k * KB + kb[None, None, :]
++    rs = tl.broadcast_to(sf_bits[:, None, :], [MB, 16, KB])
++    tl.store(scale_r_ptr + o_sr + srow.to(tl.int64) * (K // 16) + scol, rs, mask=(srow < R) & (scol < K // 16))
++
++    lo, hi = tl.split(tl.permute(tl.reshape(y, [MB, 8, 2, KB, 16]), (0, 1, 3, 4, 2)))
++    packed = _cvt_e2m1x2(lo, hi)
++    ccols = col0 + kb[None, None, :, None] * 16 + i16[None, None, None, :]
++    hrows = row0 // 2 + mb[:, None, None, None] * 8 + i8[None, :, None, None]
++    tl.store(data_c_ptr + o_dc + ccols.to(tl.int64) * (R // 2) + hrows, packed, mask=(ccols < K) & (hrows < R // 2))
++
++    crow = col0 + kb[None, :, None] * 16 + i16[None, None, :]
++    ccol = pid_m * MB + mb[:, None, None]
++    cs = tl.broadcast_to(sf_bits[:, :, None], [MB, KB, 16])
++    tl.store(scale_c_ptr + o_sc + crow.to(tl.int64) * (R // 16) + ccol, cs, mask=(crow < K) & (ccol < R // 16))
++
++
++class ShardCast:
++    """Static piece table for one bucket; ``__call__`` casts every local piece."""
++
++    def __init__(self, pieces, device, bm=64, bk=64, num_warps=4):
++        # pieces: (src elem offset, rows, cols, amax slot, row data, row scale, col data, col scale)
++        assert pieces
++        for p in pieces:
++            assert p[1] % 16 == 0 and p[2] % bk == 0, p
++        self.table = torch.tensor(pieces, dtype=torch.int64, device=device).view(-1, _FIELDS)
++        self.grid = (max(p[2] for p in pieces) // bk, triton.cdiv(max(p[1] for p in pieces), bm), len(pieces))
++        self.bm, self.bk, self.num_warps = bm, bk, num_warps
++
++    def __call__(self, src, amax_buf, data_r, scale_r, data_c, scale_c):
++        _shard_cast_kernel[self.grid](
++            self.table, src, amax_buf, data_r, scale_r, data_c, scale_c,
++            MB=self.bm // 16, KB=self.bk // 16, num_warps=self.num_warps,
++        )
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_shard_cast_cuda.py b/transformer_engine/pytorch/ops/fused/nvfp4_shard_cast_cuda.py
+new file mode 100644
+index 00000000..5c918f22
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_shard_cast_cuda.py
+@@ -0,0 +1,62 @@
++# Classification: Internal
++"""CUDA version of nvfp4_shard_cast.ShardCast (same piece table, same outputs, bitwise equal).
++
++Built once with `build(dir)`; training ranks load the .so from NVFP4_SHARD_CAST_EXT.
++"""
++import importlib.util
++import os
++
++import torch
++
++EXT_NAME = "nvfp4_shard_cast_ext"
++TILE = 128
++_ext = None
++
++
++def build(build_dir, name=EXT_NAME, arch="10.3a", verbose=True):
++    from torch.utils.cpp_extension import load
++
++    os.environ["TORCH_CUDA_ARCH_LIST"] = arch
++    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shard_cast_ext.cu")
++    os.makedirs(build_dir, exist_ok=True)
++    return load(name=name, sources=[src], build_directory=build_dir,
++                extra_cuda_cflags=["-O3"], verbose=verbose)
++
++
++def _get_ext():
++    global _ext
++    if _ext is None:
++        path = os.environ["NVFP4_SHARD_CAST_EXT"]
++        spec = importlib.util.spec_from_file_location(os.path.basename(path).split(".")[0], path)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        _ext = mod
++    return _ext
++
++
++def set_ext(mod):
++    global _ext
++    _ext = mod
++
++
++def supported(pieces):
++    """Store alignment the kernel relies on (row data 16 B, column data 8 B, row scales 4 B)."""
++    for _, rows, cols, _, o_dr, o_sr, o_dc, _ in pieces:
++        if rows % 16 or cols % 64 or o_dr % 16 or o_dc % 8 or o_sr % 4 or (cols // 16) % 4:
++            return False
++    return True
++
++
++class ShardCastCUDA:
++    """Static piece table for one bucket; ``__call__`` casts every local piece."""
++
++    def __init__(self, pieces, device):
++        assert pieces and supported(pieces), pieces
++        self.table = torch.tensor(pieces, dtype=torch.int64, device=device).view(-1, 8)
++        tiles = [(i, m, k) for i, p in enumerate(pieces)
++                 for m in range(-(-p[1] // TILE)) for k in range(-(-p[2] // TILE))]
++        self.tiles = torch.tensor(tiles, dtype=torch.int32, device=device)
++
++    def __call__(self, src, amax_buf, data_r, scale_r, data_c, scale_c):
++        _get_ext().shard_cast(self.table, self.tiles, src, amax_buf, data_r, scale_r, data_c,
++                              scale_c)
+diff --git a/transformer_engine/pytorch/ops/fused/shard_cast_ext.cu b/transformer_engine/pytorch/ops/fused/shard_cast_ext.cu
+new file mode 100644
+index 00000000..a1fbbbb7
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/shard_cast_ext.cu
+@@ -0,0 +1,219 @@
++// Classification: Internal
++// NVFP4 2D (16x16 block) cast of the local pieces of an FP4 all-gather bucket, written straight
++// into the gather buffers (row data [R, K/2], row scales [R, K/16], column data [K, R/2], column
++// scales [K, R/16]). Same numerics as nvfp4_shard_cast._shard_cast_kernel (TE
++// quantize_transpose_nvfp4_2D_kernel, round-to-nearest, per-piece amax slot).
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <torch/extension.h>
++
++#include <cfloat>
++#include <cstdint>
++
++namespace {
++
++constexpr int kTR = 128;  // tile rows
++constexpr int kTK = 128;  // tile cols
++constexpr int kThreads = 256;
++constexpr int kBR = kTR / 16, kBK = kTK / 16;  // 16x16 blocks per tile
++constexpr int kRowU4 = kTK / 8;                 // uint4 (8 bf16) per tile row
++
++struct Piece {
++  int64_t src, rows, cols, slot, o_dr, o_sr, o_dc, o_sc;
++};
++
++__device__ __forceinline__ uint8_t e2m1x2(float lo, float hi) {
++  uint16_t r;
++  asm("{\n .reg .b8 b;\n cvt.rn.satfinite.e2m1x2.f32 b, %1, %2;\n mov.b16 %0, {b, 0};\n}"
++      : "=h"(r) : "f"(hi), "f"(lo));
++  return static_cast<uint8_t>(r & 0xff);
++}
++
++__global__ void __launch_bounds__(kThreads)
++    shard_cast_kernel(const Piece* __restrict__ table, const int32_t* __restrict__ tiles,
++                      const __nv_bfloat16* __restrict__ src, const float* __restrict__ amax_buf,
++                      uint8_t* __restrict__ data_r, uint8_t* __restrict__ scale_r,
++                      uint8_t* __restrict__ data_c, uint8_t* __restrict__ scale_c) {
++  __shared__ __align__(16) __nv_bfloat16 tile[kTR][kTK + 8];  // +8: column reads conflict-free
++  __shared__ unsigned blk_max[kBR][kBK];
++  __shared__ float blk_inv[kBR][kBK];
++  __shared__ uint8_t blk_sf[kBR][kBK];
++  // Column-wise data of the tile; 72-byte rows keep the column-pair writes at 4-way conflicts.
++  __shared__ __align__(16) uint8_t col_out[kTK][kTR / 2 + 8];
++
++  const int32_t* tl = tiles + 3 * blockIdx.x;
++  const Piece p = table[tl[0]];
++  const int R = static_cast<int>(p.rows), K = static_cast<int>(p.cols);
++  const int row0 = tl[1] * kTR, col0 = tl[2] * kTK;
++  const int nr = min(kTR, R - row0), nk = min(kTK, K - col0);  // multiples of 16 / 64
++
++  if (threadIdx.x < kBR * kBK) (&blk_max[0][0])[threadIdx.x] = 0u;
++  __syncthreads();
++
++  const __nv_bfloat16* s = src + p.src + static_cast<int64_t>(row0) * K + col0;
++  constexpr int kLoads = kTR * kRowU4 / kThreads;
++  uint4 v[kLoads];
++#pragma unroll
++  for (int i = 0; i < kLoads; ++i) {
++    const int k = threadIdx.x + i * kThreads, r = k / kRowU4, cu = k % kRowU4;
++    v[i] = make_uint4(0, 0, 0, 0);
++    if (r < nr && cu * 8 < nk) v[i] = __ldg(reinterpret_cast<const uint4*>(s + static_cast<int64_t>(r) * K) + cu);
++  }
++  // A warp holds rows (2 per load) x 16 uint4; lanes l, l^1 share a 16-column block and lanes
++  // l, l^16 the two rows, so two shuffles leave one partial max per (load, block column).
++  const int lane = threadIdx.x & 31;
++#pragma unroll
++  for (int i = 0; i < kLoads; ++i) {
++    const int k = threadIdx.x + i * kThreads, r = k / kRowU4, cu = k % kRowU4;
++    *reinterpret_cast<uint4*>(&tile[r][cu * 8]) = v[i];
++    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v[i]);
++    float m = 0.f;
++#pragma unroll
++    for (int e = 0; e < 4; ++e) {
++      m = fmaxf(m, fabsf(__bfloat162float(h[e].x)));
++      m = fmaxf(m, fabsf(__bfloat162float(h[e].y)));
++    }
++    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1));
++    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 16));
++    if ((lane & 17) == 0) atomicMax(&blk_max[r / 16][cu / 2], __float_as_uint(m));
++  }
++
++  const float amax = amax_buf[p.slot];
++  float s_enc = fminf(__fdiv_rn(2688.0f, amax), FLT_MAX);
++  if (amax == 0.0f || s_enc == 0.0f) s_enc = 1.0f;
++  const float s_dec = __fdiv_rn(1.0f, s_enc);
++  __syncthreads();
++
++  if (threadIdx.x < kBR * kBK) {
++    const int br = threadIdx.x / kBK, bk = threadIdx.x % kBK;
++    const float blk = __uint_as_float(blk_max[br][bk]);
++    const float t = s_enc * 0.16666667f;
++    const __nv_fp8_storage_t sf =
++        __nv_cvt_float_to_fp8(fminf(blk * t, FLT_MAX), __NV_SATFINITE, __NV_E4M3);
++    __half_raw hr = __nv_cvt_fp8_to_halfraw(sf, __NV_E4M3);
++    const float sf_f = __half2float(__half(hr));
++    blk_sf[br][bk] = sf;
++    blk_inv[br][bk] = fminf(__fdiv_rn(1.0f, sf_f * s_dec), FLT_MAX);
++  }
++  __syncthreads();
++
++  // Row-wise data: thread -> (row, 32 columns) -> 16 bytes.
++#pragma unroll
++  for (int i = 0; i < kTR * (kTK / 32) / kThreads; ++i) {
++    const int k = threadIdx.x + i * kThreads, r = k / (kTK / 32), seg = k % (kTK / 32);
++    if (r >= nr || seg * 32 >= nk) continue;
++    uint8_t out[16];
++#pragma unroll
++    for (int b = 0; b < 2; ++b) {
++      const float inv = blk_inv[r / 16][seg * 2 + b];
++#pragma unroll
++      for (int u = 0; u < 2; ++u) {
++        const uint4 x = *reinterpret_cast<const uint4*>(&tile[r][seg * 32 + b * 16 + u * 8]);
++        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&x);
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++          out[b * 8 + u * 4 + e] = e2m1x2(__bfloat162float(h[e].x) * inv, __bfloat162float(h[e].y) * inv);
++        }
++      }
++    }
++    uint8_t* dst = data_r + p.o_dr + static_cast<int64_t>(row0 + r) * (K / 2) + (col0 + seg * 32) / 2;
++    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(out);
++  }
++
++  // Row-wise scales: thread -> row, kBK blocks (4-byte stores; K / 16 is a multiple of 4).
++  if (threadIdx.x < nr) {
++    const int r = threadIdx.x;
++    uint8_t* dst = scale_r + p.o_sr + static_cast<int64_t>(row0 + r) * (K / 16) + col0 / 16;
++    for (int q = 0; q < nk / 64; ++q) {
++      uint32_t w = 0;
++#pragma unroll
++      for (int e = 0; e < 4; ++e) w |= static_cast<uint32_t>(blk_sf[r / 16][q * 4 + e]) << (8 * e);
++      reinterpret_cast<uint32_t*>(dst)[q] = w;
++    }
++  }
++
++  // Column-wise data: thread -> (column pair, 32 rows) -> 16 bytes per column as two 8-byte
++  // stores; lanes take consecutive column pairs, so each bf16x2 shared load is conflict-free.
++  {
++    const int cp = threadIdx.x % (kTK / 2), quarter = threadIdx.x / (kTK / 2);
++    const int c = 2 * cp;
++    if (c < nk) {
++      uint8_t* dst0 = &col_out[c][quarter * 16];
++      uint8_t* dst1 = &col_out[c + 1][quarter * 16];
++#pragma unroll
++      for (int q = 0; q < 2; ++q) {
++        const int rb = quarter * 2 + q;  // 16-row block
++        if (rb * 16 >= nr) break;
++        const float inv = blk_inv[rb][c / 16];
++        uint8_t o0[8], o1[8];
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++          const int r = rb * 16 + 2 * e;
++          const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&tile[r][c]);
++          const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&tile[r + 1][c]);
++          o0[e] = e2m1x2(__bfloat162float(a.x) * inv, __bfloat162float(b.x) * inv);
++          o1[e] = e2m1x2(__bfloat162float(a.y) * inv, __bfloat162float(b.y) * inv);
++        }
++        reinterpret_cast<uint2*>(dst0)[q] = *reinterpret_cast<const uint2*>(o0);
++        reinterpret_cast<uint2*>(dst1)[q] = *reinterpret_cast<const uint2*>(o1);
++      }
++    }
++  }
++
++  __syncthreads();
++  // Column data out of shared memory: 4 lanes per column write its nr / 2 contiguous bytes
++  // (16 bytes each), so a warp store covers whole 32-byte sectors of 8 columns.
++  {
++    const int part = threadIdx.x & 3;
++    const int nbytes = nr / 2;  // multiple of 8
++    for (int c = threadIdx.x >> 2; c < nk; c += kThreads / 4) {
++      uint8_t* dst = data_c + p.o_dc + static_cast<int64_t>(col0 + c) * (R / 2) + row0 / 2;
++      const int off = part * 16;
++      if (off + 16 <= nbytes && ((reinterpret_cast<uintptr_t>(dst) & 15) == 0)) {
++        const uint2 a = *reinterpret_cast<const uint2*>(&col_out[c][off]);
++        const uint2 b = *reinterpret_cast<const uint2*>(&col_out[c][off + 8]);
++        *reinterpret_cast<uint4*>(dst + off) = make_uint4(a.x, a.y, b.x, b.y);
++      } else {
++        for (int o = off; o < min(off + 16, nbytes); o += 8) {
++          *reinterpret_cast<uint2*>(dst + o) = *reinterpret_cast<const uint2*>(&col_out[c][o]);
++        }
++      }
++    }
++  }
++
++  // Column-wise scales: thread -> column, nr / 16 bytes (one 8-byte store when aligned).
++  if (threadIdx.x < nk) {
++    const int c = threadIdx.x;
++    uint8_t* dst = scale_c + p.o_sc + static_cast<int64_t>(col0 + c) * (R / 16) + row0 / 16;
++    const int nb = nr / 16;
++    if (nb == kBR && (reinterpret_cast<uintptr_t>(dst) & 7) == 0) {
++      uint8_t v[kBR];
++#pragma unroll
++      for (int rb = 0; rb < kBR; ++rb) v[rb] = blk_sf[rb][c / 16];
++      *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(v);
++    } else {
++      for (int rb = 0; rb < nb; ++rb) dst[rb] = blk_sf[rb][c / 16];
++    }
++  }
++}
++
++}  // namespace
++
++void shard_cast(torch::Tensor table, torch::Tensor tiles, torch::Tensor src, torch::Tensor amax,
++                torch::Tensor data_r, torch::Tensor scale_r, torch::Tensor data_c,
++                torch::Tensor scale_c) {
++  TORCH_CHECK(table.scalar_type() == torch::kInt64 && table.size(1) == 8);
++  TORCH_CHECK(tiles.scalar_type() == torch::kInt32 && tiles.size(1) == 3);
++  TORCH_CHECK(src.scalar_type() == torch::kBFloat16 && amax.scalar_type() == torch::kFloat32);
++  const int n = tiles.size(0);
++  if (n == 0) return;
++  shard_cast_kernel<<<n, kThreads, 0, c10::cuda::getCurrentCUDAStream()>>>(
++      reinterpret_cast<const Piece*>(table.data_ptr<int64_t>()), tiles.data_ptr<int32_t>(),
++      reinterpret_cast<const __nv_bfloat16*>(src.data_ptr()), amax.data_ptr<float>(),
++      data_r.data_ptr<uint8_t>(), scale_r.data_ptr<uint8_t>(), data_c.data_ptr<uint8_t>(),
++      scale_c.data_ptr<uint8_t>());
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("shard_cast", &shard_cast); }

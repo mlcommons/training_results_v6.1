@@ -1,0 +1,24 @@
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: true
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      override_quantized_autocast: true
+
+# Matchers are ordered. Routed expert projections select MXFP8 before the
+# catch-all rule returns every other Transformer Engine module to BF16.
+matchers:
+  routed_experts_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.linear_fc*"
+    enabled: true
+  all_other_modules_bf16:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true

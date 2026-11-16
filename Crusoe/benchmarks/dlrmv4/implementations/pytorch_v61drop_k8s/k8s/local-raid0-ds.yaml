@@ -1,0 +1,68 @@
+# Node-local RAID0 scratch at /local on every MI355X node, adapted from Crusoe's support article
+# "How-To Setup RAID0 Storage on CMK with Ephemeral Storage for Containerd".
+# Differences from the article, both for safety on this nodepool:
+#   - The article excludes nvme0n1 by name. Here the in-use ephemeral drive (ext4 at /mnt/nvme) is a
+#     different nvmeXn1 on each node (nvme7n1, nvme4n1, ...), so drives are selected by state instead:
+#     only blank drives (no filesystem/partition signature, not mounted, no holders) or this array's own
+#     members are used. Anything else is never touched.
+#   - The host /etc is not mounted, so apt in the container cannot change the host's package sources.
+# RAID0 has no redundancy and node-local NVMe is ephemeral: scratch/staged data only.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: local-raid0, labels: { app: local-raid0 } }
+spec:
+  selector: { matchLabels: { name: local-raid0 } }
+  template:
+    metadata: { labels: { name: local-raid0 } }
+    spec:
+      hostPID: true
+      nodeSelector: { amd.com/gpu.product-name: AMD_Instinct_MI355_OAM }
+      tolerations: [ { operator: Exists } ]
+      containers:
+        - name: raid
+          image: mirror.gcr.io/library/ubuntu:22.04
+          securityContext: { privileged: true }
+          command: [ "/bin/bash", "-c" ]
+          args:
+            - |
+              set -euo pipefail
+              H(){ nsenter --mount=/proc/1/ns/mnt -- "$@"; }
+              apt-get update -qq >/dev/null 2>&1 || true
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mdadm xfsprogs util-linux >/dev/null 2>&1
+              host=$(nsenter --uts=/proc/1/ns/uts -- hostname); MD=/dev/md/local
+              # After a reboot the kernel auto-assembles the array as md127 and udev links it as
+              # /dev/md/<homehost>:local, not /dev/md/local: reuse whichever link exists.
+              for l in /dev/md/local /dev/md/*:local; do [ -b "$l" ] && { MD=$l; break; }; done
+              echo "info: array device $MD"
+              if H mountpoint -q /local && H findmnt -n -o SOURCE /local | grep -qE '^/dev/md'; then echo "info: /local already mounted"
+              else
+                [ -b $MD ] && mdadm --detail $MD >/dev/null 2>&1 || mdadm --assemble --scan >/dev/null 2>&1 || true
+                if ! { [ -b $MD ] && mdadm --detail $MD >/dev/null 2>&1; }; then
+                  devs=""
+                  for d in /dev/nvme*n1; do n=$(basename $d)
+                    grep -q "^$d " /proc/mounts && { echo "skip $n: mounted"; continue; }
+                    H findmnt -n -S "$d" >/dev/null 2>&1 && { echo "skip $n: mounted on host"; continue; }
+                    [ -n "$(ls /sys/block/$n/holders 2>/dev/null)" ] && { echo "skip $n: holders"; continue; }
+                    ls /sys/block/$n/ | grep -q "^${n}p[0-9]" && { echo "skip $n: partitions"; continue; }
+                    sig=$(blkid -p -o value -s TYPE "$d" 2>/dev/null || true); [ -n "$sig" ] && { echo "skip $n: $sig"; continue; }
+                    devs="$devs $d"; done
+                  devs=$(echo $devs); cnt=$(echo $devs | wc -w)
+                  [ "$cnt" -ge 2 ] || { echo "ERROR: only $cnt blank drives"; exec sleep infinity; }
+                  echo "info: RAID0 from $cnt blank drives: $devs"
+                  mdadm --create $MD --name=local --level=0 --raid-devices=$cnt --homehost="$host" --run $devs
+                  udevadm settle || sleep 3
+                fi
+                blkid -p -o value -s TYPE $MD | grep -q xfs || mkfs.xfs -q -f $MD
+                H mkdir -p /local; H mount -o noatime $MD /local; H chmod 1777 /local
+              fi
+              H df -h /local
+              echo "info: /local ready on $host"
+              while true; do sleep 300; H mountpoint -q /local || H mount -o noatime $MD /local || echo "ERROR: remount failed"; done
+          # Ready only when /local really is the md array (a running pod alone proved nothing before).
+          readinessProbe:
+            exec: { command: ["/bin/sh", "-c", "nsenter --mount=/proc/1/ns/mnt -- findmnt -n -o SOURCE /local | grep -q '^/dev/md'"] }
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          volumeMounts: [ { name: dev, mountPath: /dev } ]
+          resources: { requests: { cpu: 100m, memory: 128Mi } }
+      volumes: [ { name: dev, hostPath: { path: /dev } } ]

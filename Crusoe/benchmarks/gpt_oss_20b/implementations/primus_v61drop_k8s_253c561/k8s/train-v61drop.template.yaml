@@ -1,0 +1,98 @@
+# AMD MLPerf v6.1 partner-drop run (llama31_8b | gpt_oss_20b) on N MI355X nodes. Render with run-v61drop.sh.
+# Vars: __J__ __N__ __BENCH__ __GBS__ __MBS__ __SEED__ __RUN__ __IMAGE__ __PULL_SECRET__ __SELKEY__ __SELVAL__ __DEADLINE__ __LR__
+---
+apiVersion: v1
+kind: Service
+metadata: { name: __J__, labels: { app: v61drop } }
+spec: { clusterIP: None, publishNotReadyAddresses: true, selector: { job-name: __J__ }, ports: [{ port: 29501, name: c10d-oss }, { port: 29502, name: c10d }, { port: 29600, name: ready }] }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: __J__, labels: { app: v61drop, bench: __BENCH__ } }
+spec:
+  completionMode: Indexed
+  completions: __N__
+  parallelism: __N__
+  backoffLimit: 0
+  activeDeadlineSeconds: __DEADLINE__
+  template:
+    metadata:
+      labels: { app: v61drop, bench: __BENCH__ }
+      annotations:
+        k8s.v1.cni.cncf.io/networks: >-
+          kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad
+    spec:
+      restartPolicy: Never
+      subdomain: __J__
+      hostIPC: true
+      enableServiceLinks: false        # stray Services' env vars confuse launcher autodetection
+      imagePullSecrets: [{ name: __PULL_SECRET__ }]   # line removed by the runner when PULL_SECRET is unset
+      nodeSelector: { amd.com/gpu.product-name: AMD_Instinct_MI355_OAM, __SELKEY__: "__SELVAL__" }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { job-name: __J__ } }
+              topologyKey: kubernetes.io/hostname
+      # MLPerf training rules ("Data State at Start of Run"): flush the cache or restart the
+      # system before benchmarking. Drop the host page cache (incl. NFS client cache) on every
+      # node right before the run and leave evidence; the launcher only logs cache_clear when
+      # this evidence exists.
+      initContainers:
+        - name: cache-flush
+          image: mirror.gcr.io/library/busybox:1.36
+          securityContext: { privileged: true }
+          env:
+            - name: IDX
+              valueFrom: { fieldRef: { fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']" } }
+            - name: NODE
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              d=/joblogs/__RUN__; mkdir -p "$d"
+              b=$(grep -E '^Cached:' /proc/meminfo | tr -s ' ')
+              sync; echo 3 > /proc/sys/vm/drop_caches
+              a=$(grep -E '^Cached:' /proc/meminfo | tr -s ' ')
+              echo "$(date -u +%FT%TZ) node=${NODE%%.*} drop_caches=3 before=[$b] after=[$a]" > "$d/cacheflush-node${IDX}.txt"
+              cat "$d/cacheflush-node${IDX}.txt"
+          volumeMounts:
+            - { name: shared, mountPath: /joblogs, subPath: v61drop/logs }
+      containers:
+        - name: train
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext: { privileged: __PRIV__, capabilities: { add: ["IPC_LOCK", "SYS_PTRACE"] } }
+          envFrom: [{ configMapRef: { name: rccl-roce-env } }]
+          env:
+            - { name: BENCH, value: "__BENCH__" }
+            - { name: NN, value: "__N__" }
+            - { name: GBS, value: "__GBS__" }
+            - { name: MBS, value: "__MBS__" }
+            - { name: LR_OVERRIDE, value: "__LR__" }
+            - { name: SEED, value: "__SEED__" }
+            - { name: EXTRA_EXPORTS, value: "__EXTRA__" }
+            - { name: RUN_NAME, value: "__RUN__" }
+            - { name: JOB, value: "__J__" }
+            - name: IDX
+              valueFrom: { fieldRef: { fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']" } }
+          command: ["/bin/bash", "/launch/launch-v61drop.sh"]
+          resources:
+            requests: { amd.com/gpu: 8, amd.com/vnic: 8, cpu: 64, memory: 512Gi }
+            limits:   { amd.com/gpu: 8, amd.com/vnic: 8, cpu: 200, memory: 2Ti }
+          volumeMounts:
+            - { name: shared, mountPath: /data,    subPath: datasets/llama31_8b/data }
+            - { name: shared, mountPath: /model,   subPath: datasets/llama31_8b/model }
+            - { name: shared, mountPath: /joblogs, subPath: v61drop/logs }
+            - { name: launch, mountPath: /launch }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: rccl-topo, mountPath: /etc/crusoe/rccl_topo/mi355x-288gb-ib.xml, readOnly: true }
+      volumes:
+        - name: shared
+          persistentVolumeClaim: { claimName: mlperf-training-shared }
+        - name: launch
+          configMap: { name: v61drop-launch }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 256Gi }
+        - name: rccl-topo
+          hostPath: { path: /etc/crusoe/rccl_topo/mi355x-288gb-ib.xml, type: File }

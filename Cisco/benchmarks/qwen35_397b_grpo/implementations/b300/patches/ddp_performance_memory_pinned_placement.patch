@@ -1,0 +1,174 @@
+diff --git a/nemo_rl/models/megatron/setup.py b/nemo_rl/models/megatron/setup.py
+--- a/nemo_rl/models/megatron/setup.py
++++ b/nemo_rl/models/megatron/setup.py
+@@ -2118,5 +2118,12 @@ def _create_megatron_config(
+             reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+             fp8_param_gather=fp8_param_enabled,
++                                                                        
++                                                                      
++            **{
++                name: config["megatron_cfg"]["distributed_data_parallel_config"][name]
++                for name in ("bucket_size", "align_param_gather")
++                if name in config["megatron_cfg"]["distributed_data_parallel_config"]
++            },
+         ),
+         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
+         dataset=None,
+diff --git a/nemo_rl/models/policy/workers/megatron_policy_worker.py b/nemo_rl/models/policy/workers/megatron_policy_worker.py
+--- a/nemo_rl/models/policy/workers/megatron_policy_worker.py
++++ b/nemo_rl/models/policy/workers/megatron_policy_worker.py
+@@ -23,6 +23,7 @@
+ from collections import OrderedDict, defaultdict
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from dataclasses import dataclass, replace
++from functools import wraps
+ from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+ 
+ log = logging.getLogger(__name__)
+@@ -166,6 +167,35 @@
+ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+ 
+ 
++def _b300_memory_phase(function):
++                                                                              
++    @wraps(function)
++    def wrapped(self, *args, **kwargs):
++        if os.environ.get("PRINT_MEMORY_USAGE", "0") != "1":
++            return function(self, *args, **kwargs)
++        phase = function.__name__
++        try:
++            self._log_gpu_mem(phase + "_enter")
++        except Exception:
++            log.exception("Memory diagnostic failed at %s entry", phase)
++        status = "ok"
++        try:
++            return function(self, *args, **kwargs)
++        except BaseException as error:
++            status = "error"
++            log.exception(
++                "[training-error] phase=%s rank=%s type=%s",
++                phase, self.rank, type(error).__name__,
++            )
++            raise
++        finally:
++            try:
++                self._log_gpu_mem(phase + "_exit_" + status)
++            except Exception:
++                log.exception("Memory diagnostic failed at %s exit", phase)
++    return wrapped
++
++
+ def _should_use_router_replay(
+     *,
+     enabled: bool,
+@@ -1139,5 +1165,6 @@
+     @wrap_with_nvtx_name("megatron_policy_worker/train")
++    @_b300_memory_phase
+     def train(
+         self,
+         data: BatchedDataDict,
+         loss_fn: LossFunction,
+@@ -1691,4 +1718,7 @@
+-        if not torch.cuda.is_available() or not log.isEnabledFor(logging.DEBUG):
++        print_memory = os.environ.get("PRINT_MEMORY_USAGE", "0") == "1"
++        if not torch.cuda.is_available() or not (
++            print_memory or log.isEnabledFor(logging.DEBUG)
++        ):
+             return
+         dev = torch.cuda.current_device()
+         gib = float(1024**3)
+@@ -1698,7 +1727,10 @@
+         free_b, total_b = torch.cuda.mem_get_info(dev)
+-        log.debug(
++        stats = torch.cuda.memory_stats(dev)
++        emit = log.info if print_memory else log.debug
++        emit(
+             "[gpumem] tag=%s rank=%d alloc=%.2f max_alloc=%.2f reserved=%.2f "
+-            "max_reserved=%.2f driver_used=%.2f total=%.2f",
++            "max_reserved=%.2f driver_used=%.2f total=%.2f "
++            "alloc_retries=%d ooms=%d inactive_split=%.2f units=GiB",
+             tag,
+             self.rank,
+             torch.cuda.memory_allocated(dev) / gib,
+@@ -1711,4 +1742,7 @@
+             (total_b - free_b) / gib,
+             total_b / gib,
++            stats.get("num_alloc_retries", 0),
++            stats.get("num_ooms", 0),
++            stats.get("inactive_split_bytes.all.current", 0) / gib,
+         )
+         torch.cuda.reset_peak_memory_stats(dev)
+@@ -1819,5 +1853,6 @@
+     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
++    @_b300_memory_phase
+     def train_microbatch(
+         self,
+         data: BatchedDataDict[Any],
+     ) -> None:
+--- a/nemo_rl/distributed/virtual_cluster.py
++++ b/nemo_rl/distributed/virtual_cluster.py
+@@ -34,6 +34,20 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _site_pinned_rank(node: dict, default_rank: int) -> int:
++                                                                       
++    raw_order = os.environ.get("QWEN_B300_NODE_ORDER", "")
++    if not raw_order:
++        return default_rank
++    order = raw_order.split(",")
++    if len(order) != len(set(order)) or any(not ip for ip in order):
++        raise ValueError("QWEN_B300_NODE_ORDER must contain unique node IPs")
++    ip = node["NodeManagerAddress"]
++    if ip not in order:
++        raise ValueError(f"Alive Ray node {ip} is absent from QWEN_B300_NODE_ORDER")
++    return order.index(ip) + 1
++
++
+ class ClusterConfig(TypedDict):
+     gpus_per_node: int
+     num_nodes: int
+@@ -541,12 +555,15 @@
+     for node in ray.nodes():
+         if node.get("NodeID") == node_id:
+             all_node_resources = node.get("Resources", {})
++            pinned_node = node
+             break
+     for key, val in all_node_resources.items():
+         if key.startswith(NVLINK_DOMAIN_PREFIX):
+             nvlink_domain = key
+         if key == TOPO_RANK_KEY:
+             topo_rank = int(val)
++    if os.environ.get("QWEN_B300_NODE_ORDER"):
++        topo_rank = _site_pinned_rank(pinned_node, topo_rank)
+     return gpu_id, nvlink_domain, topo_rank
+ 
+ 
+@@ -637,7 +654,7 @@
+                 nvlink_domain = key
+             if key == TOPO_RANK_KEY:
+                 topo_rank = int(val)
+-        topology[node_id] = (nvlink_domain, topo_rank)
++        topology[node_id] = (nvlink_domain, _site_pinned_rank(node, topo_rank))
+     return topology
+ 
+ 
+@@ -776,6 +793,18 @@
+         topology, segment_size, num_nodes
+     )
+     node_resource_constraints = [{topology[nid][0]: 0.001} for nid in selected_node_ids]
++    if os.environ.get("QWEN_B300_NODE_ORDER"):
++        node_ips = {
++            node["NodeID"]: node["NodeManagerAddress"]
++            for node in ray.nodes() if node.get("Alive", False)
++        }
++                                                                         
++                                                                          
++        node_resource_constraints = [
++            {f"node:{node_ips[nid]}": 0.001} for nid in selected_node_ids
++        ]
++        print(f"[B300_PINNED_PLACEMENT] role={role} "
++              f"hosts={[node_ips[nid] for nid in selected_node_ids]}", flush=True)
+     print(
+         f"  ✓ Topology-aware allocation: {num_nodes} {role} nodes in "
+         f"{len(set(topology[nid][0] for nid in selected_node_ids))} NVLink domains "

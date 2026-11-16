@@ -1,0 +1,114 @@
+#!/bin/bash
+set -e
+
+# ==============================================================================
+# MLPerf DeepSWE recipe: Qwen3.5-397B-A17B on TPU v7x, as submitted
+# (tpu7x-4x4x8-128x2x2x1, 640 chips). The submission sets BATCH_SIZE=72
+# (global batch size 1,152; run_and_time.sh).
+# ==============================================================================
+# - Trainer on 128 chips (4x4x8 = 256 devices, FSDP=32, TP=1, EXPERT=2, CP=4)
+# - Rollout on 512 chips (128 replicas x 4 chips 2x2x1, DP=1, EP=8, TP=1)
+# - BATCH_SIZE prompts x 16 generations per step; the learning rate and the
+#   gradient clip follow from the global batch size (below)
+# - FP8 routed MoE experts (fp8_moe.sh), asynchronous and in-flight weight sync
+# Sources mlperf_397b_1024_v7x.sh, which sources mlperf_397b_256_v7x.sh and then
+# mlperf_base.sh; the exports below take precedence over their ${VAR:-default}
+# defaults.
+# ==============================================================================
+
+export RCP_LOGGING="${RCP_LOGGING:-true}"
+export WEIGHT_SYNC_DISABLE_TIMEOUTS="${WEIGHT_SYNC_DISABLE_TIMEOUTS:-1}"
+export RAIDEN_BROADCAST_HOST_RATIO="${RAIDEN_BROADCAST_HOST_RATIO:-1.0}"
+export RAIDEN_BROADCAST_PIPELINE_STAGES="${RAIDEN_BROADCAST_PIPELINE_STAGES:-4}"
+export FAIL_FAST="${FAIL_FAST:-true}"
+export WANDB_RESUME="${WANDB_RESUME:-allow}"
+export PATHWAYS_CHECKPOINTING_IMPL="${PATHWAYS_CHECKPOINTING_IMPL:-persistence}"
+export CKPT_USE_OCDBT="${CKPT_USE_OCDBT:-0}"
+export CHECKPOINT_SAVE_INTERVAL_STEPS="${CHECKPOINT_SAVE_INTERVAL_STEPS:-1}"
+export CHECKPOINT_ABANDON_FAILED_SAVES="${CHECKPOINT_ABANDON_FAILED_SAVES:-true}"
+export CHECKPOINT_OPTIMIZER_INTERVAL_STEPS="${CHECKPOINT_OPTIMIZER_INTERVAL_STEPS:-0}"
+export TUNIX_DEBUG_INFERENCE_LOGS="${TUNIX_DEBUG_INFERENCE_LOGS:-true}"
+export MAX_STEPS="${MAX_STEPS:-10}"
+export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
+export ASYNC_WEIGHT_SYNC="${ASYNC_WEIGHT_SYNC:-true}"
+export PIPELINE_TRAIN_MICROBATCHES="${PIPELINE_TRAIN_MICROBATCHES:-true}"
+export IN_FLIGHT_WEIGHT_UPDATES="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
+export MAX_STALENESS="${MAX_STALENESS:-2}"
+export ROLLOUT_PRIORITY_SCHEDULING="${ROLLOUT_PRIORITY_SCHEDULING:-true}"
+export OPENHANDS_MULTI_TOOL_CALLS="${OPENHANDS_MULTI_TOOL_CALLS:-true}"
+export WEIGHT_SYNC_PARALLEL_H2H="${WEIGHT_SYNC_PARALLEL_H2H:-1}"
+export VERIFY_WEIGHTS="${VERIFY_WEIGHTS:-false}"
+export DISABLE_TRAJECTORY_STORE="${DISABLE_TRAJECTORY_STORE:-false}"
+export BATCH_SIZE="${BATCH_SIZE:-64}"
+
+# Learning rate and gradient clip follow the global batch size when not set:
+# GBS = BATCH_SIZE * NUM_GENERATIONS (16), LEARNING_RATE = 1e-6 * sqrt(GBS / 256),
+# MAX_GRAD_NORM = 0.125 * sqrt(256 / GBS). GBS 1,024 gives 2e-06 / 0.0625 and
+# GBS 1,152 (BATCH_SIZE=72) gives 2.121320343559642e-06 / 0.05892556509887896.
+if [[ ! "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BATCH_SIZE must be a positive integer, got '${BATCH_SIZE}'" >&2
+  exit 1
+fi
+_gbs=$(( BATCH_SIZE * ${NUM_GENERATIONS:-16} ))
+export LEARNING_RATE="${LEARNING_RATE:-$(python3 -c "import math; print(f'{1e-6 * math.sqrt(${_gbs} / 256):.16g}')")}"
+export MAX_GRAD_NORM="${MAX_GRAD_NORM:-$(python3 -c "import math; print(f'{0.125 * math.sqrt(256 / ${_gbs}):.16g}')")}"
+unset _gbs
+
+export INITIAL_DISPATCH_FIRST_STAGGER_S="${INITIAL_DISPATCH_FIRST_STAGGER_S:-75}"
+export INITIAL_DISPATCH_STAGGER_S="${INITIAL_DISPATCH_STAGGER_S:-75}"
+export TRAINER_WARMUP_COMPILE="${TRAINER_WARMUP_COMPILE:-true}"
+export SANDBOX_WAIT_INITIAL="${SANDBOX_WAIT_INITIAL:-false}"
+
+export ROLLOUT_ATTENTION_DP="${ROLLOUT_ATTENTION_DP:-false}"
+
+export TRAINER_TUNED_FLAGS="${TRAINER_TUNED_FLAGS:-true}"
+if [[ "${TRAINER_TUNED_FLAGS}" == "true" ]]; then
+  export COMPUTE_LOGPS_CHUNK_SIZE="${COMPUTE_LOGPS_CHUNK_SIZE:-1024}"
+fi
+export DROPLESS="${DROPLESS:-true}"
+case "${DROPLESS}" in
+  true)
+    if [[ "${TRAINER_TUNED_FLAGS}" == "true" ]]; then
+      export RAGGED_BUFFER_FACTOR="${RAGGED_BUFFER_FACTOR:-2.75}"
+    fi
+    export RAGGED_BUFFER_FACTOR="${RAGGED_BUFFER_FACTOR:--1}"
+    if [[ "${TRAINER_TUNED_FLAGS}" == "true" && "${RAGGED_BUFFER_FACTOR}" != "-1" ]]; then
+      export RETRY_WHEN_TOKENS_DROPPED="${RETRY_WHEN_TOKENS_DROPPED:-true}"
+      export MOE_EXCLUDE_PADDING="${MOE_EXCLUDE_PADDING:-true}"
+      export LOG_MOE_DROPS="${LOG_MOE_DROPS:-true}"
+      if [[ "${RETRY_DROPLESS_FINAL_MICRO_BATCH:-false}" != "true" \
+            && -z "${FIRST_PHASE_RAGGED_BUFFER_FACTOR:-}" ]]; then
+        export REMAT_CONTEXT="${REMAT_CONTEXT:-device}"
+        export NUM_MOE_TOKEN_CHUNKS="${NUM_MOE_TOKEN_CHUNKS:-2}"
+      fi
+    fi
+    export REMAT_CONTEXT="${REMAT_CONTEXT:-offload}"
+    export NUM_MOE_TOKEN_CHUNKS="${NUM_MOE_TOKEN_CHUNKS:-4}"
+    export TRAINER_MAX_HBM_SIZE_MIB="${TRAINER_MAX_HBM_SIZE_MIB:-84992}"
+    if [[ "${RAGGED_BUFFER_FACTOR}" != "-1" && "${RETRY_WHEN_TOKENS_DROPPED:-false}" != "true" ]]; then
+      echo "ERROR: DROPLESS=true with RAGGED_BUFFER_FACTOR=${RAGGED_BUFFER_FACTOR} drops tokens;" \
+           "set RETRY_WHEN_TOKENS_DROPPED=true or DROPLESS=false" >&2
+      exit 1
+    fi
+    ;;
+  false)
+    ;;
+  *)
+    echo "ERROR: DROPLESS must be true or false, got '${DROPLESS}'" >&2
+    exit 1
+    ;;
+esac
+
+export TUNIX_LOGPS_SHARDED_HEAD="${TUNIX_LOGPS_SHARDED_HEAD:-local}"
+export PIPELINE_STEP_BOUNDARY="${PIPELINE_STEP_BOUNDARY:-1}"
+export STAGE_NEXT_MICROBATCH="${STAGE_NEXT_MICROBATCH:-${PIPELINE_STEP_BOUNDARY}}"
+
+export TRAINER_FP8="${TRAINER_FP8:-true}"
+export ROLLOUT_FP8="${ROLLOUT_FP8:-true}"
+export ROLLOUT_REPLICAS="${ROLLOUT_REPLICAS:-128}"
+export VLLM_DATA_PARALLEL_SIZE="${VLLM_DATA_PARALLEL_SIZE:-1}"
+export ROLLOUT_TPU_SLICE="${ROLLOUT_TPU_SLICE:-tpu7x:2x2x1}"
+export ROLLOUT_JOBSET_YAML="${ROLLOUT_JOBSET_YAML:-jobset.tpu.yaml}"
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${DIR}/mlperf_397b_1024_v7x.sh" "$@"

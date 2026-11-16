@@ -1,0 +1,1767 @@
+diff -ruN a/cudnn/grouped_gemm/grouped_gemm_dglu/api.py b/cudnn/grouped_gemm/grouped_gemm_dglu/api.py
+--- a/cudnn/grouped_gemm/grouped_gemm_dglu/api.py
++++ b/cudnn/grouped_gemm/grouped_gemm_dglu/api.py
+@@ -125,6 +125,11 @@
+         sample_sfd_col: Optional[torch.Tensor] = None,
+         sample_amax: Optional[torch.Tensor] = None,
+         sample_norm_const: Optional[torch.Tensor] = None,
++        sample_d_row_nvfp4: Optional[torch.Tensor] = None,
++        sample_d_row_nvfp4_scale: Optional[torch.Tensor] = None,
++        sample_d_rht_nvfp4: Optional[torch.Tensor] = None,
++        sample_d_rht_nvfp4_scale: Optional[torch.Tensor] = None,
++        sample_nvfp4_norm_const: Optional[torch.Tensor] = None,
+         # Configuration
+         acc_dtype: torch.dtype = torch.float32,
+         mma_tiler_mn: Tuple[int, int] = (256, 256),
+@@ -164,6 +169,11 @@
+         :param sample_sfd_col: Optional column scale factor for D
+         :param sample_amax: Optional amax tensor for quantization, shape (expert_cnt, 2, 1)
+         :param sample_norm_const: Optional normalization constant
++        :param sample_d_row_nvfp4: Packed rowwise NVFP4 output
++        :param sample_d_row_nvfp4_scale: Swizzled rowwise E4M3 scales
++        :param sample_d_rht_nvfp4: Packed flat fixed-sign H16 NVFP4 output
++        :param sample_d_rht_nvfp4_scale: Flat columnwise E4M3 scales
++        :param sample_nvfp4_norm_const: One-element FP32 NVFP4 normalization tensor
+         :param acc_dtype: Accumulator data type
+         :param mma_tiler_mn: MMA tiler shape (M, N)
+         :param cluster_shape_mn: Cluster shape (M, N)
+@@ -223,6 +233,15 @@
+             1,
+             "norm_const",
+         )
++        self.d_row_nvfp4_desc = self._make_tensor_desc(sample_d_row_nvfp4, name="sample_d_row_nvfp4")
++        self.d_row_nvfp4_scale_desc = self._make_tensor_desc(sample_d_row_nvfp4_scale, name="sample_d_row_nvfp4_scale")
++        self.d_rht_nvfp4_desc = self._make_tensor_desc(sample_d_rht_nvfp4, name="sample_d_rht_nvfp4")
++        self.d_rht_nvfp4_scale_desc = self._make_tensor_desc(sample_d_rht_nvfp4_scale, name="sample_d_rht_nvfp4_scale")
++        self.nvfp4_norm_const_desc = self._unpad_tensor_to_ndim(
++            self._make_tensor_desc(sample_nvfp4_norm_const, name="sample_nvfp4_norm_const"),
++            1,
++            "nvfp4_norm_const",
++        )
+ 
+         # ---- Mode-specific state ----
+         if self.weight_mode == MoEWeightMode.DENSE:
+@@ -277,6 +296,7 @@
+ 
+         self._interpret_uint8_as_fp4x2 = True
+         self._has_dbias = self.dbias_desc is not None
++        self.generate_nvfp4_output = self.d_row_nvfp4_desc is not None
+         self._kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel
+ 
+         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+@@ -305,6 +325,20 @@
+             "sfd_row_desc, sfd_col_desc, and norm_const_desc must be all None or all not None",
+         )
+         self._user_requested_sfd = all_provided
++        nvfp4_descs = [
++            self.d_row_nvfp4_desc,
++            self.d_row_nvfp4_scale_desc,
++            self.d_rht_nvfp4_desc,
++            self.d_rht_nvfp4_scale_desc,
++            self.nvfp4_norm_const_desc,
++        ]
++        nvfp4_all_none = all(desc is None for desc in nvfp4_descs)
++        nvfp4_all_provided = all(desc is not None for desc in nvfp4_descs)
++        self._value_error_if(
++            not (nvfp4_all_none or nvfp4_all_provided),
++            "all fused NVFP4 data/scale/norm tensors must be provided together",
++        )
++        self.generate_nvfp4_output = nvfp4_all_provided
+ 
+         # ---- Shapes and strides ----
+         self._logger.debug("Checking tensor shapes and strides")
+@@ -322,6 +356,7 @@
+             l = self.expert_cnt  # for shape checks that use l
+ 
+         n_out = 2 * n
++        self.n_out = n_out
+ 
+         self._value_error_if(
+             n % 32 != 0,
+@@ -357,6 +392,19 @@
+         self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
+         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 2, 1), "amax")
+         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
++        self._check_tensor_shape(self.d_row_nvfp4_desc, (tensor_m, n_out, 1), "D_row_NVFP4")
++        self._check_tensor_shape(
++            self.d_row_nvfp4_scale_desc,
++            (32, 4, ceil_div(tensor_m, 128), 4, ceil_div(ceil_div(n_out, 16), 4), 1),
++            "D_row_NVFP4_scale",
++        )
++        self._check_tensor_shape(self.d_rht_nvfp4_desc, (tensor_m * n_out,), "D_RHT_NVFP4")
++        self._check_tensor_shape(
++            self.d_rht_nvfp4_scale_desc,
++            (tensor_m * n_out // 16,),
++            "D_RHT_NVFP4_scale",
++        )
++        self._check_tensor_shape(self.nvfp4_norm_const_desc, (1,), "NVFP4_norm_const")
+         self._check_tensor_shape(self.padded_offsets_desc, (self.expert_cnt,), "padded_offsets")
+ 
+         # Strides
+@@ -393,6 +441,22 @@
+             stride=[(n_out, 1, tensor_m * n_out)],
+             extra_error_msg="D_col must have n-major layout",
+         )
++        if self.generate_nvfp4_output:
++            _ = self._check_tensor_stride(
++                self.d_row_nvfp4_desc,
++                stride=[(n_out, 1, tensor_m * n_out)],
++                extra_error_msg="D_row_NVFP4 must have n-major layout",
++            )
++            _ = self._check_tensor_stride(
++                self.d_rht_nvfp4_desc,
++                stride=[(1,)],
++                extra_error_msg="D_RHT_NVFP4 must be flat",
++            )
++            _ = self._check_tensor_stride(
++                self.d_rht_nvfp4_scale_desc,
++                stride=[(1,)],
++                extra_error_msg="D_RHT_NVFP4_scale must be flat",
++            )
+ 
+         # ---- Data types ----
+         self._logger.debug("Checking data types")
+@@ -514,6 +578,23 @@
+             name="D_col",
+             extra_error_msg="D_col must have the same dtype as D_row",
+         )
++        if self.generate_nvfp4_output:
++            self._value_error_if(self.d_dtype != torch.bfloat16, "fused NVFP4 outputs require BF16 D_row")
++            self._value_error_if(self.sf_vec_size != 16, "fused NVFP4 outputs require sf_vec_size=16")
++            self._value_error_if(n_out % 128 != 0, f"fused NVFP4 outputs require N_out divisible by 128, got {n_out}")
++            self._check_dtype(self.d_row_nvfp4_desc, dtype=torch.float4_e2m1fn_x2, name="D_row_NVFP4")
++            self._check_dtype(self.d_rht_nvfp4_desc, dtype=torch.float4_e2m1fn_x2, name="D_RHT_NVFP4")
++            self._check_dtype(
++                self.d_row_nvfp4_scale_desc,
++                dtype=torch.float8_e4m3fn,
++                name="D_row_NVFP4_scale",
++            )
++            self._check_dtype(
++                self.d_rht_nvfp4_scale_desc,
++                dtype=torch.float8_e4m3fn,
++                name="D_RHT_NVFP4_scale",
++            )
++            self._check_dtype(self.nvfp4_norm_const_desc, dtype=torch.float32, name="NVFP4_norm_const")
+ 
+         # ---- SFD generation logic ----
+         kernel_generate_sfd = self._is_fp8(self.ab_dtype) and self.sf_dtype == torch.float8_e8m0fnu and self._is_fp8(self.d_dtype)
+@@ -696,7 +777,7 @@
+ 
+     def _compile_dense(self, gemm_dglu, max_active_clusters, fake_stream) -> None:
+         """Compile for dense (contiguous) weight mode."""
+-        use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
++        use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0" and not self.generate_nvfp4_output
+ 
+         fake_workspace_ptr = cute.runtime.nullptr(
+             dtype=cutlass.Uint8,
+@@ -873,6 +954,35 @@
+                     stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
+                 )
+ 
++        d_row_nvfp4_fake = None
++        d_row_nvfp4_scale_fake = None
++        d_rht_nvfp4_fake = None
++        d_rht_nvfp4_scale_fake = None
++        nvfp4_norm_const_fake = None
++        if self.generate_nvfp4_output:
++            d_row_nvfp4_fake = self._make_fake_cute_compact_tensor(
++                dtype=self.d_row_nvfp4_desc.dtype,
++                shape=(valid_m, self.n_out, 1),
++                stride_order=self.d_row_nvfp4_desc.stride_order,
++            )
++            stride_nvfp4_sf_m = cute.sym_int(divisibility=32 * 4 * 4)
++            d_row_nvfp4_scale_fake = self._make_fake_cute_tensor(
++                dtype=self.d_row_nvfp4_scale_desc.dtype,
++                shape=(32, 4, tensor_m_128, 4, self.d_row_nvfp4_scale_desc.shape[4], 1),
++                stride=(16, 4, self.d_row_nvfp4_scale_desc.stride[2], 1, 512, stride_nvfp4_sf_m),
++            )
++            d_rht_nvfp4_fake = self._make_fake_cute_tensor(
++                dtype=self.d_rht_nvfp4_desc.dtype,
++                shape=(valid_m * self.n_out,),
++                stride=(1,),
++            )
++            d_rht_nvfp4_scale_fake = self._make_fake_cute_tensor(
++                dtype=self.d_rht_nvfp4_scale_desc.dtype,
++                shape=(valid_m * (self.n_out // 16),),
++                stride=(1,),
++            )
++            nvfp4_norm_const_fake = self._make_fake_cute_tensor_from_desc(self.nvfp4_norm_const_desc, assumed_align=16)
++
+         # Compile with keyword args (dense mode uses the unified __call__ positional order).
+         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
+ 
+@@ -894,6 +1004,11 @@
+             sfd_col_tensor=sfd_col_fake,
+             amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
+             norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
++            d_row_quant_tensor=d_row_nvfp4_fake,
++            d_row_quant_sf_tensor=d_row_nvfp4_scale_fake,
++            d_rht_quant_tensor=d_rht_nvfp4_fake,
++            d_rht_quant_sf_tensor=d_rht_nvfp4_scale_fake,
++            quant_norm_const_tensor=nvfp4_norm_const_fake,
+             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
+             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
+             beta=beta_cute_fake,
+@@ -925,6 +1040,11 @@
+             sfd_col_tensor: Optional[torch.Tensor],
+             amax_tensor: Optional[torch.Tensor],
+             norm_const_tensor: Optional[torch.Tensor],
++            d_row_nvfp4_tensor: Optional[torch.Tensor],
++            d_row_nvfp4_scale_tensor: Optional[torch.Tensor],
++            d_rht_nvfp4_tensor: Optional[torch.Tensor],
++            d_rht_nvfp4_scale_tensor: Optional[torch.Tensor],
++            nvfp4_norm_const_tensor: Optional[torch.Tensor],
+             padded_offsets: torch.Tensor,
+             alpha_tensor: torch.Tensor,
+             beta_tensor: torch.Tensor,
+@@ -934,6 +1054,7 @@
+             stream: cuda.CUstream,
+         ) -> None:
+             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
++            nvfp4_norm_const_tensor = self._unpad_tensor_to_ndim(nvfp4_norm_const_tensor, 1, "nvfp4_norm_const")
+             _compiled_kernel(
+                 a_tensor,
+                 b_tensor,
+@@ -950,6 +1071,11 @@
+                 sfd_col_tensor,
+                 amax_tensor,
+                 norm_const_tensor,
++                d_row_nvfp4_tensor,
++                d_row_nvfp4_scale_tensor,
++                d_rht_nvfp4_tensor,
++                d_rht_nvfp4_scale_tensor,
++                nvfp4_norm_const_tensor,
+                 padded_offsets,
+                 alpha_tensor,
+                 beta_tensor,
+@@ -1036,6 +1162,35 @@
+             )
+         amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
+         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
++        d_row_nvfp4_tensor = None
++        d_row_nvfp4_scale_tensor = None
++        d_rht_nvfp4_tensor = None
++        d_rht_nvfp4_scale_tensor = None
++        nvfp4_norm_const_tensor_cute = None
++        if self.generate_nvfp4_output:
++            d_row_nvfp4_tensor = self._make_fake_cute_compact_tensor(
++                dtype=self.d_row_nvfp4_desc.dtype,
++                shape=(valid_m, self.n_out, 1),
++                stride_order=self.d_row_nvfp4_desc.stride_order,
++            )
++            stride_nvfp4_sf_m = cute.sym_int(divisibility=32 * 4 * 4)
++            d_row_nvfp4_scale_tensor = self._make_fake_cute_tensor(
++                dtype=self.d_row_nvfp4_scale_desc.dtype,
++                shape=(32, 4, tensor_m_128, 4, self.d_row_nvfp4_scale_desc.shape[4], 1),
++                stride=(16, 4, self.d_row_nvfp4_scale_desc.stride[2], 1, 512, stride_nvfp4_sf_m),
++                assumed_align=16,
++            )
++            d_rht_nvfp4_tensor = self._make_fake_cute_tensor(
++                dtype=self.d_rht_nvfp4_desc.dtype,
++                shape=(valid_m * self.n_out,),
++                stride=(1,),
++            )
++            d_rht_nvfp4_scale_tensor = self._make_fake_cute_tensor(
++                dtype=self.d_rht_nvfp4_scale_desc.dtype,
++                shape=(valid_m * (self.n_out // 16),),
++                stride=(1,),
++            )
++            nvfp4_norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.nvfp4_norm_const_desc, assumed_align=16)
+         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
+         alpha_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
+         beta_tensor = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
+@@ -1080,6 +1235,11 @@
+             sfd_col_tensor=sfd_col_tensor,
+             amax_tensor=amax_tensor,
+             norm_const_tensor=norm_const_tensor_cute,
++            d_row_quant_tensor=d_row_nvfp4_tensor,
++            d_row_quant_sf_tensor=d_row_nvfp4_scale_tensor,
++            d_rht_quant_tensor=d_rht_nvfp4_tensor,
++            d_rht_quant_sf_tensor=d_rht_nvfp4_scale_tensor,
++            quant_norm_const_tensor=nvfp4_norm_const_tensor_cute,
+             padded_offsets=padded_offsets_tensor,
+             alpha=alpha_tensor,
+             beta=beta_tensor,
+@@ -1118,6 +1278,11 @@
+             sfd_col_tensor: Optional[torch.Tensor],
+             amax_tensor: Optional[torch.Tensor],
+             norm_const_tensor: Optional[torch.Tensor],
++            d_row_nvfp4_tensor: Optional[torch.Tensor],
++            d_row_nvfp4_scale_tensor: Optional[torch.Tensor],
++            d_rht_nvfp4_tensor: Optional[torch.Tensor],
++            d_rht_nvfp4_scale_tensor: Optional[torch.Tensor],
++            nvfp4_norm_const_tensor: Optional[torch.Tensor],
+             padded_offsets: torch.Tensor,
+             alpha_tensor: torch.Tensor,
+             beta_tensor: torch.Tensor,
+@@ -1127,6 +1292,7 @@
+             stream: cuda.CUstream,
+         ) -> None:
+             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
++            nvfp4_norm_const_tensor = self._unpad_tensor_to_ndim(nvfp4_norm_const_tensor, 1, "nvfp4_norm_const")
+             b_ptrs_addr = int(b_ptrs_device.data_ptr())
+             sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
+ 
+@@ -1146,6 +1312,11 @@
+                 sfd_col_tensor,
+                 amax_tensor,
+                 norm_const_tensor,
++                d_row_nvfp4_tensor,
++                d_row_nvfp4_scale_tensor,
++                d_rht_nvfp4_tensor,
++                d_rht_nvfp4_scale_tensor,
++                nvfp4_norm_const_tensor,
+                 padded_offsets,
+                 alpha_tensor,
+                 beta_tensor,
+@@ -1185,6 +1356,11 @@
+         sfd_col_tensor: Optional[torch.Tensor] = None,
+         amax_tensor: Optional[torch.Tensor] = None,
+         norm_const_tensor: Optional[torch.Tensor] = None,
++        d_row_nvfp4_tensor: Optional[torch.Tensor] = None,
++        d_row_nvfp4_scale_tensor: Optional[torch.Tensor] = None,
++        d_rht_nvfp4_tensor: Optional[torch.Tensor] = None,
++        d_rht_nvfp4_scale_tensor: Optional[torch.Tensor] = None,
++        nvfp4_norm_const_tensor: Optional[torch.Tensor] = None,
+         current_stream: Optional[cuda.CUstream] = None,
+     ) -> None:
+         """Execute the compiled kernel.
+@@ -1244,6 +1420,11 @@
+                 sfd_col_tensor=sfd_col_tensor,
+                 amax_tensor=amax_tensor,
+                 norm_const_tensor=norm_const_tensor,
++                d_row_nvfp4_tensor=d_row_nvfp4_tensor,
++                d_row_nvfp4_scale_tensor=d_row_nvfp4_scale_tensor,
++                d_rht_nvfp4_tensor=d_rht_nvfp4_tensor,
++                d_rht_nvfp4_scale_tensor=d_rht_nvfp4_scale_tensor,
++                nvfp4_norm_const_tensor=nvfp4_norm_const_tensor,
+                 padded_offsets=padded_offsets,
+                 alpha_tensor=alpha_tensor,
+                 beta_tensor=beta_tensor,
+@@ -1265,6 +1446,11 @@
+                 sfd_col_tensor=sfd_col_tensor,
+                 amax_tensor=amax_tensor,
+                 norm_const_tensor=norm_const_tensor,
++                d_row_nvfp4_tensor=d_row_nvfp4_tensor,
++                d_row_nvfp4_scale_tensor=d_row_nvfp4_scale_tensor,
++                d_rht_nvfp4_tensor=d_rht_nvfp4_tensor,
++                d_rht_nvfp4_scale_tensor=d_rht_nvfp4_scale_tensor,
++                nvfp4_norm_const_tensor=nvfp4_norm_const_tensor,
+                 padded_offsets=padded_offsets,
+                 alpha_tensor=alpha_tensor,
+                 beta_tensor=beta_tensor,
+@@ -1298,6 +1484,7 @@
+     b_tensor: Optional[torch.Tensor] = None,
+     sfb_tensor: Optional[torch.Tensor] = None,
+     generate_dbias: bool = False,
++    generate_nvfp4_output: bool = False,
+     # Discrete mode:
+     b_ptrs: Optional[torch.Tensor] = None,
+     sfb_ptrs: Optional[torch.Tensor] = None,
+@@ -1346,6 +1533,8 @@
+         b_tensor: (Dense) Weight B tensor (n, k, l)
+         sfb_tensor: (Dense) Scale factor B
+         generate_dbias: Optional flag to allocate and return dbias output
++        generate_nvfp4_output: Emit rowwise and fixed-sign H16 colwise NVFP4
++            data/scales for direct GroupedTensor construction.
+         b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
+         sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
+         n: (Discrete) B weight N dimension
+@@ -1384,7 +1573,11 @@
+ 
+     Returns:
+         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
+-            dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor
++            dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor,
++            d_row_nvfp4_tensor, d_row_nvfp4_scale_tensor,
++            d_rht_nvfp4_tensor, d_rht_nvfp4_scale_tensor, and
++            nvfp4_norm_const_tensor. NVFP4 entries are None unless
++            generate_nvfp4_output is true.
+     """
+     from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
+ 
+@@ -1441,6 +1634,11 @@
+     sfd_col_tensor = None
+     amax_tensor = None
+     dbias_tensor = None
++    d_row_nvfp4_tensor = None
++    d_row_nvfp4_scale_tensor = None
++    d_rht_nvfp4_tensor = None
++    d_rht_nvfp4_scale_tensor = None
++    nvfp4_norm_const_tensor = None
+ 
+     if a_tensor.dtype in [
+         torch.float8_e4m3fn,
+@@ -1461,9 +1659,72 @@
+ 
+     if d_dtype in [torch.bfloat16, torch.float16]:
+         _logger.debug("grouped_gemm_dglu_wrapper_sm100: Constructing amax_tensor")
+-        amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
++        # Empty experts launch no CTAs. Keep their pre/post-RHT amax at the
++        # mathematically neutral value so quantize-with-amax never consumes
++        # an untouched -inf slot under fixed-buffer graph replay.
++        amax_tensor = torch.zeros((l, 2, 1), dtype=torch.float32, device=a_tensor.device)
+     if generate_dbias:
+         dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
++    if generate_nvfp4_output:
++        if d_dtype != torch.bfloat16:
++            raise ValueError("generate_nvfp4_output requires d_dtype=torch.bfloat16")
++        if sf_vec_size != 16:
++            raise ValueError("generate_nvfp4_output requires sf_vec_size=16")
++        if n_out % 128 != 0:
++            raise ValueError(f"generate_nvfp4_output requires n_out divisible by 128, got {n_out}")
++        # This ABI matches TE GroupedTensor's rowwise data/scale_inv
++        # and columnwise_data/columnwise_scale_inv storage contract.
++        d_row_nvfp4_tensor = torch.empty_strided(
++            (valid_m, n_out // 2, 1),
++            (n_out // 2, 1, valid_m * n_out // 2),
++            dtype=torch.float4_e2m1fn_x2,
++            device=a_tensor.device,
++        )
++        sf_shape = (1, ceil_div(valid_m, 128), ceil_div(ceil_div(n_out, 16), 4), 32, 4, 4)
++        d_row_nvfp4_scale_tensor = torch.empty(sf_shape, dtype=torch.float8_e4m3fn, device=a_tensor.device).permute(3, 4, 1, 5, 2, 0)
++        d_rht_nvfp4_tensor = torch.empty_strided(
++            (valid_m * n_out // 2,),
++            (1,),
++            dtype=torch.float4_e2m1fn_x2,
++            device=a_tensor.device,
++        )
++        d_rht_nvfp4_scale_tensor = torch.empty_strided(
++            (valid_m * n_out // 16,),
++            (1,),
++            dtype=torch.float8_e4m3fn,
++            device=a_tensor.device,
++        )
++        # Dynamic fixed-buffer scheduling can reserve up to (experts - 1)
++        # alignment blocks beyond padded_offsets[-1]. No CTA overwrites those
++        # rows. Clear the packed data suffixes so graph replay never feeds
++        # stale FP4/NaN bit patterns into FC1 dgrad or wgrad.
++        if use_dynamic_sched and valid_m > 0 and l > 1:
++            max_inactive_rows = min(valid_m, (l - 1) * m_aligned)
++            d_row_nvfp4_tensor[-max_inactive_rows:].view(torch.uint8).zero_()
++            # Columnwise K-major storage interleaves token blocks across N;
++            # its inactive token rows are not a contiguous byte suffix.
++            # Clear the compact buffer until a strided tail-clear kernel is
++            # available. Active entries are overwritten by the dQGeGLU CTA.
++            d_rht_nvfp4_tensor.view(torch.uint8).zero_()
++            # Zero data multiplied by an untouched E4M3 NaN scale is still
++            # NaN. The rowwise scale view is physically swizzled, so clear its
++            # compact backing storage. Active entries are overwritten below.
++            d_row_nvfp4_scale_tensor.as_strided(
++                (d_row_nvfp4_scale_tensor.numel(),), (1,)
++            ).view(torch.uint8).zero_()
++            d_rht_nvfp4_scale_tensor.view(torch.uint8).zero_()
++        # Quantization needs a launch-time global scale so small dGLU block
++        # scales remain representable in E4M3. The paired TE overlay advertises
++        # amax=(6*448)/global_scale to preserve the GEMM scale contract.
++        fixed_global_scale = float(
++            os.getenv("NVFP4_DQGEGLU_FIXED_GLOBAL_SCALE", "32768")
++        )
++        nvfp4_norm_const_tensor = torch.full(
++            (1,),
++            fixed_global_scale,
++            dtype=torch.float32,
++            device=a_tensor.device,
++        )
+ 
+     if valid_m == 0:
+         _logger.debug("grouped_gemm_dglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
+@@ -1475,6 +1736,11 @@
+             amax_tensor=amax_tensor,
+             sfd_row_tensor=sfd_row_tensor,
+             sfd_col_tensor=sfd_col_tensor,
++            d_row_nvfp4_tensor=d_row_nvfp4_tensor,
++            d_row_nvfp4_scale_tensor=d_row_nvfp4_scale_tensor,
++            d_rht_nvfp4_tensor=d_rht_nvfp4_tensor,
++            d_rht_nvfp4_scale_tensor=d_rht_nvfp4_scale_tensor,
++            nvfp4_norm_const_tensor=nvfp4_norm_const_tensor,
+         )
+ 
+     # ---- Build cache key ----
+@@ -1499,7 +1765,7 @@
+         stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(tensor.stride()))
+         return static_shape_suffix, stride_signature, tensor.dtype
+ 
+-    use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
++    use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0" and not generate_nvfp4_output
+ 
+     if is_dense:
+         cache_key = (
+@@ -1526,6 +1792,11 @@
+             *tensor_signature(beta_tensor),
+             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
+             *(dynamic_m_tensor_signature(dprob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
++            *tensor_signature(d_row_nvfp4_tensor),
++            *tensor_signature(d_row_nvfp4_scale_tensor),
++            *tensor_signature(d_rht_nvfp4_tensor),
++            *tensor_signature(d_rht_nvfp4_scale_tensor),
++            *tensor_signature(nvfp4_norm_const_tensor),
+             *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
+             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
+             norm_const_tensor.shape if norm_const_tensor is not None else None,
+@@ -1543,6 +1814,7 @@
+             vector_f32,
+             m_aligned,
+             discrete_col_sfd,
++            generate_nvfp4_output,
+             use_dynamic_sched,
+         )
+     else:
+@@ -1560,6 +1832,11 @@
+             *tensor_signature(beta_tensor),
+             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
+             *dynamic_m_tensor_signature(dprob_tensor, (1, 1)),
++            *tensor_signature(d_row_nvfp4_tensor),
++            *tensor_signature(d_row_nvfp4_scale_tensor),
++            *tensor_signature(d_rht_nvfp4_tensor),
++            *tensor_signature(d_rht_nvfp4_scale_tensor),
++            *tensor_signature(nvfp4_norm_const_tensor),
+             *tensor_signature(dbias_tensor),
+             *tensor_signature(norm_const_tensor),
+             tuple(b_ptrs.shape),
+@@ -1580,6 +1857,7 @@
+             vector_f32,
+             m_aligned,
+             discrete_col_sfd,
++            generate_nvfp4_output,
+             use_dynamic_sched,
+             b_major,
+             num_experts,
+@@ -1610,6 +1888,11 @@
+                 sample_sfd_col=sfd_col_tensor,
+                 sample_amax=amax_tensor,
+                 sample_norm_const=norm_const_tensor,
++                sample_d_row_nvfp4=d_row_nvfp4_tensor,
++                sample_d_row_nvfp4_scale=d_row_nvfp4_scale_tensor,
++                sample_d_rht_nvfp4=d_rht_nvfp4_tensor,
++                sample_d_rht_nvfp4_scale=d_rht_nvfp4_scale_tensor,
++                sample_nvfp4_norm_const=nvfp4_norm_const_tensor,
+                 acc_dtype=acc_dtype,
+                 mma_tiler_mn=mma_tiler_mn,
+                 cluster_shape_mn=cluster_shape_mn,
+@@ -1645,6 +1928,11 @@
+                 sample_sfd_col=sfd_col_tensor,
+                 sample_amax=amax_tensor,
+                 sample_norm_const=norm_const_tensor,
++                sample_d_row_nvfp4=d_row_nvfp4_tensor,
++                sample_d_row_nvfp4_scale=d_row_nvfp4_scale_tensor,
++                sample_d_rht_nvfp4=d_rht_nvfp4_tensor,
++                sample_d_rht_nvfp4_scale=d_rht_nvfp4_scale_tensor,
++                sample_nvfp4_norm_const=nvfp4_norm_const_tensor,
+                 acc_dtype=acc_dtype,
+                 mma_tiler_mn=mma_tiler_mn,
+                 cluster_shape_mn=cluster_shape_mn,
+@@ -1687,6 +1975,11 @@
+             sfd_col_tensor=sfd_col_tensor,
+             amax_tensor=amax_tensor,
+             norm_const_tensor=norm_const_tensor,
++            d_row_nvfp4_tensor=d_row_nvfp4_tensor,
++            d_row_nvfp4_scale_tensor=d_row_nvfp4_scale_tensor,
++            d_rht_nvfp4_tensor=d_rht_nvfp4_tensor,
++            d_rht_nvfp4_scale_tensor=d_rht_nvfp4_scale_tensor,
++            nvfp4_norm_const_tensor=nvfp4_norm_const_tensor,
+             current_stream=current_stream,
+         )
+     else:
+@@ -1708,6 +2001,11 @@
+             sfd_col_tensor=sfd_col_tensor,
+             amax_tensor=amax_tensor,
+             norm_const_tensor=norm_const_tensor,
++            d_row_nvfp4_tensor=d_row_nvfp4_tensor,
++            d_row_nvfp4_scale_tensor=d_row_nvfp4_scale_tensor,
++            d_rht_nvfp4_tensor=d_rht_nvfp4_tensor,
++            d_rht_nvfp4_scale_tensor=d_rht_nvfp4_scale_tensor,
++            nvfp4_norm_const_tensor=nvfp4_norm_const_tensor,
+             current_stream=current_stream,
+         )
+ 
+@@ -1719,4 +2017,9 @@
+         amax_tensor=amax_tensor,
+         sfd_row_tensor=sfd_row_tensor,
+         sfd_col_tensor=sfd_col_tensor,
++        d_row_nvfp4_tensor=d_row_nvfp4_tensor,
++        d_row_nvfp4_scale_tensor=d_row_nvfp4_scale_tensor,
++        d_rht_nvfp4_tensor=d_rht_nvfp4_tensor,
++        d_rht_nvfp4_scale_tensor=d_rht_nvfp4_scale_tensor,
++        nvfp4_norm_const_tensor=nvfp4_norm_const_tensor,
+     )
+diff -ruN a/cudnn/grouped_gemm/grouped_gemm_dglu/moe_blockscaled_grouped_gemm_dglu_dbias.py b/cudnn/grouped_gemm/grouped_gemm_dglu/moe_blockscaled_grouped_gemm_dglu_dbias.py
+--- a/cudnn/grouped_gemm/grouped_gemm_dglu/moe_blockscaled_grouped_gemm_dglu_dbias.py
++++ b/cudnn/grouped_gemm/grouped_gemm_dglu/moe_blockscaled_grouped_gemm_dglu_dbias.py
+@@ -66,6 +66,7 @@
+     MoEWorkTileInfo,
+ )
+ from ..moe_utils import (
++    compute_expert_token_range,
+     MoEWeightMode,
+     TensormapWorkspace,
+     store_tma_desc,
+@@ -74,6 +75,13 @@
+     DiscreteWeightScaledGemmSchedExtension,
+     ContiguousAndConsistentGroupedGemmSchedExtension,
+ )
++from ..grouped_gemm_glu_hadamard.hadamard_utils import (
++    hadamard_rmem_colwise_fwht_quant_amax,
++    hadamard_rmem_colwise_fwht_amax,
++    load_colwise_pairs_bf16,
++    load_row_bf16,
++    nvfp4_quant_rmem_row,
++)
+ from ..moe_kernel_helpers import (
+     fmin,
+     fmax,
+@@ -92,7 +100,6 @@
+     is_valid_mma_tiler_and_cluster_shape,
+     is_valid_tensor_alignment,
+ )
+-
+ """
+ High-performance persistent blockscaled contiguous grouped dense GEMM (D = alpha * (SFA * A) * (SFB * B)) example for the NVIDIA Blackwell architecture
+ using CUTE DSL.
+@@ -342,15 +349,20 @@
+         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
+ 
+         self.occupancy = 1
++        # Four ACT warps produce BF16 dGLU subtiles; four dedicated RHT warps
++        # consume those subtiles through a ping-pong SMEM pipeline.
+         self.epilog_warp_id = (0, 1, 2, 3)
+-        self.mma_warp_id = 4
+-        self.tma_warp_id = 5
+-        self.epilog_load_tma_id = 6
+-        self.sched_warp_id = 7
++        self.epilog_act_warp_id = self.epilog_warp_id
++        self.epilog_rht_store_warp_id = (4, 5, 6, 7)
++        self.mma_warp_id = 8
++        self.tma_warp_id = 9
++        self.epilog_load_tma_id = 10
++        self.sched_warp_id = 11
+         self.threads_per_warp = 32
+         self.threads_per_cta = self.threads_per_warp * len(
+             (
+                 *self.epilog_warp_id,
++                *self.epilog_rht_store_warp_id,
+                 self.mma_warp_id,
+                 self.tma_warp_id,
+                 self.epilog_load_tma_id,
+@@ -360,6 +372,7 @@
+         self.threads_wo_sched = self.threads_per_warp * len(
+             (
+                 *self.epilog_warp_id,
++                *self.epilog_rht_store_warp_id,
+                 self.mma_warp_id,
+                 self.tma_warp_id,
+                 self.epilog_load_tma_id,
+@@ -373,7 +386,7 @@
+         )
+         self.epilog_sync_barrier = pipeline.NamedBarrier(
+             barrier_id=2,
+-            num_threads=32 * len(self.epilog_warp_id),
++            num_threads=32 * (len(self.epilog_warp_id) + len(self.epilog_rht_store_warp_id)),
+         )
+         self.tmem_alloc_barrier = pipeline.NamedBarrier(
+             barrier_id=3,
+@@ -383,6 +396,14 @@
+             barrier_id=4,
+             num_threads=self.threads_per_warp,
+         )
++        self.epilog_sync_barrier_group0 = pipeline.NamedBarrier(
++            barrier_id=5,
++            num_threads=32 * len(self.epilog_act_warp_id),
++        )
++        self.epilog_sync_barrier_group1 = pipeline.NamedBarrier(
++            barrier_id=6,
++            num_threads=32 * len(self.epilog_rht_store_warp_id),
++        )
+         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+         SM100_TMEM_CAPACITY_COLUMNS = 512
+         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+@@ -516,6 +537,7 @@
+             self.num_c_stage,
+             self.num_d_stage,
+             self.num_tile_stage,
++            self.num_pingpong_stage,
+         ) = self._compute_stages(
+             tiled_mma,
+             self.mma_tiler,
+@@ -532,6 +554,7 @@
+             self.occupancy,
+             self.store_d_directly,
+             self.generate_dbias,
++            self.generate_fused_quant,
+         )
+ 
+         # Compute A/B/D/Scale shared memory layout
+@@ -581,6 +604,13 @@
+                 self.epi_tile,
+                 1,
+             )
++        if cutlass.const_expr(self.generate_fused_quant):
++            self.d_quant_smem_layout_staged = sm100_utils.make_smem_layout_epi(
++                cutlass.Float4E2M1FN,
++                self.d_layout,
++                self.epi_tile,
++                self.num_d_stage,
++            )
+ 
+         # Overlap and double buffer accumulator when num_acc_stage == 1 for cta_tile_n = 256 case
+         self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
+@@ -739,6 +769,11 @@
+         sfd_col_tensor: Optional[cute.Tensor],
+         amax_tensor: Optional[cute.Tensor],
+         norm_const_tensor: Optional[cute.Tensor],
++        d_row_quant_tensor: Optional[cute.Tensor],
++        d_row_quant_sf_tensor: Optional[cute.Tensor],
++        d_rht_quant_tensor: Optional[cute.Tensor],
++        d_rht_quant_sf_tensor: Optional[cute.Tensor],
++        quant_norm_const_tensor: Optional[cute.Tensor],
+         padded_offsets: cute.Tensor,
+         alpha: cute.Tensor,
+         beta: cute.Tensor,
+@@ -783,6 +818,39 @@
+         self.c_layout = utils.LayoutEnum.from_tensor(c)
+         self.d_layout = utils.LayoutEnum.from_tensor(d)
+ 
++        any_quant_arg = (
++            d_row_quant_tensor is not None
++            or d_row_quant_sf_tensor is not None
++            or d_rht_quant_tensor is not None
++            or d_rht_quant_sf_tensor is not None
++            or quant_norm_const_tensor is not None
++        )
++        all_quant_args = (
++            d_row_quant_tensor is not None
++            and d_row_quant_sf_tensor is not None
++            and d_rht_quant_tensor is not None
++            and d_rht_quant_sf_tensor is not None
++            and quant_norm_const_tensor is not None
++        )
++        if cutlass.const_expr(any_quant_arg and not all_quant_args):
++            raise ValueError("all fused dGLU NVFP4 data/scale/norm tensors must be provided together")
++        self.generate_fused_quant = all_quant_args
++        if cutlass.const_expr(self.generate_fused_quant):
++            if cutlass.const_expr(self.d_dtype != cutlass.BFloat16):
++                raise TypeError("fused dGLU NVFP4 outputs require BF16 dGLU output")
++            if cutlass.const_expr(self.sf_vec_size != 16):
++                raise ValueError("fused dGLU NVFP4 outputs require sf_vec_size=16")
++            if cutlass.const_expr(
++                d_row_quant_tensor.element_type != cutlass.Float4E2M1FN
++                or d_rht_quant_tensor.element_type != cutlass.Float4E2M1FN
++            ):
++                raise TypeError("fused dGLU NVFP4 data tensors must use Float4E2M1FN")
++            self.fused_quant_sf_dtype = d_row_quant_sf_tensor.element_type
++            if cutlass.const_expr(
++                d_rht_quant_sf_tensor.element_type != self.fused_quant_sf_dtype
++            ):
++                raise TypeError("rowwise and RHT NVFP4 scale tensors must have matching dtypes")
++
+         # dBias configuration
+         self.generate_dbias = dbias_tensor is not None
+         self.dbias_cross_warp_reduce = self.generate_dbias  # always cross-warp reduce
+@@ -847,6 +915,12 @@
+             sfd_col_tensor = cute.make_tensor(sfd_col_tensor.iterator, sfd_col_quant_layout)
+ 
+         self.generate_amax = amax_tensor is not None
++        if cutlass.const_expr(self.generate_fused_quant and not self.generate_amax):
++            raise ValueError("fused dGLU NVFP4 outputs require the two-slot amax tensor")
++        # The two-slot ABI is [combined pre-RHT amax, exact fixed-sign H16
++        # post-RHT amax]. The dedicated RHT path consumes the BF16 SMEM values
++        # that are also stored to D, including the transform's BF16 rounding.
++        self.generate_post_rht_amax = self.generate_amax and self.d_dtype == cutlass.BFloat16
+ 
+         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+             self.a_dtype,
+@@ -970,6 +1044,17 @@
+         else:
+             tma_tensor_d = d
+ 
++        tma_atom_d_quant = None
++        tma_tensor_d_quant = None
++        if cutlass.const_expr(self.generate_fused_quant):
++            d_quant_smem_layout = cute.slice_(self.d_quant_smem_layout_staged, (None, None, 0))
++            tma_atom_d_quant, tma_tensor_d_quant = cpasync.make_tiled_tma_atom(
++                cpasync.CopyBulkTensorTileS2GOp(),
++                d_row_quant_tensor,
++                d_quant_smem_layout,
++                self.epi_tile,
++            )
++
+         tma_atom_d_col = None
+         tma_tensor_d_col = None
+         if cutlass.const_expr(self.generate_sfd):
+@@ -1006,6 +1091,7 @@
+         class SharedStorage:
+             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
++            pingpong_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_pingpong_stage * 2]
+             scheduler: SchedulerStorage
+             c_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_c_stage]
+             c_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_c_stage]
+@@ -1027,6 +1113,21 @@
+                 cute.struct.MemRange[self.d_dtype, sD_col_size],
+                 self.buffer_align_bytes,
+             ]
++            if cutlass.const_expr(self.generate_fused_quant):
++                sDQuant: cute.struct.Align[
++                    cute.struct.MemRange[
++                        cutlass.Float4E2M1FN,
++                        cute.cosize(self.d_quant_smem_layout_staged.outer),
++                    ],
++                    self.buffer_align_bytes,
++                ]
++                sDQuantSf: cute.struct.Align[
++                    cute.struct.MemRange[
++                        self.fused_quant_sf_dtype,
++                        128 * (2 * self.cta_tile_shape_mnk[1] // 16),
++                    ],
++                    16,
++                ]
+             # (MMA, MMA_M, MMA_K, STAGE)
+             sA: cute.struct.Align[
+                 cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+@@ -1052,6 +1153,10 @@
+                 cute.struct.MemRange[cutlass.Float32, self.num_epilog_warps],
+                 4,
+             ]
++            sPostRhtAmax: cute.struct.Align[
++                cute.struct.MemRange[cutlass.Float32, self.num_epilog_warps],
++                4,
++            ]
+             # dBias SMEM transpose buffer: (128, epi_tile_n*2) col-major FP32
+             sDbias: cute.struct.Align[
+                 cute.struct.MemRange[
+@@ -1107,6 +1212,12 @@
+             tma_tensor_c,
+             tma_atom_d,
+             tma_tensor_d,
++            tma_atom_d_quant,
++            tma_tensor_d_quant,
++            d_row_quant_sf_tensor,
++            d_rht_quant_tensor,
++            d_rht_quant_sf_tensor,
++            quant_norm_const_tensor,
+             tma_atom_d_col,
+             tma_tensor_d_col,
+             sfd_row_tensor,
+@@ -1132,6 +1243,7 @@
+             self.sfb_smem_layout_staged,
+             self.c_smem_layout_staged,
+             self.d_smem_layout_staged,
++            self.d_quant_smem_layout_staged if self.generate_fused_quant else self.d_smem_layout_staged,
+             self.epi_tile,
+             sched_params,
+             epilogue_op,
+@@ -1225,8 +1337,8 @@
+         if lane_idx == 0:
+             amax_smem[warp_idx] = cutlass.Float32(warp_amax)
+ 
+-        # Ensure all epilogue warps complete their writes before block reduction
+-        self.epilog_sync_barrier.arrive_and_wait()
++        # Ensure all ACT epilogue warps complete their writes before reduction.
++        self.epilog_sync_barrier_group0.arrive_and_wait()
+ 
+         # Block-level reduction: only first epilogue warp's lane 0 handles this
+         if warp_idx == self.epilog_warp_id[0] and lane_idx == 0:
+@@ -1238,8 +1350,39 @@
+             # Global atomic max (accumulates across all tiles for final tensor amax)
+             _ = atomic_max_float32(ptr=amax_gmem, value=block_amax)
+ 
+-        # Ensure all epilogue warps complete their writes before global reduction
+-        self.epilog_sync_barrier.arrive_and_wait()
++        self.epilog_sync_barrier_group0.arrive_and_wait()
++
++    @cute.jit
++    def post_rht_amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
++        warp_amax = warp_redux_sync(
++            value=amax_fp32,
++            kind=None,
++            mask_and_clamp=0xFFFFFFFF,
++        )
++        lane_idx = cute.arch.thread_idx()[0] % 32
++        if lane_idx == 0:
++            amax_smem[warp_idx - self.epilog_rht_store_warp_id[0]] = cutlass.Float32(warp_amax)
++
++        self.epilog_sync_barrier_group1.arrive_and_wait()
++
++        if warp_idx == self.epilog_rht_store_warp_id[0] and lane_idx == 0:
++            block_amax = cutlass.Float32(0.0)
++            for i in cutlass.range(self.num_epilog_warps):
++                block_amax = cute.arch.fmax(block_amax, amax_smem[i])
++            _ = atomic_max_float32(ptr=amax_gmem, value=block_amax)
++
++        self.epilog_sync_barrier_group1.arrive_and_wait()
++
++    @cute.jit
++    def store_fused_quant_sf_row(self, sf_tensor, logical_row, sf_col_base, sSf, tidx):
++        sf_tensor = cute.recast_tensor(sf_tensor, self.fused_quant_sf_dtype)
++        row_m0 = logical_row % 32
++        row_m1 = (logical_row // 32) % 4
++        row_m2 = logical_row // 128
++        num_sf = 2 * self.cta_tile_shape_mnk[1] // 16
++        for vi in cutlass.range_constexpr(num_sf):
++            sf_col = sf_col_base + vi
++            sf_tensor[(row_m0, row_m1, row_m2, sf_col % 4, sf_col // 4, 0)] = sSf[(tidx, vi)]
+ 
+     @cute.jit
+     def cvt_f32x4_to_f8x4_pack_i32(self, fp32x4, fp8_type, loc=None, ip=None):
+@@ -1649,7 +1792,7 @@
+             sDbias[(n, lane_idx, warp_local)] = d1_vec[n]
+             sDbias[(epi_n + n, lane_idx, warp_local)] = d2_vec[n]
+ 
+-        self.epilog_sync_barrier.arrive_and_wait()
++        self.epilog_sync_barrier_group0.arrive_and_wait()
+ 
+         col_a = 2 * lane_idx if lane_idx < 16 else epi_n + 2 * (lane_idx - 16)
+         col_b = col_a + 1
+@@ -1683,13 +1826,13 @@
+             reduce_base = sDbias.iterator
+             copy_64bit_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=64)
+ 
+-            self.epilog_sync_barrier.arrive_and_wait()
++            self.epilog_sync_barrier_group0.arrive_and_wait()
+             rSrc_partial = cute.make_rmem_tensor(cute.make_layout((2,)), cutlass.Float32)
+             rSrc_partial[0] = sum_a
+             rSrc_partial[1] = sum_b
+             sDst_partial = cute.make_tensor(reduce_base + warp_local * 64 + lane_idx * 2, cute.make_layout((2,)))
+             cute.copy_atom_call(copy_64bit_atom, rSrc_partial, sDst_partial)
+-            self.epilog_sync_barrier.arrive_and_wait()
++            self.epilog_sync_barrier_group0.arrive_and_wait()
+ 
+             if warp_idx == self.epilog_warp_id[0]:
+                 cta_sum_a = cutlass.Float32(0.0)
+@@ -2057,6 +2200,12 @@
+         mC_mnl: cute.Tensor,
+         tma_atom_d: cute.CopyAtom,
+         mD_mnl: cute.Tensor,
++        tma_atom_d_quant: Optional[cute.CopyAtom],
++        mDQuant_mnl: Optional[cute.Tensor],
++        mDQuantSf_mnl: Optional[cute.Tensor],
++        mRhtQuant: Optional[cute.Tensor],
++        mRhtQuantSf: Optional[cute.Tensor],
++        quant_norm_const_tensor: Optional[cute.Tensor],
+         tma_atom_d_col: Optional[cute.CopyAtom],
+         mD_col_mnl: Optional[cute.Tensor],
+         mSFDRow_mnl: Optional[cute.Tensor],
+@@ -2082,6 +2231,7 @@
+         sfb_smem_layout_staged: cute.Layout,
+         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
++        d_quant_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+         epi_tile: cute.Tile,
+         sched_params: MoESchedulerParams,
+         epilogue_op: cutlass.Constexpr,
+@@ -2107,6 +2257,8 @@
+             cpasync.prefetch_descriptor(tma_atom_c)
+             if cutlass.const_expr(not self.store_d_directly):
+                 cpasync.prefetch_descriptor(tma_atom_d)
++            if cutlass.const_expr(self.generate_fused_quant):
++                cpasync.prefetch_descriptor(tma_atom_d_quant)
+             if cutlass.const_expr(self.generate_sfd):
+                 cpasync.prefetch_descriptor(tma_atom_d_col)
+ 
+@@ -2158,6 +2310,22 @@
+             defer_sync=True,
+         )
+ 
++        # ACT warps publish each d1/d2 SMEM subtile to the dedicated RHT warps.
++        pingpong_producer_group = pipeline.CooperativeGroup(
++            pipeline.Agent.Thread,
++            len(self.epilog_act_warp_id) * self.threads_per_warp,
++        )
++        pingpong_consumer_group = pipeline.CooperativeGroup(
++            pipeline.Agent.Thread,
++            len(self.epilog_rht_store_warp_id) * self.threads_per_warp,
++        )
++        pingpong_pipeline = pipeline.PipelineAsync.create(
++            barrier_storage=storage.pingpong_mbar_ptr.data_ptr(),
++            num_stages=self.num_pingpong_stage,
++            producer_group=pingpong_producer_group,
++            consumer_group=pingpong_consumer_group,
++        )
++
+         # Load C pipeline
+         # Threads/warps participating in tma store pipeline
+         c_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+@@ -2233,6 +2401,16 @@
+         sD_col = None
+         if cutlass.const_expr(self.generate_sfd):
+             sD_col = storage.sD_col.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
++        if cutlass.const_expr(self.generate_fused_quant):
++            sDQuant = storage.sDQuant.get_tensor(
++                d_quant_smem_layout_staged.outer,
++                swizzle=d_quant_smem_layout_staged.inner,
++            )
++            quant_sf_cols = 2 * self.cta_tile_shape_mnk[1] // 16
++            sDQuantSf = storage.sDQuantSf.get_tensor(
++                cute.make_layout((128, quant_sf_cols), stride=(quant_sf_cols, 1))
++            )
++            quant_norm_const = cutlass.Float32(quant_norm_const_tensor[0])
+         # (MMA, MMA_M, MMA_K, STAGE)
+         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
+         # (MMA, MMA_N, MMA_K, STAGE)
+@@ -2246,6 +2424,7 @@
+         # as the overhead is minimal and we want to keep the code simple.
+         amax_layout = cute.make_layout((self.num_epilog_warps,))
+         sAmax = storage.sAmax.get_tensor(amax_layout)
++        sPostRhtAmax = storage.sPostRhtAmax.get_tensor(amax_layout)
+         # (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
+         info_layout = cute.make_layout((4, self.num_tile_stage), stride=(1, 4))
+         sInfo = sched_storage.sInfo.get_tensor(info_layout)
+@@ -2729,7 +2908,7 @@
+         #
+         # Specialized epilogue warps
+         #
+-        if warp_idx < self.mma_warp_id:
++        if warp_idx < self.epilog_rht_store_warp_id[0]:
+             #
+             # Alloc tensor memory buffer
+             #
+@@ -2781,6 +2960,10 @@
+             epi_ext = self._make_extension(workspace_ptr)
+ 
+             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
++            pingpong_act_producer_state = pipeline.make_pipeline_state(
++                pipeline.PipelineUserType.Producer,
++                self.num_pingpong_stage,
++            )
+ 
+             # Load C pipeline
+             c_pipeline_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_c_stage)
+@@ -2792,11 +2975,16 @@
+             )
+             d_pipeline = None
+             if cutlass.const_expr(not self.store_d_directly):
+-                num_d_stages = self.num_d_stage // 2
++                num_d_stages = self.num_d_stage if self.generate_post_rht_amax else self.num_d_stage // 2
+                 d_pipeline = pipeline.PipelineTmaStore.create(
+                     num_stages=num_d_stages,
+                     producer_group=d_producer_group,
+                 )
++            if cutlass.const_expr(self.generate_fused_quant):
++                d_quant_pipeline = pipeline.PipelineTmaStore.create(
++                    num_stages=self.num_d_stage,
++                    producer_group=d_producer_group,
++                )
+ 
+             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
+ 
+@@ -2848,6 +3036,26 @@
+                     bSG_gD = bSG_gD_partitioned[(None, None, None, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], 0)]
+                     bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
+ 
++                if cutlass.const_expr(self.generate_fused_quant):
++                    real_d_quant, _ = epi_ext.get_gmem_tensor("d", mDQuant_mnl, padded_offsets, epi_work_tile_info)
++                    gDQuant_mnl_loop = cute.local_tile(
++                        real_d_quant,
++                        cute.slice_(self.mma_tiler_d, (None, None, 0)),
++                        (None, None, None),
++                    )
++                    tCgDQuant_loop = thr_mma_epi.partition_C(gDQuant_mnl_loop)
++                    bSG_sDQuant, bSG_gDQuant_partitioned = self.epilog_gmem_copy_and_partition(
++                        epi_tidx,
++                        tma_atom_d_quant,
++                        tCgDQuant_loop,
++                        epi_tile,
++                        sDQuant,
++                    )
++                    bSG_gDQuant = bSG_gDQuant_partitioned[
++                        (None, None, None, mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], 0)
++                    ]
++                    bSG_gDQuant = cute.group_modes(bSG_gDQuant, 1, cute.rank(bSG_gDQuant))
++
+                 if cutlass.const_expr(self.generate_sfd):
+                     real_d_col, _ = epi_ext.get_gmem_tensor("d_col", mD_col_mnl, padded_offsets, epi_work_tile_info)
+                     gD_col_mnl_loop = cute.local_tile(real_d_col, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
+@@ -3182,7 +3390,7 @@
+                     # Store D
+                     #
+                     if cutlass.const_expr(self.store_d_directly):
+-                        self.epilog_sync_barrier.arrive_and_wait()
++                        self.epilog_sync_barrier_group0.arrive_and_wait()
+                         d_idx_mn = (mma_tile_coord_mnl[0], mma_tile_coord_mnl[1])
+                         d_epilogue_subtile = (
+                             cute.make_layout(128),
+@@ -3212,65 +3420,171 @@
+                         self.store_global_memory_256b(tCgD1, tRS_rD1)
+                         self.store_global_memory_256b(tCgD2, tRS_rD2)
+                     else:
+-                        if warp_idx == self.epilog_warp_id[0]:
+-                            d_pipeline.producer_acquire()
+-                        self.epilog_sync_barrier.arrive_and_wait()
+                         d1_buffer = num_prev_subtiles % self.num_d_stage
+                         num_prev_subtiles = num_prev_subtiles + 1
+-                        cute.copy(
+-                            tiled_copy_r2s,
+-                            tRS_rD1,
+-                            tRS_sD[(None, None, None, d1_buffer)],
+-                        )
+-                        if cutlass.const_expr(self.generate_sfd):
++                        d2_buffer = num_prev_subtiles % self.num_d_stage
++                        num_prev_subtiles = num_prev_subtiles + 1
++
++                        if cutlass.const_expr(self.generate_post_rht_amax):
++                            # Publish d1 and d2 independently. The RHT warps
++                            # vector-load each slot before arriving at the
++                            # lockstep barrier, so ACT can safely reuse SMEM
++                            # while H16 continues from registers.
++                            if warp_idx == self.epilog_warp_id[0]:
++                                d_pipeline.producer_acquire()
++                                if cutlass.const_expr(self.generate_fused_quant):
++                                    d_quant_pipeline.producer_acquire()
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
+                             cute.copy(
+                                 tiled_copy_r2s,
+-                                tRS_rD1_col,
+-                                tRS_sD_col[(None, None, None, d1_buffer)],
++                                tRS_rD1,
++                                tRS_sD[(None, None, None, d1_buffer)],
+                             )
+-                        d2_buffer = num_prev_subtiles % self.num_d_stage
+-                        num_prev_subtiles = num_prev_subtiles + 1
+-                        cute.copy(
+-                            tiled_copy_r2s,
+-                            tRS_rD2,
+-                            tRS_sD[(None, None, None, d2_buffer)],
+-                        )
+-                        if cutlass.const_expr(self.generate_sfd):
++                            cute.arch.fence_proxy("async.shared", space="cta")
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
++                            if cutlass.const_expr(self.generate_fused_quant):
++                                d1_row_bf16 = load_row_bf16(sD, d1_buffer, epi_tidx)
++                                nvfp4_quant_rmem_row(
++                                    d1_row_bf16,
++                                    d1_buffer,
++                                    epi_tidx,
++                                    sDQuant,
++                                    quant_norm_const,
++                                    sDQuantSf,
++                                    2 * real_subtile_idx,
++                                    self.fused_quant_sf_dtype,
++                                )
++                                cute.arch.fence_proxy("async.shared", space="cta")
++                                self.epilog_sync_barrier_group0.arrive_and_wait()
++                            if warp_idx == self.epilog_warp_id[0]:
++                                cute.copy(
++                                    tma_atom_d,
++                                    bSG_sD[(None, d1_buffer)],
++                                    bSG_gD[(None, 2 * real_subtile_idx + 0)],
++                                )
++                                d_pipeline.producer_commit()
++                                if cutlass.const_expr(self.generate_fused_quant):
++                                    cute.copy(
++                                        tma_atom_d_quant,
++                                        bSG_sDQuant[(None, d1_buffer)],
++                                        bSG_gDQuant[(None, 2 * real_subtile_idx + 0)],
++                                    )
++                                    d_quant_pipeline.producer_commit()
++                            pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
++                            pingpong_pipeline.producer_commit(pingpong_act_producer_state)
++                            pingpong_act_producer_state.advance()
++                            self.epilog_sync_barrier.arrive_and_wait()
++
++                            if warp_idx == self.epilog_warp_id[0]:
++                                d_pipeline.producer_acquire()
++                                if cutlass.const_expr(self.generate_fused_quant):
++                                    d_quant_pipeline.producer_acquire()
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
+                             cute.copy(
+                                 tiled_copy_r2s,
+-                                tRS_rD2_col,
+-                                tRS_sD_col[(None, None, None, d2_buffer)],
++                                tRS_rD2,
++                                tRS_sD[(None, None, None, d2_buffer)],
+                             )
+-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+-                        cute.arch.fence_proxy("async.shared", space="cta")
+-                        self.epilog_sync_barrier.arrive_and_wait()
+-                        #
+-                        # TMA store D to global memory
+-                        #
+-                        if warp_idx == self.epilog_warp_id[0]:
++                            cute.arch.fence_proxy("async.shared", space="cta")
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
++                            if cutlass.const_expr(self.generate_fused_quant):
++                                d2_row_bf16 = load_row_bf16(sD, d2_buffer, epi_tidx)
++                                nvfp4_quant_rmem_row(
++                                    d2_row_bf16,
++                                    d2_buffer,
++                                    epi_tidx,
++                                    sDQuant,
++                                    quant_norm_const,
++                                    sDQuantSf,
++                                    2 * real_subtile_idx + 1,
++                                    self.fused_quant_sf_dtype,
++                                )
++                                cute.arch.fence_proxy("async.shared", space="cta")
++                                self.epilog_sync_barrier_group0.arrive_and_wait()
++                            if warp_idx == self.epilog_warp_id[0]:
++                                cute.copy(
++                                    tma_atom_d,
++                                    bSG_sD[(None, d2_buffer)],
++                                    bSG_gD[(None, 2 * real_subtile_idx + 1)],
++                                )
++                                d_pipeline.producer_commit()
++                                if cutlass.const_expr(self.generate_fused_quant):
++                                    cute.copy(
++                                        tma_atom_d_quant,
++                                        bSG_sDQuant[(None, d2_buffer)],
++                                        bSG_gDQuant[(None, 2 * real_subtile_idx + 1)],
++                                    )
++                                    d_quant_pipeline.producer_commit()
++                            pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
++                            pingpong_pipeline.producer_commit(pingpong_act_producer_state)
++                            pingpong_act_producer_state.advance()
++                            self.epilog_sync_barrier.arrive_and_wait()
++                        else:
++                            if warp_idx == self.epilog_warp_id[0]:
++                                d_pipeline.producer_acquire()
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
+                             cute.copy(
+-                                tma_atom_d,
+-                                bSG_sD[(None, d1_buffer)],
+-                                bSG_gD[(None, 2 * real_subtile_idx + 0)],
++                                tiled_copy_r2s,
++                                tRS_rD1,
++                                tRS_sD[(None, None, None, d1_buffer)],
+                             )
++                            if cutlass.const_expr(self.generate_sfd):
++                                cute.copy(
++                                    tiled_copy_r2s,
++                                    tRS_rD1_col,
++                                    tRS_sD_col[(None, None, None, d1_buffer)],
++                                )
+                             cute.copy(
+-                                tma_atom_d,
+-                                bSG_sD[(None, d2_buffer)],
+-                                bSG_gD[(None, 2 * real_subtile_idx + 1)],
++                                tiled_copy_r2s,
++                                tRS_rD2,
++                                tRS_sD[(None, None, None, d2_buffer)],
+                             )
+                             if cutlass.const_expr(self.generate_sfd):
+                                 cute.copy(
+-                                    tma_atom_d_col,
+-                                    bSG_sD_col[(None, d1_buffer)],
+-                                    bSG_gD_col[(None, 2 * real_subtile_idx + 0)],
++                                    tiled_copy_r2s,
++                                    tRS_rD2_col,
++                                    tRS_sD_col[(None, None, None, d2_buffer)],
++                                )
++                            cute.arch.fence_proxy("async.shared", space="cta")
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
++                            if warp_idx == self.epilog_warp_id[0]:
++                                cute.copy(
++                                    tma_atom_d,
++                                    bSG_sD[(None, d1_buffer)],
++                                    bSG_gD[(None, 2 * real_subtile_idx + 0)],
+                                 )
+                                 cute.copy(
+-                                    tma_atom_d_col,
+-                                    bSG_sD_col[(None, d2_buffer)],
+-                                    bSG_gD_col[(None, 2 * real_subtile_idx + 1)],
++                                    tma_atom_d,
++                                    bSG_sD[(None, d2_buffer)],
++                                    bSG_gD[(None, 2 * real_subtile_idx + 1)],
+                                 )
+-                            # Fence and barrier to make sure shared memory store is visible to TMA store
+-                            d_pipeline.producer_commit()
++                                if cutlass.const_expr(self.generate_sfd):
++                                    cute.copy(
++                                        tma_atom_d_col,
++                                        bSG_sD_col[(None, d1_buffer)],
++                                        bSG_gD_col[(None, 2 * real_subtile_idx + 0)],
++                                    )
++                                    cute.copy(
++                                        tma_atom_d_col,
++                                        bSG_sD_col[(None, d2_buffer)],
++                                        bSG_gD_col[(None, 2 * real_subtile_idx + 1)],
++                                    )
++                                d_pipeline.producer_commit()
++                            self.epilog_sync_barrier_group0.arrive_and_wait()
++
++                if cutlass.const_expr(self.generate_fused_quant):
++                    self.store_fused_quant_sf_row(
++                        mDQuantSf_mnl,
++                        epi_ext.token_offset + mPosition,
++                        epi_work_tile_info.tile_n_idx * (2 * self.cta_tile_shape_mnk[1] // 16),
++                        sDQuantSf,
++                        epi_tidx,
++                    )
++
++                if cutlass.const_expr(self.generate_post_rht_amax):
++                    # The final lockstep arrival only guarantees that RHT has
++                    # loaded the last slot. Wait here for its H16 phase before
++                    # either warp group advances to a new tile.
+                     self.epilog_sync_barrier.arrive_and_wait()
+ 
+                 #
+@@ -3294,20 +3608,21 @@
+ 
+                 # Perform amax reduction after all subtiles are processed
+                 if cutlass.const_expr(self.generate_amax):
+-                    gAmax1 = mAmax_tensor[(expert_idx, 0, None)].iterator.llvm_ptr
+-                    gAmax2 = mAmax_tensor[(expert_idx, 1, None)].iterator.llvm_ptr
++                    gAmax = mAmax_tensor[(expert_idx, 0, None)].iterator.llvm_ptr
+                     self.amax_reduction_per_warp_and_cta(
+                         thread_tile_amax_1,
+                         warp_idx,
+                         sAmax,
+-                        gAmax1,
++                        gAmax,
+                     )
+                     self.amax_reduction_per_warp_and_cta(
+                         thread_tile_amax_2,
+                         warp_idx,
+                         sAmax,
+-                        gAmax2,
++                        gAmax,
+                     )
++                if cutlass.const_expr(self.generate_post_rht_amax):
++                    self.epilog_sync_barrier.arrive_and_wait()
+ 
+                 if cutlass.const_expr(self.generate_dprob):
+                     real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+@@ -3320,13 +3635,117 @@
+             # Dealloc the tensor memory buffer
+             #
+             tmem.relinquish_alloc_permit()
+-            self.epilog_sync_barrier.arrive_and_wait()
++            self.epilog_sync_barrier_group0.arrive_and_wait()
+             tmem.free(tmem_ptr)
+             #
+             # Wait for D store complete
+             #
+             if cutlass.const_expr(not self.store_d_directly):
+                 d_pipeline.producer_tail()
++            if cutlass.const_expr(self.generate_post_rht_amax):
++                pingpong_pipeline.producer_tail(pingpong_act_producer_state)
++            if cutlass.const_expr(self.generate_fused_quant):
++                d_quant_pipeline.producer_tail()
++
++        # Dedicated RHT warps: consume every d1/d2 BF16 SMEM subtile and
++        # compute the exact fixed-sign post-RHT amax from paired registers.
++        if warp_idx >= self.epilog_rht_store_warp_id[0] and warp_idx < self.mma_warp_id:
++            epi_tidx = tidx % (self.threads_per_warp * len(self.epilog_rht_store_warp_id))
++            pingpong_rht_consumer_state = pipeline.make_pipeline_state(
++                pipeline.PipelineUserType.Consumer,
++                self.num_pingpong_stage,
++            )
++            tile_info_consumer_state = pipeline.make_pipeline_state(
++                pipeline.PipelineUserType.Consumer,
++                self.num_tile_stage,
++            )
++
++            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
++            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
++            for idx in cutlass.range(4, unroll_full=True):
++                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
++            is_valid_tile = tile_info[0] >= cutlass.Int32(0)
++            cute.arch.fence_proxy("async.shared", space="cta")
++            tile_info_pipeline.consumer_release(tile_info_consumer_state)
++            tile_info_consumer_state.advance()
++
++            num_prev_d_subtiles = cutlass.Int32(0)
++            if cutlass.const_expr(self.overlapping_accum):
++                rht_reverse = cutlass.Boolean(True)
++            while is_valid_tile:
++                expert_idx = tile_info[0]
++
++                if cutlass.const_expr(self.generate_post_rht_amax):
++                    thread_tile_post_rht_amax = cutlass.Float32(0.0)
++                    if cutlass.const_expr(self.generate_fused_quant):
++                        rht_t_off, rht_t_cnt = compute_expert_token_range(padded_offsets, expert_idx)
++                        tile_m_base = (
++                            (tile_info[1] // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[0]
++                            + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
++                        )
++                    subtile_cnt = self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1])
++                    for subtile_idx in cutlass.range(subtile_cnt, unroll=1):
++                        real_subtile_idx = subtile_idx
++                        if cutlass.const_expr(self.overlapping_accum):
++                            if rht_reverse:
++                                real_subtile_idx = subtile_cnt - 1 - subtile_idx
++                        for half in cutlass.range_constexpr(2):
++                            pingpong_pipeline.consumer_wait(pingpong_rht_consumer_state)
++                            d_buffer = num_prev_d_subtiles % self.num_d_stage
++
++                            # Once all 128 RHT threads have loaded their two
++                            # feature columns, release ACT's lockstep wait. H16
++                            # then runs entirely from registers.
++                            rht_ld = load_colwise_pairs_bf16(sD, d_buffer, epi_tidx)
++                            self.epilog_sync_barrier.arrive()
++                            if cutlass.const_expr(self.generate_fused_quant):
++                                output_subtile = 2 * real_subtile_idx + half
++                                thread_tile_post_rht_amax = hadamard_rmem_colwise_fwht_quant_amax(
++                                    rht_ld,
++                                    epi_tidx,
++                                    quant_norm_const,
++                                    self.fused_quant_sf_dtype,
++                                    mRhtQuant,
++                                    (mD_mnl.shape[1] // 16) * rht_t_off,
++                                    rht_t_cnt // 16,
++                                    tile_info[2] * (2 * self.cta_tile_shape_mnk[1]) + output_subtile * 32,
++                                    tile_m_base // 16,
++                                    cute.ceil_div(mD_mnl.shape[1], 128),
++                                    mRhtQuantSf,
++                                    thread_tile_post_rht_amax,
++                                )
++                            else:
++                                thread_tile_post_rht_amax = hadamard_rmem_colwise_fwht_amax(
++                                    rht_ld,
++                                    thread_tile_post_rht_amax,
++                                )
++
++                            pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
++                            pingpong_rht_consumer_state.advance()
++                            num_prev_d_subtiles = num_prev_d_subtiles + 1
++
++                    self.epilog_sync_barrier.arrive_and_wait()
++                    if cutlass.const_expr(self.overlapping_accum):
++                        rht_reverse = not rht_reverse
++
++                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
++                for idx in cutlass.range(4, unroll_full=True):
++                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
++                is_valid_tile = tile_info[0] >= cutlass.Int32(0)
++                cute.arch.fence_proxy("async.shared", space="cta")
++                tile_info_pipeline.consumer_release(tile_info_consumer_state)
++                tile_info_consumer_state.advance()
++
++                if cutlass.const_expr(self.generate_post_rht_amax):
++                    gPostRhtAmax = mAmax_tensor[(expert_idx, 1, None)].iterator.llvm_ptr
++                    self.post_rht_amax_reduction_per_warp_and_cta(
++                        thread_tile_post_rht_amax,
++                        warp_idx,
++                        sPostRhtAmax,
++                        gPostRhtAmax,
++                    )
++                    self.epilog_sync_barrier.arrive_and_wait()
++
+         #
+         # Specialized epilog load warp (loads C from GMEM to SMEM via TMA)
+         #
+@@ -3602,7 +4021,8 @@
+         occupancy: int,
+         store_d_directly: bool,
+         generate_dbias: bool = False,
+-    ) -> Tuple[int, int, int]:
++        generate_fused_quant: bool = False,
++    ) -> Tuple[int, int, int, int, int, int]:
+         """Computes the number of stages for A/B/D operands based on heuristics.
+ 
+         :param tiled_mma: The tiled MMA object defining the core computation.
+@@ -3641,6 +4061,8 @@
+ 
+         # Default Tile info stages
+         num_tile_stage = 2
++        # One logical slot for every d1/d2 epilogue subtile in a GEMM tile.
++        num_pingpong_stage = 2 * mma_tiler_mnk[1] // epi_tile[1]
+ 
+         # Calculate smem layout and size for one stage of A, B, and D
+         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
+@@ -3701,12 +4123,22 @@
+         d_bytes = d_bytes_per_stage * num_d_stage
+         if d_dtype == cutlass.Float8E5M2 or d_dtype == cutlass.Float8E4M3FN:
+             d_bytes = d_bytes * 2
++        quant_bytes = 0
++        if generate_fused_quant:
++            d_quant_layout_one = sm100_utils.make_smem_layout_epi(
++                cutlass.Float4E2M1FN,
++                d_layout,
++                epi_tile,
++                1,
++            )
++            quant_bytes = cute.size_in_bytes(cutlass.Float4E2M1FN, d_quant_layout_one) * num_d_stage
++            quant_bytes += 128 * (2 * mma_tiler_mnk[1] // 16)
+         # AMAX bytes
+-        amax_bytes = get_amax_smem_size() if d_dtype == cutlass.BFloat16 else 0
++        amax_bytes = 2 * get_amax_smem_size()
+         # dBias transpose buffer: (128, 64) column-major FP32 = 32 KB
+         dbias_bytes = 128 * 64 * cute.size_in_bytes(cutlass.Float32, cute.make_layout((1,))) if generate_dbias else 0
+         # Epilogue bytes
+-        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes
++        epi_bytes = c_bytes + d_bytes + quant_bytes + amax_bytes + dbias_bytes
+ 
+         # Calculate A/B stages:
+         # Start with total smem per CTA (capacity / occupancy)
+@@ -3716,4 +4148,4 @@
+ 
+         total_bytes = occupancy * (ab_bytes_per_stage * num_ab_stage + epi_bytes + sinfo_bytes + mbar_helpers_bytes)
+ 
+-        return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage
++        return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_pingpong_stage
+diff -ruN a/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/api.py b/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/api.py
+--- a/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/api.py
++++ b/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/api.py
+@@ -636,6 +636,16 @@
+ 
+     c_tensor = torch.empty_strided((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), dtype=c_dtype, device=a_tensor.device)
+     d_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
++    # A fixed-buffer dynamic schedule may reserve up to (experts - 1)
++    # alignment blocks beyond padded_offsets[-1]. The grouped kernel launches
++    # no CTAs for those rows, so torch.empty_strided would leak non-finite
++    # allocator contents into the router's mathematically zero dummy rows.
++    # Conservatively clear only that maximum tail; active rows in the tail are
++    # overwritten by the grouped GEMM. Both memsets are CUDA-graph capturable.
++    if use_dynamic_sched and valid_m > 0 and l > 1:
++        max_inactive_rows = min(valid_m, (l - 1) * m_aligned)
++        c_tensor[-max_inactive_rows:].zero_()
++        d_tensor[-max_inactive_rows:].zero_()
+     amax_tensor = None
+     post_rht_amax_tensor = None
+     if d_dtype in [torch.bfloat16, torch.float16]:
+diff -ruN a/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/hadamard_utils.py b/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/hadamard_utils.py
+--- a/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/hadamard_utils.py
++++ b/cudnn/grouped_gemm/grouped_gemm_glu_hadamard/hadamard_utils.py
+@@ -7,15 +7,252 @@
+ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+ import cutlass.utils.blackwell_helpers as sm100_utils
++from cutlass._mlir.dialects import math
+ from cutlass.cute.nvgpu import tcgen05
+ from cutlass.cute.nvgpu import OperandMajorMode
+ from cutlass.cute.nvgpu.tcgen05 import OperandSource
+ import torch
+ 
++from ..moe_kernel_helpers import fmax, fmin, get_dtype_rcp_limits
++
+ HADAMARD_SIZE = 16
++RHT_SIGN_MASK = 0xD7E8
+ TMEM_ROW_STRIDE = 1 << 16
+ M_PER_CLUSTER = 256
+ 
++@cute.jit
++def load_colwise_pairs_bf16(sD, d_buffer, tidx):
++    """Load two adjacent feature columns for one 16-token block from SMEM."""
++    token_block = tidx // HADAMARD_SIZE
++    feat_pair = tidx % HADAMARD_SIZE
++    token_base = token_block * HADAMARD_SIZE
++
++    rmem_bf16 = cute.make_rmem_tensor((2 * HADAMARD_SIZE,), cutlass.BFloat16)
++    rmem_pairs = cute.zipped_divide(rmem_bf16, (2,))
++    sD_pairs = cute.zipped_divide(cute.slice_(sD, (None, None, d_buffer)), (1, 2))
++    for i in cutlass.range_constexpr(HADAMARD_SIZE):
++        cute.autovec_copy(
++            cute.slice_(sD_pairs, ((None, None), (token_base + i, feat_pair))),
++            cute.slice_(rmem_pairs, ((None,), i)),
++        )
++    return rmem_bf16
++
++
++@cute.jit
++def _colwise_fwht_inplace(tCompute):
++    """In-place natural-order H16 over two interleaved token-major columns."""
++    for c in cutlass.range_constexpr(2):
++        for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 2):
++            x = tCompute[2 * base + c]
++            y = tCompute[2 * (base + 1) + c]
++            tCompute[2 * base + c] = x + y
++            tCompute[2 * (base + 1) + c] = x - y
++        for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 4):
++            for i in cutlass.range_constexpr(2):
++                x = tCompute[2 * (base + i) + c]
++                y = tCompute[2 * (base + i + 2) + c]
++                tCompute[2 * (base + i) + c] = x + y
++                tCompute[2 * (base + i + 2) + c] = x - y
++        for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 8):
++            for i in cutlass.range_constexpr(4):
++                x = tCompute[2 * (base + i) + c]
++                y = tCompute[2 * (base + i + 4) + c]
++                tCompute[2 * (base + i) + c] = x + y
++                tCompute[2 * (base + i + 4) + c] = x - y
++        for i in cutlass.range_constexpr(8):
++            x = tCompute[2 * i + c]
++            y = tCompute[2 * (i + 8) + c]
++            tCompute[2 * i + c] = x + y
++            tCompute[2 * (i + 8) + c] = x - y
++
++
++@cute.jit
++def hadamard_rmem_colwise_fwht_amax(rmem_bf16, amax_fp32):
++    """Accumulate exact BF16 post-RHT amax for two feature columns."""
++    n_vals = 2 * HADAMARD_SIZE
++    tCompute = cute.make_rmem_tensor((n_vals,), cutlass.Float32)
++    for i in cutlass.range_constexpr(HADAMARD_SIZE):
++        sign = cutlass.Float32(-1.0 if ((RHT_SIGN_MASK >> i) & 1) else 1.0)
++        for c in cutlass.range_constexpr(2):
++            tCompute[2 * i + c] = rmem_bf16[2 * i + c].to(cutlass.Float32) * sign
++
++    _colwise_fwht_inplace(tCompute)
++
++    for i in cutlass.range_constexpr(n_vals):
++        value = (tCompute[i] * cutlass.Float32(0.25)).to(cutlass.BFloat16).to(cutlass.Float32)
++        amax_fp32 = fmax(amax_fp32, fmax(value, -value))
++    return amax_fp32
++
++
++@cute.jit
++def load_row_bf16(sD, d_buffer, tidx):
++    """Load one 32-feature BF16 row from an epilogue SMEM stage."""
++    row_feats = 2 * HADAMARD_SIZE
++    sD_tiles = cute.zipped_divide(cute.slice_(sD, (None, None, d_buffer)), (1, row_feats))
++    src = cute.slice_(sD_tiles, ((None, None), (tidx, 0)))
++    rmem_bf16 = cute.make_rmem_tensor(src.shape, cutlass.BFloat16)
++    cute.autovec_copy(src, rmem_bf16)
++    return rmem_bf16
++
++
++@cute.jit
++def nvfp4_quant_rmem_row(rmem_bf16, d_buffer, tidx, sOut, norm_const, sSf, sf_pair, sf_dtype):
++    """Quantize one exact BF16-rounded 32-feature row to packed NVFP4."""
++    row_feats = 2 * HADAMARD_SIZE
++    tCompute = cute.make_rmem_tensor(rmem_bf16.shape, cutlass.Float32)
++    for i in cutlass.range_constexpr(row_feats):
++        tCompute[i] = rmem_bf16[i].to(cutlass.Float32)
++
++    tCompute_flat = cute.make_tensor(tCompute.iterator, cute.make_layout((row_feats,)))
++    num_vecs = row_feats // HADAMARD_SIZE
++    tTR_rAcc_frg = cute.logical_divide(tCompute_flat, cute.make_layout(HADAMARD_SIZE))
++    acc_frg = tTR_rAcc_frg.load()
++    abs_acc_frg_ir = math.absf(acc_frg.ir_value())
++    abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
++    pvscale = cute.make_rmem_tensor((num_vecs,), cutlass.Float32)
++    for vi in cutlass.range_constexpr(num_vecs):
++        pvscale[vi] = abs_acc_frg[None, vi].reduce(
++            cute.ReductionOp.MAX,
++            cutlass.Float32(0.0),
++            0,
++        )
++    for vi in cutlass.range_constexpr(0, num_vecs, 2):
++        pvscale[vi], pvscale[vi + 1] = cute.arch.mul_packed_f32x2(
++            (pvscale[vi], pvscale[vi + 1]),
++            (
++                get_dtype_rcp_limits(cutlass.Float4E2M1FN),
++                get_dtype_rcp_limits(cutlass.Float4E2M1FN),
++            ),
++        )
++        pvscale[vi], pvscale[vi + 1] = cute.arch.mul_packed_f32x2(
++            (pvscale[vi], pvscale[vi + 1]),
++            (norm_const, norm_const),
++        )
++
++    pvscale_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
++    for vi in cutlass.range_constexpr(4):
++        pvscale_f32x4[vi] = pvscale[min(vi, num_vecs - 1)]
++    scale_f8x4 = cute.make_rmem_tensor((4,), sf_dtype)
++    scale_f8x4.store(pvscale_f32x4.load().to(sf_dtype))
++    scale_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
++    scale_f32x4.store(scale_f8x4.load().to(cutlass.Float32))
++
++    for vi in cutlass.range_constexpr(num_vecs):
++        sSf[(tidx, num_vecs * sf_pair + vi)] = scale_f8x4[vi]
++
++    fp32_max = cutlass.Float32(3.40282346638528859812e38)
++    for vi in cutlass.range_constexpr(0, num_vecs, 2):
++        acc_scale = cute.arch.mul_packed_f32x2(
++            (
++                cute.arch.rcp_approx(scale_f32x4[vi]),
++                cute.arch.rcp_approx(scale_f32x4[vi + 1]),
++            ),
++            (norm_const, norm_const),
++        )
++        acc_scale_min0 = fmin(acc_scale[0], fp32_max, nan=True)
++        acc_scale_min1 = fmin(acc_scale[1], fp32_max, nan=True)
++        vec0 = tTR_rAcc_frg[None, vi]
++        vec1 = tTR_rAcc_frg[None, vi + 1]
++        for ei in cutlass.range_constexpr(HADAMARD_SIZE):
++            vec0[ei], vec1[ei] = cute.arch.mul_packed_f32x2(
++                (vec0[ei], vec1[ei]),
++                (acc_scale_min0, acc_scale_min1),
++            )
++
++    packed = cute.make_rmem_tensor(tCompute.shape, cutlass.Float4E2M1FN)
++    packed.store(tCompute.load().to(cutlass.Float4E2M1FN))
++    sOut_tiles = cute.zipped_divide(cute.slice_(sOut, (None, None, d_buffer)), (1, row_feats))
++    cute.autovec_copy(packed, cute.slice_(sOut_tiles, ((None, None), (tidx, 0))))
++
++
++@cute.jit
++def hadamard_rmem_colwise_fwht_quant_amax(
++    rmem_bf16,
++    tidx,
++    norm_const,
++    sf_dtype,
++    gRht,
++    seg16,
++    pitch16,
++    feat0,
++    tok16,
++    row_blocks,
++    gSf,
++    amax_fp32,
++):
++    """Fixed-sign H16, BF16 round, exact amax, and direct colwise NVFP4 stores."""
++    token_block = tidx // HADAMARD_SIZE
++    feat_pair = tidx % HADAMARD_SIZE
++    feature = 2 * feat_pair
++    n_vals = 2 * HADAMARD_SIZE
++    tCompute = cute.make_rmem_tensor((n_vals,), cutlass.Float32)
++    for i in cutlass.range_constexpr(HADAMARD_SIZE):
++        sign = cutlass.Float32(-1.0 if ((RHT_SIGN_MASK >> i) & 1) else 1.0)
++        for c in cutlass.range_constexpr(2):
++            tCompute[2 * i + c] = rmem_bf16[2 * i + c].to(cutlass.Float32) * sign
++
++    _colwise_fwht_inplace(tCompute)
++    for i in cutlass.range_constexpr(n_vals):
++        value = (tCompute[i] * cutlass.Float32(0.25)).to(cutlass.BFloat16).to(cutlass.Float32)
++        tCompute[i] = value
++        amax_fp32 = fmax(amax_fp32, fmax(value, -value))
++
++    gem = norm_const * cutlass.Float32(get_dtype_rcp_limits(cutlass.Float4E2M1FN))
++    gd = cutlass.Float32(1.0) / norm_const
++    pv = cute.make_rmem_tensor((2,), cutlass.Float32)
++    for c in cutlass.range_constexpr(2):
++        pv[c] = cutlass.Float32(0.0)
++        for i in cutlass.range_constexpr(HADAMARD_SIZE):
++            value = tCompute[2 * i + c]
++            pv[c] = fmax(pv[c], fmax(value, -value))
++    pv[0], pv[1] = cute.arch.mul_packed_f32x2((pv[0], pv[1]), (gem, gem))
++
++    pv_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
++    for c in cutlass.range_constexpr(4):
++        pv_f32x4[c] = pv[min(c, 1)]
++    scale_f8x4 = cute.make_rmem_tensor((4,), sf_dtype)
++    scale_f8x4.store(pv_f32x4.load().to(sf_dtype))
++    scale_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
++    scale_f32x4.store(scale_f8x4.load().to(cutlass.Float32))
++    gSf = cute.recast_tensor(gSf, sf_dtype)
++    col_blocks = pitch16 // 4
++    for c in cutlass.range_constexpr(2):
++        row = feat0 + feature + c
++        col = tok16 + token_block
++        # Physical SM100 K-major block-scale layout for logical
++        # (feature, token/16):
++        #   shape  = (32, 4, ceil(N/128), 4, ceil(M/64), 1)
++        #   stride = (16, 4, ceil(M/64)*512, 1, 512, total)
++        sf_idx = (
++            seg16
++            + (row % 32) * 16
++            + ((row // 32) % 4) * 4
++            + (row // 128) * col_blocks * 512
++            + (col % 4)
++            + (col // 4) * 512
++        )
++        gSf[sf_idx] = scale_f8x4[c]
++
++    fp32_max = cutlass.Float32(3.40282346638528859812e38)
++    scale0 = fmin(cutlass.Float32(1.0) / (scale_f32x4[0] * gd), fp32_max, nan=True)
++    scale1 = fmin(cutlass.Float32(1.0) / (scale_f32x4[1] * gd), fp32_max, nan=True)
++    for i in cutlass.range_constexpr(HADAMARD_SIZE):
++        tCompute[2 * i], tCompute[2 * i + 1] = cute.arch.mul_packed_f32x2(
++            (tCompute[2 * i], tCompute[2 * i + 1]),
++            (scale0, scale1),
++        )
++
++    gRht_cols = cute.zipped_divide(gRht, (HADAMARD_SIZE,))
++    col_values = cute.make_rmem_tensor((HADAMARD_SIZE,), cutlass.Float32)
++    col_fp4 = cute.make_rmem_tensor((HADAMARD_SIZE,), cutlass.Float4E2M1FN)
++    for c in cutlass.range_constexpr(2):
++        for i in cutlass.range_constexpr(HADAMARD_SIZE):
++            col_values[i] = tCompute[2 * i + c]
++        col_fp4.store(col_values.load().to(cutlass.Float4E2M1FN))
++        col = seg16 + (feat0 + feature + c) * pitch16 + tok16 + token_block
++        cute.autovec_copy(col_fp4, cute.slice_(gRht_cols, ((None,), col)))
++    return amax_fp32
++
+ 
+ @cute.jit
+ def hadamard_setup(g_hadamard, s_hadamard, tidx):

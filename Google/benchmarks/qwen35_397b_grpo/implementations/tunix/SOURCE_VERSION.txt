@@ -1,0 +1,50 @@
+Tunix / MaxText / vLLM / OpenHands source provenance for the submitted runs (/app and /opt/venv of the run image). All three scored runs trained and were evaluated offline on the same container image, built from tunix/tunix/Dockerfile, and the same Pathways build. The image digests below are the image IDs of the runs' pods.
+
+Container image digest: sha256:d7e4c3b5b3f364f0ce3045253f77acd7b83e9734ab255f8884dc0434f2eb128e (RL controller, trainer head, the 128 rollout workers, and the 32 evaluation replicas)
+  Image config digest: sha256:5832d0b634431a284daab66fe4b12d1b09d6580ddd2b2af34e176a0a2decd404
+  Image built: 2026-10-16T00:04:07Z (Debian 13 trixie, Python 3.12.15)
+requirements_frozen.txt lists the 374 Python packages installed in /opt/venv of the container image.
+
+1. Tunix & OpenHands CodeActAgent Harness (/app):
+   Repository: https://github.com/google/tunix
+   Image /app layer (sha256:1b6f08c9a2f9dc6390688153af0e17a5f8979cf1894793a7f432d9fc45291a50):
+     HEAD commit 592380f2963d81cb710082c05f00b538afdb2aa2 (google-tunix==0.1.8), no uncommitted changes to tracked files; packaged in tunix/tunix/ with one file changed for the evaluation launch (tunix/experimental/examples/deepswe_dist/k8s_launcher.sh):
+       - Sets is_partial=True in MaxText's maxtext/utils/model_creation_utils.py (via sed) in the evaluation workers' startup command, so evaluation restores model parameters from a training checkpoint saved without optimizer state.
+       - Moves ${BOOTSTRAP_CMD} (empty in the scored runs) to the start of that startup command.
+   Launch recipes: ../tpu7x-4x4x8-128x2x2x1/recipes/ (from 592380f, with site-specific defaults and an optional run-reporting hook removed, comments edited, and stricter error handling at launch and in the offline evaluation loop). The training JobSets of the scored runs were launched with these recipes; their evaluation JobSets carry the k8s_launcher.sh change above.
+   OpenHands CodeActAgent harness modules: examples/deepswe/{template.py, openhands_utils.py, swe_agent.py, swe_env.py, sandbox_utils.py}.
+   Reference OpenHands alignment target: https://github.com/OpenHands/OpenHands @ 0d766ad06b2be64a42e6f0175b9ebcc4a06599d9 (openhands/agenthub/codeact_agent) and https://github.com/NVIDIA-NeMo/RL @ 3fca04c9b313d313302923a5bb6b0c8dc0340ed6
+
+2. MaxText & maxtext-vllm-adapter (/opt/venv):
+   Repository: https://github.com/AI-Hypercomputer/maxtext
+   Commit: e526ea02dea8498a9391e5934398db5c409d1944 (maxtext==0.2.4, maxtext-vllm-adapter==0.1.0; layer sha256:fe004888bd35)
+   Subdirectory for adapter: src/maxtext/integration/vllm
+
+3. vLLM & tpu-inference (/opt/venv, layer sha256:bbbeef0f5932):
+   vLLM repository & commit: https://github.com/vllm-project/vllm @ 51da0ca66c8065619c79e35dff97aa99aeaf5644 (vllm==0.28.1rc1.dev500+g51da0ca66.tpu)
+   tpu-inference repository & commit: https://github.com/vllm-project/tpu-inference @ dbc73c3656bcdfc1246f42ad88ee00f8fe2f96bc (tpu-inference==0.0.0)
+
+4. R2E-Gym, OpenHands SDK & Kubernetes Agent-Sandbox (/opt/venv):
+   r2e-gym repository & commit: https://github.com/r2e-gym/r2e-gym @ 0d94c4eb9431cd195c55a7ea3abd54006c9a1735 (r2e_gym==0.1.0)
+   agent-sandbox repository & commit: https://github.com/kubernetes-sigs/agent-sandbox @ 7fd162d9d5c33fd0c8af9fbb15c6453ccf5ddd58 (k8s_agent_sandbox==1.0.8.dev6+g7fd162d9d, openhands_k8s_agent_sandbox==1.0.8.dev6+g7fd162d9d, agent_sandbox_rl==0.1.0.dev0; tunix/tunix/Dockerfile installs these from git, so pin the commit to rebuild an image)
+   OpenHands SDK & SWE-bench: openhands_sdk==1.55.0, swebench==3.0.2
+   OpenHands agent-server image (sandbox init container, run_and_time.sh OPENHANDS_SERVER_IMAGE): index sha256:437b82bcf745e5f292e9a1ed19859f472f81c687a550b8412b2f1cf3495b7d3d
+
+5. Raiden / TPU Sync weight broadcast (/app/raiden_wheels):
+   Repository: https://github.com/google/tpu-sync (the wheel METADATA home page, github.com/google/tpu-raiden, redirects there)
+   Wheel (layer sha256:84004d248e51): tunix/tunix/raiden_wheels/tpu_sync_jax-0.0.1.dev20261013212200-0110-cp312-cp312-manylinux_2_31_x86_64.whl (tpu-sync-jax==0.0.1.dev20261013212200, Apache 2.0, sha256 c3a34a8dc94e6dbabd4aa5e54bde2de6e1c3c5f616bf04c71cc507241d64ece0; training only, WEIGHT_SYNC_MODE=none in offline evaluation)
+
+6. Pathways and colocated-python sidecar images (run_and_time.sh PATHWAYS_SERVER_IMAGE, PATHWAYS_PROXY_IMAGE, COLOCATED_PYTHON_SIDECAR_IMAGE):
+   Google Cloud TPU GKE runtime images for multi-host JAX (Pathways), publicly readable in Google Cloud Artifact Registry under us-docker.pkg.dev/cloud-tpu-v2-images/pathways (`gcloud auth configure-docker us-docker.pkg.dev`):
+   Training and offline evaluation:
+     Pathways server build raiden_20261013212200: sha256:97fe1fb2691c2d88191a4fbe9b3a463189be3acb54f28b5997baa1a7dc529eb1 (public release: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:20261015-jax_0.11.0)
+     Pathways proxy build raiden_20261013212200: sha256:0278afb1ed3be54d11d4738d4e01a62458e79795909eaefe535da237d394b8b9 (public release: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:20261015-jax_0.11.0)
+   Colocated Python sidecar image digest: sha256:6682fc0f364d2246a8768265c8c06ef50e213d86e1639d367543c78a90a8f0f2 (attached to the trainer pods via a default variable in mlperf_base.sh, but unused at runtime because mlperf_gbs1024_submission.sh sets PATHWAYS_CHECKPOINTING_IMPL=persistence, i.e., colocated_python_checkpointing=False and colocated_python_data_input=False in result_{0,1,2}.txt; optional/unset by default in run_and_time.sh)
+
+7. mlperf_logging (/opt/venv): https://github.com/mlcommons/logging @ 003087fbe75ef759b513d950e39b85084024739c (tag 6.1.0-rc1, mlperf_logging==4.1.64)
+
+8. GKE cluster (scored runs):
+   GKE node version: v1.36.4-gke.1247000. TPU, RL controller and Pathways head nodes: Container-Optimized OS from Google (Linux 6.12.105+, containerd 2.2.7). Sandbox nodes: Ubuntu 24.04 (GKE node image ubuntu-2404-1-36-amd64-v20260827).
+   JobSet controller: registry.k8s.io/jobset/jobset:v0.12.0
+   Kueue controller: registry.k8s.io/kueue/kueue:v0.18.2
+   agent-sandbox controller: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.4

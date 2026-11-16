@@ -1,0 +1,48 @@
+#!/bin/bash
+# Usage: try-defrag [node]
+# Grab 512 MiB transparent huge pages on one node until the kernel stops producing them.
+node=${1:-0}
+exec numactl --membind="$node" python3 - "$node" <<'EOF'
+import mmap, ctypes, sys, time
+node = sys.argv[1]
+HP       = 512 << 20     # PMD huge page size on the 64k kernel
+RESERVE  = 16 << 30      # stop while this much node memory is still free
+PATIENCE = 16            # stop after this many fallbacks in a row
+
+def node_free():
+    for l in open(f'/sys/devices/system/node/node{node}/meminfo'):
+        if 'MemFree:' in l:
+            return int(l.split()[3]) << 10
+def huge():              # bytes of this process mapped with PMD huge pages
+    for l in open('/proc/self/smaps_rollup'):
+        if l.startswith('AnonHugePages:'):
+            return int(l.split()[1]) << 10
+def vm():
+    return {k: int(v) for k, v in (l.split() for l in open('/proc/vmstat'))
+            if k.startswith(('thp_fault', 'compact_'))}
+
+before = vm()
+n = node_free() // HP
+n += n // 4              # spare address space for regions that fall back
+m = mmap.mmap(-1, (n + 1) * HP, flags=mmap.MAP_PRIVATE)
+m.madvise(mmap.MADV_HUGEPAGE)
+off = (-ctypes.addressof(ctypes.c_char.from_buffer(m))) % HP
+got = miss = streak = 0
+for i in range(n):
+    if node_free() < RESERVE:
+        print('stopped: hit free-memory reserve'); break
+    h = huge()
+    m[off + i * HP] = 1  # a 512 MiB THP, or a single 64 KiB page on fallback
+    if huge() > h:
+        got += 1; streak = 0
+    else:
+        miss += 1; streak += 1
+        if streak >= PATIENCE:
+            print(f'stopped: {PATIENCE} fallbacks in a row'); break
+        time.sleep(0.5)  # give kcompactd a chance to catch up
+print(f'node {node}: got {got} x 512 MiB ({got / 2:.1f} GiB), {miss} fallbacks')
+after = vm()
+for k in after:
+    if after[k] != before[k]:
+        print(f'{k:32s} {after[k] - before[k]}')
+EOF

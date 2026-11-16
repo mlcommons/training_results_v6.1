@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+#
+# Copyright (c) 2024-2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#           http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+
+class Level(Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+
+
+def canonical_json(obj) -> bytes:
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        ensure_ascii=True,  # no locale-dependent UTF-8 output
+        separators=(",", ":"),  # no whitespace at all
+        allow_nan=False,  # reject NaN/Infinity (not valid JSON)
+    ).encode("ascii")
+
+
+def sample_offsets(file_size: int, num_samples: int, slice_size: int) -> list[int]:
+    """Deterministic, spread-out offsets based on file size."""
+    if file_size <= slice_size * num_samples:
+        # Small file, we can just read from the beginning,
+        # even if the header is similar
+        return [0]
+    # Evenly spaced, but avoid byte 0 (headers are too similar across formats)
+    return [int(file_size * i / (num_samples + 1)) for i in range(1, num_samples + 1)]
+
+
+def fingerprint_file(path: Path, num_samples: int = 10, slice_size: int = 4096) -> dict:
+    size = path.stat().st_size
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for offset in sample_offsets(size, num_samples, slice_size):
+                f.seek(offset)
+                h.update(f.read(slice_size))
+    except PermissionError:
+        print(f"No permission for {path}")
+        return {"num_bytes": size, "sparse_sha256": "0"}
+    return {"num_bytes": size, "sparse_sha256": h.hexdigest()}
+
+
+def load_csv(expected_mounts_csv: Path) -> list[dict]:
+    lines = expected_mounts_csv.read_text().strip().split("\n")
+    rows = []
+    keys = lines[0].split(",")
+    for line in lines[1:]:
+        values = line.split(",")
+        row = {key: value for key, value in zip(keys, values)}
+        row["num_files"] = int(row["num_files"])
+        row["num_bytes"] = int(row["num_bytes"])
+        rows.append(row)
+    return rows
+
+
+def save_csv(rows: list[dict], expected_mounts_csv: Path) -> None:
+    lines = []
+    columns = rows[0].keys()
+    header = ",".join(columns)
+    lines.append(header)
+    for row in rows:
+        values = ",".join(map(str, row.values()))
+        lines.append(values)
+    lines = "\n".join(lines)
+    expected_mounts_csv.write_text(lines + "\n")
+    print(f"{expected_mounts_csv} saved!")
+
+
+def split(mounts_to_verify: list[str]) -> dict[str, Path]:
+    mappings = {}
+    for key_path_mapping in mounts_to_verify:
+        if ":" not in key_path_mapping:
+            raise RuntimeError(
+                f"invalid key:path mapping {repr(key_path_mapping)}! Expected KEY:/path/to/mount."
+            )
+        key, path = key_path_mapping.split(":", 1)
+        if key == "" or path == "":
+            raise RuntimeError(
+                f"invalid key:path mapping {key_path_mapping}! Both key and path must be present."
+            )
+        path = Path(path)
+        if not path.exists():
+            raise RuntimeError(f"{repr(path)} for key={repr(key)} does not exists!")
+        if key in mappings:
+            raise RuntimeError(f"key={repr(key)} already used!")
+        mappings[key] = path
+    return mappings
+
+
+def is_hidden(path: Path) -> bool:
+    return path.name.startswith(".")
+
+
+def files_in(path: Path) -> list[Path]:
+    if is_hidden(path):
+        return []
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        files = []
+        for sub_path in sorted(path.glob("*")):
+            files += files_in(sub_path)
+        return files
+    raise RuntimeError(f"{repr(path)} is not a file nor a dir!")
+
+
+def scan(
+    path: Path,
+    key: str,
+    root: Path,
+    fingerprints: Optional[dict[Path, dict]] = None,
+) -> list[dict]:
+    if is_hidden(path):
+        return []
+    if path.is_file():
+        row = {}
+        row["key"] = key
+        row["type"] = "file"
+        row["relative_path"] = str(path.relative_to(root))
+        row["full_path"] = str(path)
+        row["num_files"] = 1
+        row.update(
+            fingerprint_file(path)
+            if fingerprints is None or path not in fingerprints
+            else fingerprints[path]
+        )
+        return [row]
+    elif path.is_dir():
+        rows = []
+        for sub_path in sorted(path.glob("*")):
+            rows += scan(sub_path, key, root, fingerprints)
+        row = {}
+        row["key"] = key
+        row["type"] = "dir"
+        row["relative_path"] = str(path.relative_to(root))
+        row["full_path"] = str(path)
+        row["num_files"] = sum(
+            [row["num_files"] for row in rows if row["type"] == "file"]
+        )
+        row["num_bytes"] = sum(
+            [row["num_bytes"] for row in rows if row["type"] == "file"]
+        )
+        canon = canonical_json(
+            {row["relative_path"]: row["sparse_sha256"] for row in rows}
+        )
+        row["sparse_sha256"] = hashlib.sha256(canon).hexdigest()
+        rows.append(row)
+        return rows
+    else:
+        raise RuntimeError(f"{repr(path)} is not a file nor a dir!")
+
+
+def inspect(mounts_to_verify: list[str]) -> list[dict]:
+    mappings = split(mounts_to_verify)
+    files = []
+    for path in mappings.values():
+        files += files_in(path)
+    with ThreadPoolExecutor() as executor:
+        fingerprints = dict(zip(files, executor.map(fingerprint_file, files)))
+
+    rows = []
+    for key, path in mappings.items():
+        rows += scan(path, key, path, fingerprints)
+    return rows
+
+
+def filter_out(rows: list[dict], extensions_to_filter_out: list[str]) -> list[dict]:
+    if len(extensions_to_filter_out) == 0:
+        return rows
+    output = []
+    for row in rows:
+        keep = True
+        for ext in extensions_to_filter_out:
+            if row["relative_path"].endswith(ext):
+                keep = False
+                break
+        if keep:
+            output.append(row)
+    return output
+
+
+def print_check(verbosity: int, level: Level, message: str) -> None:
+    if verbosity >= 2 or (verbosity == 1 and level == Level.WARNING):
+        print(f"mountcheck {level.value} {message}")
+
+
+def initialize_expected_mounts(
+    expected_mounts_csv: Path,
+    mounts_to_verify: list[str],
+    extensions_to_filter_out: list[str],
+) -> None:
+    rows = inspect(mounts_to_verify)
+    rows = filter_out(rows, extensions_to_filter_out)
+    if len(rows) == 0:
+        raise RuntimeError(
+            "No expected mount entries found! Check --mounts_to_verify and --extensions_to_filter_out."
+        )
+    for row in rows:
+        del row["full_path"]
+    save_csv(rows, expected_mounts_csv)
+
+
+def verify_actual_mounts(
+    expected_mounts_csv: Path,
+    mounts_to_verify: list[str],
+    extensions_to_filter_out: list[str],
+    verbosity: int,
+) -> None:
+    expected_rows = load_csv(expected_mounts_csv)
+    actual_rows = inspect(mounts_to_verify)
+    actual_rows = filter_out(actual_rows, extensions_to_filter_out)
+    mappings = split(mounts_to_verify)
+
+    actual_rows_grouped = {}
+    for actual in actual_rows:
+        row_id = (actual["key"], actual["type"], actual["relative_path"])
+        assert row_id not in actual_rows_grouped
+        actual_rows_grouped[row_id] = actual
+
+    for expected in expected_rows:
+        row_id = (expected["key"], expected["type"], expected["relative_path"])
+
+        if row_id not in actual_rows_grouped:
+            mount_key = expected["key"]
+            mount_path = mappings.get(mount_key, None)
+            if mount_path is None:
+                print_check(
+                    verbosity,
+                    Level.WARNING,
+                    f"missing key:path mapping in --mounts_to_verify for key={repr(mount_key)}",
+                )
+            else:
+                missing_path = Path(mount_path) / Path(expected["relative_path"])
+                print_check(
+                    verbosity,
+                    Level.WARNING,
+                    f"{expected['type']} {missing_path} does not exist!",
+                )
+            continue
+
+        actual = actual_rows_grouped[row_id]
+
+        key = "sparse_sha256"
+        if expected[key] == actual[key]:
+            print_check(
+                verbosity,
+                Level.INFO,
+                f"{actual['full_path']} {key}={actual[key]}",
+            )
+        else:
+            print_check(
+                verbosity,
+                Level.WARNING,
+                f"{actual['full_path']} {key} mismatch! expected={expected[key]} actual={actual[key]}",
+            )
+
+        if expected["type"] == "dir":
+            if expected["num_files"] == actual["num_files"]:
+                print_check(
+                    verbosity,
+                    Level.INFO,
+                    f"{actual['full_path']} {actual['num_files']} files",
+                )
+            else:
+                print_check(
+                    verbosity,
+                    Level.WARNING,
+                    f"{actual['full_path']} num files mismatch! expected={expected['num_files']} actual={actual['num_files']}",
+                )
+
+
+def main(args: argparse.Namespace) -> None:
+    if args.initialize:
+        initialize_expected_mounts(
+            expected_mounts_csv=args.expected_mounts_csv,
+            mounts_to_verify=args.mounts_to_verify,
+            extensions_to_filter_out=args.extensions_to_filter_out,
+        )
+    else:
+        verify_actual_mounts(
+            expected_mounts_csv=args.expected_mounts_csv,
+            mounts_to_verify=args.mounts_to_verify,
+            extensions_to_filter_out=args.extensions_to_filter_out,
+            verbosity=args.verbosity,
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--expected_mounts_csv",
+        type=Path,
+        default="expected-mounts.csv",
+        help="""
+        CSV file with expected mounts.
+        When --initialize is passed this file is created.
+        """,
+    )
+    parser.add_argument(
+        "--mounts_to_verify",
+        type=str,
+        nargs="*",
+        default=[],
+        help="""
+        Sequence of key:path mappings.
+        For example '--mounts_to_verify DATADIR:/path/to/data MODELDIR:/path/to/model FILE:/path/to/file'.
+        Keys must be unique.
+        Keys specified for initialization must later be passed during verification.
+        """,
+    )
+    parser.add_argument(
+        "--extensions_to_filter_out",
+        type=str,
+        nargs="*",
+        default=[],
+        help="""
+        List of extensions to filter out.
+        If there are a large number of files with the same extension, you may want to count their number and total size,
+        but filter out individual files from the expected mounts CSV file.
+        This allows you to reduce the size of the expected mounts CSV file without compromising on functionality.
+        Parent directory will contain aggregated statistics about the filtered out files.
+        For example '--extensions_to_filter_out .jpg .jpeg .png'.
+        """,
+    )
+    parser.add_argument(
+        "--initialize",
+        action="store_true",
+        help="""
+        Whether to initialize expected_mounts_csv based on mounts_to_verify.
+        """,
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=int,
+        default=1,
+        help="""
+        Verbosity level.
+        If 0, prints nothing.
+        If 1, prints warnings.
+        If 2, prints warnings and info messages.
+        """,
+    )
+    try:
+        main(args=parser.parse_args())
+    except (OSError, RuntimeError) as exc:
+        parser.exit(1, f"mountcheck ERROR {exc}\n")

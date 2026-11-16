@@ -1,0 +1,49 @@
+{
+  "system_desc_id": "firmus_gb300_ngpu8_llama8b_l4_nvfp4_v3",
+  "implementation_id": "nemo_l4_nvfp4_v3",
+  "benchmark": "llama31_8b",
+  "division": "closed",
+  "status": "Available on-premise",
+  "number_of_nodes": "2",
+  "accelerators_per_node": "4",
+  "framework": "NVIDIA NeMo / Megatron-Bridge recipe of the MLPerf Training v6.1 release 20261006, on NVIDIA NGC PyTorch 26.09 (public base), with Firmus kernels compiled from source",
+  "implementation_source": "NVIDIA llama31_8b reference implementation (MLPerf Training v6.1, 20261006) + Firmus patches (firmus/patches) and kernels (firmus/ak); see README.md and KERNELS.md in implementations/nemo_l4_nvfp4_v3",
+  "container": {
+    "dockerfile": "benchmarks/llama31_8b/implementations/nemo_l4_nvfp4_v3/Dockerfile",
+    "base_image": "nvcr.io/nvidia/pytorch:26.09-py3@sha256:6e8ccc607fc2a51e3741667b86316a0889418ba8b78ed0ba96e8d282b648a7a6",
+    "built": "2026-10-14, docker build of the implementation directory (build context: BUILD_CONTEXT.sha256)",
+    "docker_image_id": "sha256:bc859ba89be7",
+    "squashfs_sha256": "1d55d6d50d540c7688046dc1cb0b09ae13ef5745ec0ae1c18ec08f236d484942",
+    "squashfs_bytes": "26061021184",
+    "firmus_ak_build_sha256": "d041cf2e1a22bf4551a464a56f1e3000ceaaa43ef7bcc5e79d611a8e84ec65ec"
+  },
+  "software": {
+    "transformer_engine": "2.20.0 (NVIDIA/TransformerEngine 5b28d7aa2bd639ff0541356cc025f62954f96ce3) + firmus/patches/te",
+    "megatron_bridge": "26.09-alpha.rc1 (NVIDIA-NeMo/Megatron-Bridge ea5dded83078cf7e61ef91960273053cf564d5ac)",
+    "megatron_core": "0.20.0 (NVIDIA/Megatron-LM f6c33bde4cdc10805ee7157db746d47b758f5f02, the Megatron-Bridge submodule) + firmus/patches/mcore",
+    "pytorch": "NVIDIA NGC PyTorch 26.09",
+    "cuda": "13.4.1",
+    "cudnn": "9.26.0.51",
+    "nccl": "2.31.2",
+    "cublas": "13.8.0.4"
+  },
+  "config_file": "config_GB300_2x4x2xtp1pp1cp1_8b_l4.sh (sources NVIDIA's config_GB300_2x4x2xtp1pp1cp1_8b.sh unchanged + the Firmus AK_* switches, with AK_FP4G_NOOVERLAP=1: no forward parameter gather overlaps compute)",
+  "config_filename_logged": "config_GB300_2x4x2xtp1pp1cp1_8b.sh (pretrain.py logs config_${DGXSYSTEM}.sh)",
+  "parallelism": {
+    "tensor": 1,
+    "pipeline": 1,
+    "context": 1,
+    "expert": 1,
+    "data": 8
+  },
+  "global_batch_size": 16,
+  "micro_batch_size": 2,
+  "precision": {
+    "linear": "nvfp4",
+    "attention": "fp8",
+    "communication": "nvfp4 (Firmus K15: NVFP4 parameter all-gather)"
+  },
+  "custom_kernels": "16 Firmus kernels (K1-K16) and 16 patch, wiring and configuration items (N1-N16). K3 is shipped but never launched with the recipe's shapes, and of K1 only the angle table runs. Every kernel and every item with a numerical role is bit-identical to the stock computation (equivalence class E0), except K6's gradient-norm pass, which keeps subnormal partial sums that TE's fast-math kernel flushes and is bit-identical outside that never-observed domain (class E0-restricted), N4, which is bit-identical outside a stated subnormal input domain that a census of a whole run found empty (class E0-restricted), and N7, which is bit-identical up to the sign of an exact zero (class E0 in value); N14-N16 have no numerical role. In L4 v3, N11 also finishes every forward parameter gather at its dispatch (AK_FP4G_NOOVERLAP=1), which moves stream waits and changes no value. Listed with evidence in implementations/nemo_l4_nvfp4_v3/KERNELS.md and KERNELS/",
+  "launcher": "implementations/nemo_l4_nvfp4_v3/run.sub (differences from NVIDIA's run.sub: run.sub.vs_nvidia1006.diff in this directory)",
+  "result_logs": "results/firmus_gb300_ngpu8_llama8b_l4_nvfp4_v3/llama31_8b/result_0..9.txt: the raw logs after redact_logs.sh in this directory (internal storage paths redacted on non-MLLOG lines; MLLOG lines unchanged)"
+}

@@ -1,0 +1,890 @@
+diff --git a/megatron/core/distributed/distributed_data_parallel.py b/megatron/core/distributed/distributed_data_parallel.py
+index 264cf13078ce6c0e5326f14ba9852e472abdf120..4f349550a640bd128d8c08ea5f25b0e5cad3b29c 100644
+--- a/megatron/core/distributed/distributed_data_parallel.py
++++ b/megatron/core/distributed/distributed_data_parallel.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ 
+ import logging
++import os
+ import weakref
+ from contextlib import contextmanager
+ from typing import Optional
+@@ -26,6 +27,53 @@ from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _reset_grad_buffer(buffer):
++    """Zero the grad buffer except params whose wgrad GEMM overwrites main_grad.
++
++    Padding is zeroed by the first full reset and is never written afterwards.
++    """
++    overwritten = sum(
++        1 for p in buffer.param_index_map if getattr(p, "_nvfp4_wgrad_overwrite", False)
++    )
++    if overwritten == 0:
++        buffer.reset()
++        return
++    cached = getattr(buffer, "_nvfp4_zero_views", None)
++    if cached is None or cached[0] != overwritten:
++        spans = sorted(
++            (start, end)
++            for p, (start, end, _) in buffer.param_index_map.items()
++            if not getattr(p, "_nvfp4_wgrad_overwrite", False)
++        )
++        merged = []
++        for start, end in spans:
++            if merged and start <= merged[-1][1]:
++                merged[-1][1] = max(merged[-1][1], end)
++            else:
++                merged.append([start, end])
++        skipped = [
++            buffer.grad_data[start:end]
++            for p, (start, end, _) in buffer.param_index_map.items()
++            if getattr(p, "_nvfp4_wgrad_overwrite", False)
++        ]
++        cached = (overwritten, [buffer.grad_data[s:e] for s, e in merged], skipped)
++        buffer._nvfp4_zero_views = cached
++        if torch.distributed.get_rank() == 0:
++            print(
++                f"NVFP4 grad zero: {overwritten} overwritten params skipped, {len(merged)} spans, "
++                f"{sum(e - s for s, e in merged)}/{buffer.grad_data.numel()} elements",
++                flush=True,
++            )
++    if cached[1]:
++        torch._foreach_zero_(cached[1])
++    if os.environ.get("NVFP4_DEBUG_OVERWRITE_NAN", "0") == "1":
++        # Any skipped element the wgrad GEMM fails to write turns the grad norm NaN.
++        for view in cached[2]:
++            view.fill_(float("nan"))
++    for grad in buffer.extra_main_grads:
++        grad.zero_()
++
++
+ class _BucketParamReadyCallback:
+     """Publishes one bucket group's parameters on demand.
+ 
+@@ -448,6 +496,16 @@ class DistributedDataParallel(_BaseDataParallel):
+ 
+             self.module.apply(unmap_weight_tensor)
+ 
++        self._nvfp4_batch_grad_acc = os.environ.get("NVFP4_BATCH_GRAD_ACC", "0") == "1"
++        self._nvfp4_pending_main = []
++        self._nvfp4_pending_grad = []
++        if self._nvfp4_batch_grad_acc:
++            # Deferred main_grad adds must land before any bucket's collective is issued.
++            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++                bucket_group.start_grad_sync = self._nvfp4_flush_before(
++                    bucket_group.start_grad_sync
++                )
++
+         # Register backward hook.
+         # Accumulation function for the gradients need to be stored so they
+         # don't go out of scope.
+@@ -589,19 +647,35 @@ class DistributedDataParallel(_BaseDataParallel):
+                         assert (
+                             param.grad is not None
+                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'
++                bucket_group = self.param_to_bucket_group[param]
+                 if param.grad is not None and (
+                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                 ):
+-                    param.main_grad.add_(param.grad.data)
++                    if self._nvfp4_batch_grad_acc and self.ddp_config.overlap_grad_reduce:
++                        self._nvfp4_pending_main.append(param.main_grad)
++                        self._nvfp4_pending_grad.append(param.grad.data)
++                    else:
++                        param.main_grad.add_(param.grad.data)
+                 param.grad = None
+ 
+                 if self.ddp_config.overlap_grad_reduce:
+-                    self.param_to_bucket_group[param].register_grad_ready(
+-                        param, self.force_all_reduce
+-                    )
++                    bucket_group.register_grad_ready(param, self.force_all_reduce)
+ 
+         return hook
+ 
++    def _nvfp4_flush_grad_acc(self):
++        if self._nvfp4_pending_main:
++            torch._foreach_add_(self._nvfp4_pending_main, self._nvfp4_pending_grad)
++            self._nvfp4_pending_main = []
++            self._nvfp4_pending_grad = []
++
++    def _nvfp4_flush_before(self, start_grad_sync):
++        def wrapped(*args, **kwargs):
++            self._nvfp4_flush_grad_acc()
++            return start_grad_sync(*args, **kwargs)
++
++        return wrapped
++
+     @contextmanager
+     def no_sync(self):
+         """
+@@ -678,6 +752,7 @@ class DistributedDataParallel(_BaseDataParallel):
+         calls. When overlap_grad_reduce is set to False, calls synchronous
+         communication ops.
+         """
++        self._nvfp4_flush_grad_acc()
+         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+             bucket_group.start_grad_sync()
+ 
+@@ -691,6 +766,7 @@ class DistributedDataParallel(_BaseDataParallel):
+         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
+         communication ops.
+         """
++        self._nvfp4_flush_grad_acc()
+         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+ 
+@@ -715,11 +791,49 @@ class DistributedDataParallel(_BaseDataParallel):
+             # to True, and there will be a double-GA.
+             for param in self.params_with_grad:
+                 param.grad_added_to_main_grad = False
+-        for buffer in self.buffers + self.expert_parallel_buffers:
+-            buffer.reset()
++        if os.environ.get("NVFP4_ASYNC_GRAD_ZERO", "0") == "1" and not is_graph_capturing():
++            # Zero on a side stream so the fill overlaps the forward pass;
++            # backward waits for it before the first main_grad write.
++            main_stream = torch.cuda.current_stream()
++            if getattr(self, "_grad_zero_stream", None) is None:
++                self._grad_zero_stream = torch.cuda.Stream()
++            self._grad_zero_stream.wait_stream(main_stream)
++            with torch.cuda.stream(self._grad_zero_stream):
++                for buffer in self.buffers + self.expert_parallel_buffers:
++                    _reset_grad_buffer(buffer)
++                event = torch.cuda.Event()
++                event.record()
++            self._grad_zero_event = event
++        else:
++            for buffer in self.buffers + self.expert_parallel_buffers:
++                _reset_grad_buffer(buffer)
+         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+             bucket_group.reset()
+ 
++    def forward(self, *inputs, **kwargs):
++        output = self.module(*inputs, **kwargs)
++        event = getattr(self, "_grad_zero_event", None)
++        if event is None:
++            return output
++        self._grad_zero_event = None
++        tensors = [output] if isinstance(output, torch.Tensor) else (
++            [t for t in output if isinstance(t, torch.Tensor)]
++            if isinstance(output, (tuple, list))
++            else []
++        )
++        tensors = [t for t in tensors if t.requires_grad]
++        if not tensors:
++            torch.cuda.current_stream().wait_event(event)
++            return output
++
++        def wait_for_grad_zero(grad):
++            torch.cuda.current_stream().wait_event(event)
++            return grad
++
++        for tensor in tensors:
++            tensor.register_hook(wait_for_grad_zero)
++        return output
++
+     def broadcast_params(self):
+         """
+         Syncs parameters across all DP ranks.
+diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
+index 82a80040af2fdadc78308198ce480d26f4bf0dd6..a0cf62ac99794823687db6c66855808b170aa4c4 100644
+--- a/megatron/core/transformer/moe/experts.py
++++ b/megatron/core/transformer/moe/experts.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import inspect
+ import logging
++import os
+ from collections.abc import Callable
+ from contextlib import nullcontext
+ from copy import deepcopy
+@@ -93,6 +94,28 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
+ )
+ 
+ logger = logging.getLogger(__name__)
++_PAD_DRIFT_CALLS = [0]
++
++
++@torch.no_grad()
++def _edit_param(param: torch.Tensor, edit: Callable[[torch.Tensor], None]) -> None:
++    """Apply an in-place init edit to a (possibly quantized) parameter.
++
++    With quantized primary weights the distributed optimizer seeds its FP32
++    main weights from the preserved high-precision init value, so the edit
++    must reach that copy as well as the quantized data.
++    """
++    if hasattr(param, "dequantize") and hasattr(param, "quantize_"):
++        value = param.dequantize()
++        edit(value)
++        param.quantize_(value)
++    else:
++        edit(param)
++    get_init_val = getattr(param, "get_high_precision_init_val", None)
++    if get_init_val is not None:
++        init_val = get_init_val()
++        if init_val is not None:
++            edit(init_val)
+ 
+ 
+ class GroupedLinearFc1Interface(Protocol):
+@@ -207,7 +230,21 @@ class TEGroupedMLP(MegatronModule):
+         """
+         super().__init__(config=config)
+         self.num_local_experts = num_local_experts
+-        self.input_size = self.config.hidden_size
++        self.logical_hidden_size = self.config.hidden_size
++        self.logical_moe_ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
++        self.padded_expert_hidden_size = int(
++            os.environ.get("NVFP4_PADDED_EXPERT_HIDDEN", "0")
++        )
++        if self.padded_expert_hidden_size:
++            assert self.config.fp4, "Expert hidden padding is only implemented for FP4."
++            assert self.padded_expert_hidden_size >= self.logical_hidden_size
++            assert self.padded_expert_hidden_size >= self.logical_moe_ffn_hidden_size
++            assert self.padded_expert_hidden_size % 128 == 0
++            self.input_size = self.padded_expert_hidden_size
++            physical_ffn_hidden_size = self.padded_expert_hidden_size
++        else:
++            self.input_size = self.logical_hidden_size
++            physical_ffn_hidden_size = self.logical_moe_ffn_hidden_size
+         assert not (
+             self.config.add_bias_linear and config.bias_dropout_fusion
+         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
+@@ -216,7 +253,7 @@ class TEGroupedMLP(MegatronModule):
+         self.tp_group = pg_collection.expt_tp
+ 
+         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
+-        ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
++        ffn_hidden_size = physical_ffn_hidden_size
+         if self.config.gated_linear_unit:
+             ffn_hidden_size *= 2
+ 
+@@ -241,9 +278,9 @@ class TEGroupedMLP(MegatronModule):
+ 
+         self.linear_fc2 = submodules.linear_fc2(
+             self.num_local_experts,
+-            not_none(self.config.moe_ffn_hidden_size),
++            physical_ffn_hidden_size,
+             (
+-                self.config.hidden_size
++                self.input_size
+                 if self.config.moe_latent_size is None
+                 else self.config.moe_latent_size
+             ),
+@@ -257,6 +294,181 @@ class TEGroupedMLP(MegatronModule):
+             name=(name + ".linear_fc2") if name is not None else None,
+         )
+ 
++        if self.padded_expert_hidden_size:
++            logical_ffn = self.logical_moe_ffn_hidden_size
++            # With wgrad fusion the real gradient is already in main_grad and
++            # ``grad`` is a dummy, so the mask must be applied to main_grad.
++            mask_main_grad = os.environ.get("NVFP4_MASK_PADDED_MAIN_GRAD", "0") == "1"
++            debug_drift = os.environ.get("NVFP4_DEBUG_PAD_DRIFT", "0") == "1"
++            debug_calls = _PAD_DRIFT_CALLS
++
++            # Keep padded activation channels mathematically dead.
++            def make_fc2_mask_hook(weight):
++                def keep_padded_fc2_columns_zero(grad):
++                    fused = getattr(weight, "grad_added_to_main_grad", False) and (
++                        getattr(weight, "main_grad", None) is not None
++                    )
++                    if debug_drift:
++                        debug_calls[0] += 1
++                    if debug_drift and debug_calls[0] in (1, 2000, 10000):
++                        src = weight.main_grad if fused else grad
++                        padded_weight = (
++                            weight.dequantize() if hasattr(weight, "dequantize") else weight
++                        ).detach()[..., logical_ffn:]
++                        print(
++                            f"NVFP4 pad drift: call={debug_calls[0]} fused={fused} "
++                            f"padded-column max|grad|="
++                            f"{src[..., logical_ffn:].abs().max().item():.3e} "
++                            f"weight padded max={padded_weight.float().abs().max().item():.3e}",
++                            flush=True,
++                        )
++                    if fused and mask_main_grad:
++                        weight.main_grad[..., logical_ffn:].zero_()
++                        return grad
++                    if not fused:
++                        grad[..., logical_ffn:] = 0
++                    return grad
++
++                return keep_padded_fc2_columns_zero
++
++            fc2_weights = (
++                [self.linear_fc2.weight]
++                if self.linear_fc2.single_grouped_weight
++                else [
++                    self.linear_fc2.get_parameter(f"weight{idx}")
++                    for idx in range(self.num_local_experts)
++                ]
++            )
++            # FC1 rows of the padded FFN channels are randomly initialised, so the
++            # padded activations are live and FC2's padded columns receive a real
++            # gradient that has to be masked every step. Zeroed rows give a zero
++            # activation (SwiGLU(0, 0) = 0) and exactly zero gradients for both
++            # FC1 rows and FC2 columns, so no per-step mask is needed.
++            zero_fc1_pad_rows = os.environ.get("NVFP4_ZERO_FC1_PAD_ROWS", "0") == "1"
++            if zero_fc1_pad_rows:
++                glu_interleave = self.config.moe_mlp_glu_interleave_size
++                physical_ffn = physical_ffn_hidden_size
++                channel = torch.arange(
++                    2 * physical_ffn if self.config.gated_linear_unit else physical_ffn
++                )
++                if self.config.gated_linear_unit and glu_interleave:
++                    channel = (channel // (2 * glu_interleave)) * glu_interleave + (
++                        channel % glu_interleave
++                    )
++                elif self.config.gated_linear_unit:
++                    channel = channel % physical_ffn
++                fc1_pad_rows = torch.nonzero(channel >= logical_ffn).flatten()
++                for weight in (
++                    [self.linear_fc1.weight]
++                    if self.linear_fc1.single_grouped_weight
++                    else [
++                        self.linear_fc1.get_parameter(f"weight{idx}")
++                        for idx in range(self.num_local_experts)
++                    ]
++                ):
++                    _edit_param(
++                        weight,
++                        lambda w: w.index_fill_(-2, fc1_pad_rows.to(w.device), 0),
++                    )
++            for weight in fc2_weights:
++                _edit_param(weight, lambda w: w[..., logical_ffn:].zero_())
++                if debug_drift or not zero_fc1_pad_rows:
++                    weight.register_hook(make_fc2_mask_hook(weight))
++
++            self.fold_fc1_bias = bool(int(os.environ.get("NVFP4_FOLD_FC1_BIAS", "0")))
++            if self.fold_fc1_bias and self.linear_fc1.use_bias:
++                fc1_weights = (
++                    [self.linear_fc1.weight]
++                    if self.linear_fc1.single_grouped_weight
++                    else [
++                        self.linear_fc1.get_parameter(f"weight{idx}")
++                        for idx in range(self.num_local_experts)
++                    ]
++                )
++                fc1_biases = (
++                    [self.linear_fc1.bias]
++                    if self.linear_fc1.single_grouped_bias
++                    else [
++                        self.linear_fc1.get_parameter(f"bias{idx}")
++                        for idx in range(self.num_local_experts)
++                    ]
++                )
++                logical_hidden = self.logical_hidden_size
++                # A folded bias is a constant zero; its grad needs neither a
++                # zero fill nor main_grad accumulation. TE requires bias and
++                # weight to share requires_grad, so the bias cannot be frozen.
++                freeze_folded_bias = os.environ.get("NVFP4_FREEZE_FOLDED_BIAS", "0") == "1"
++                for weight, bias in zip(fc1_weights, fc1_biases):
++                    # A constant-one padded feature turns this weight
++                    # column into the original FC1 bias exactly.
++                    bias_value = bias.detach().float().clone()
++                    _edit_param(
++                        weight,
++                        lambda w, b=bias_value: w[..., logical_hidden].copy_(b.to(w.device, w.dtype)),
++                    )
++                    _edit_param(bias, lambda b: b.zero_())
++                    if zero_fc1_pad_rows:
++                        _edit_param(
++                            weight,
++                            lambda w: w.index_fill_(-2, fc1_pad_rows.to(w.device), 0),
++                        )
++                    if freeze_folded_bias:
++                        # Marking the grad as already accumulated makes DDP skip
++                        # the add, so main_grad keeps the zero from the reset.
++                        def skip_folded_bias_grad(grad, bias=bias):
++                            if hasattr(bias, "grad_added_to_main_grad"):
++                                bias.grad_added_to_main_grad = True
++                                return grad
++                            return grad.zero_()
++
++                        bias.register_hook(skip_folded_bias_grad)
++                    else:
++                        bias.register_hook(lambda grad: grad.zero_())
++            else:
++                self.fold_fc1_bias = False
++
++            if os.environ.get("NVFP4_ZERO_HIDDEN_PAD", "0") == "1":
++                # The padded hidden entries (FC1 input columns, FC2 output rows) never
++                # reach the output and receive zero gradients. Zeroing them at init keeps
++                # them zero and out of each weight's per-tensor amax.
++                first_pad_column = self.logical_hidden_size + int(self.fold_fc1_bias)
++                for weight in (
++                    [self.linear_fc1.weight]
++                    if self.linear_fc1.single_grouped_weight
++                    else [
++                        self.linear_fc1.get_parameter(f"weight{idx}")
++                        for idx in range(self.num_local_experts)
++                    ]
++                ):
++                    _edit_param(weight, lambda w: w[..., first_pad_column:].zero_())
++                for weight in fc2_weights:
++                    _edit_param(
++                        weight, lambda w: w[..., self.logical_hidden_size :, :].zero_()
++                    )
++
++            zero_expert_bias = os.environ.get("NVFP4_ZERO_EXPERT_BIAS", "0")
++            if zero_expert_bias != "0":
++                if zero_expert_bias == "fc1":
++                    bias_linears = (self.linear_fc1,)
++                elif zero_expert_bias == "fc2":
++                    bias_linears = (self.linear_fc2,)
++                else:
++                    bias_linears = (self.linear_fc1, self.linear_fc2)
++                for linear in bias_linears:
++                    if not linear.use_bias:
++                        continue
++                    biases = (
++                        [linear.bias]
++                        if linear.single_grouped_bias
++                        else [
++                            linear.get_parameter(f"bias{idx}")
++                            for idx in range(self.num_local_experts)
++                        ]
++                    )
++                    for bias in biases:
++                        _edit_param(bias, lambda b: b.zero_())
++                        bias.register_hook(lambda grad: grad.zero_())
++
+         self.offload_expert_fc1 = (
+             self.config.fine_grained_activation_offloading
+             and "expert_fc1" in self.config.offload_modules
+@@ -780,6 +992,25 @@ class TEGroupedMLP(MegatronModule):
+             )
+         # if the number of tokens is 0, pad the hidden states to 256
+ 
++        externally_padded = (
++            self.padded_expert_hidden_size
++            and permuted_local_hidden_states.shape[-1] == self.padded_expert_hidden_size
++        )
++        if self.padded_expert_hidden_size and not externally_padded:
++            logical_output_buffer = output_buffer
++            permuted_local_hidden_states = F.pad(
++                permuted_local_hidden_states,
++                (0, self.padded_expert_hidden_size - self.logical_hidden_size),
++            )
++            if self.fold_fc1_bias:
++                permuted_local_hidden_states[..., self.logical_hidden_size] = 1
++            # Both fused GEMMs are physically 2944-wide. Copy their logical
++            # output back into HybridEP's stable communication buffer below.
++            output_buffer = None
++            grad_input_buffer = None
++        else:
++            logical_output_buffer = None
++
+         if self.config.moe_paged_stash:
+             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+             max_num_tokens = permuted_local_hidden_states.shape[0]
+@@ -838,6 +1069,13 @@ class TEGroupedMLP(MegatronModule):
+         output = fused_group_mlp_manager.group_offload(
+             output, forced_released_tensors=forced_released_tensors
+         )
++        if self.padded_expert_hidden_size and not externally_padded:
++            logical_output = output[..., : self.logical_hidden_size]
++            if logical_output_buffer is not None:
++                logical_output_buffer.copy_(logical_output)
++                output = logical_output_buffer
++            else:
++                output = logical_output.contiguous()
+         # Remove padding if needed
+         if unpadded_tokens_per_expert is not None:
+             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
+@@ -893,6 +1131,18 @@ class TEGroupedMLP(MegatronModule):
+             output_buffer is None and grad_input_buffer is None
+         ), "output_buffer/grad_input_buffer require the TE op-fuser (fused) path"
+ 
++        externally_padded = (
++            self.padded_expert_hidden_size
++            and permuted_local_hidden_states.shape[-1] == self.padded_expert_hidden_size
++        )
++        if self.padded_expert_hidden_size and not externally_padded:
++            permuted_local_hidden_states = F.pad(
++                permuted_local_hidden_states,
++                (0, self.padded_expert_hidden_size - self.logical_hidden_size),
++            )
++            if self.fold_fc1_bias:
++                permuted_local_hidden_states[..., self.logical_hidden_size] = 1
++
+         # Apply padding if needed
+         unpadded_tokens_per_expert = None
+         permuted_probs = permuted_probs.unsqueeze(-1)
+@@ -1071,6 +1321,8 @@ class TEGroupedMLP(MegatronModule):
+             delay_offload=self.config.delay_offload_until_cuda_graph,
+         )
+         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
++        if self.padded_expert_hidden_size and not externally_padded:
++            output = output[..., : self.logical_hidden_size].contiguous()
+ 
+         # upad and concat the output
+         if unpadded_tokens_per_expert is not None:
+diff --git a/megatron/core/transformer/moe/moe_layer.py b/megatron/core/transformer/moe/moe_layer.py
+index 6e7ba95bf31e5f93cdaaa512766906f16fbf56f9..ddd1c66899be223c389c376542d9a1d391d33698 100644
+--- a/megatron/core/transformer/moe/moe_layer.py
++++ b/megatron/core/transformer/moe/moe_layer.py
+@@ -2,11 +2,13 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+ from typing import Optional, Protocol
+ 
+ import torch
++import torch.nn.functional as F
+ 
+ from megatron.core import tensor_parallel, utils
+ from megatron.core.extensions.transformer_engine import HAVE_TE
+@@ -66,6 +68,78 @@ else:
+     TELinear, TENorm, te_checkpoint = None, None, None
+ 
+ 
++def _word_view_ok(t: torch.Tensor) -> bool:
++    # Rows of 16-bit elements are copied as int64 words: 4x fewer elements than
++    # the element-wise strided copy PyTorch uses for a padded/narrowed view.
++    return (
++        t.is_contiguous()
++        and t.element_size() == 2
++        and t.shape[-1] % 4 == 0
++        and t.data_ptr() % 8 == 0
++    )
++
++
++def _crop_last_dim(y: torch.Tensor, width: int) -> torch.Tensor:
++    out = y.new_empty(*y.shape[:-1], width)
++    if _word_view_ok(y) and width % 4 == 0:
++        out.view(torch.int64).copy_(y.view(torch.int64)[..., : width // 4])
++    else:
++        out.copy_(y[..., :width])
++    return out
++
++
++def _pad_last_dim(x: torch.Tensor, width: int, one_column: Optional[int]) -> torch.Tensor:
++    logical = x.shape[-1]
++    out = x.new_empty(*x.shape[:-1], width)
++    if _word_view_ok(x) and width % 4 == 0:
++        out_words = out.view(torch.int64)
++        out_words[..., : logical // 4].copy_(x.view(torch.int64))
++        out_words[..., logical // 4 :].zero_()
++    else:
++        out[..., :logical].copy_(x)
++        out[..., logical:].zero_()
++    if one_column is not None:
++        out[..., one_column] = 1
++    return out
++
++
++class _BoundaryPad(torch.autograd.Function):
++    """Pad hidden states to the physical expert width (optional constant-one bias column)."""
++
++    @staticmethod
++    def forward(ctx, x, width, fold_bias):
++        ctx.logical = x.shape[-1]
++        return _pad_last_dim(x, width, x.shape[-1] if fold_bias else None)
++
++    @staticmethod
++    def backward(ctx, grad):
++        return _crop_last_dim(grad, ctx.logical), None, None
++
++
++class _BoundaryCrop(torch.autograd.Function):
++    """Crop expert output back to the logical hidden size."""
++
++    @staticmethod
++    def forward(ctx, y, width):
++        ctx.physical = y.shape[-1]
++        return _crop_last_dim(y, width)
++
++    @staticmethod
++    def backward(ctx, grad):
++        return _pad_last_dim(grad, ctx.physical, None), None
++
++
++def _fast_boundary_pad() -> bool:
++    return os.environ.get("NVFP4_FAST_BOUNDARY_PAD", "1") == "1"
++
++
++def _boundary_padded_hidden() -> int:
++    # With NVFP4_FUSED_PERMUTE_PAD the permutation kernels pad and crop instead.
++    if os.environ.get("NVFP4_FUSED_PERMUTE_PAD", "0") == "1":
++        return 0
++    return int(os.environ.get("NVFP4_PADDED_EXPERT_HIDDEN", "0"))
++
++
+ class ExpertsInterface(Protocol):
+     """Interface for the experts used in an MoELayer."""
+ 
+@@ -609,6 +683,12 @@ class MoELayer(BaseMoELayer):
+         fc2_latent_proj, so the dimensions match the full hidden dim."""
+ 
+         output = self.token_dispatcher.combine_postprocess(output)
++        padded_hidden_size = _boundary_padded_hidden()
++        if padded_hidden_size:
++            if _fast_boundary_pad():
++                output = _BoundaryCrop.apply(output, self.config.hidden_size)
++            else:
++                output = output[..., : self.config.hidden_size].contiguous()
+         if self.config.moe_latent_size:
+             if self.config.moe_use_norm_before_up_proj:
+                 output = apply_module(self.fc2_norm)(output)
+@@ -683,6 +763,20 @@ class MoELayer(BaseMoELayer):
+                 if "route" in self.fwd_execution_map:
+                     shared_expert_output = self.shared_experts_compute(hidden_states)
+                     probs, routing_map = self.route(hidden_states, padding_mask)
++                    padded_hidden_size = _boundary_padded_hidden()
++                    fold_bias = bool(int(os.environ.get("NVFP4_FOLD_FC1_BIAS", "0")))
++                    if padded_hidden_size and _fast_boundary_pad():
++                        hidden_states = _BoundaryPad.apply(
++                            hidden_states, padded_hidden_size, fold_bias
++                        )
++                    elif padded_hidden_size:
++                        logical_hidden_size = hidden_states.shape[-1]
++                        hidden_states = F.pad(
++                            hidden_states,
++                            (0, padded_hidden_size - logical_hidden_size),
++                        )
++                        if fold_bias:
++                            hidden_states[..., logical_hidden_size] = 1
+                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+ 
+                     if intermediate_tensors is not None:
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index 3d573deb287c5135eb931d5fc77f3a10325c3e86..09b9f89906927ad2f08921bebf6bc7cd407e21ee 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -728,7 +728,11 @@ def group_limited_topk(
+     return probs, top_indices
+ 
+ 
+-def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
++def pad_routing_map(
++    routing_map: torch.Tensor,
++    pad_multiple: int,
++    fixed_num_tokens: Optional[int] = None,
++) -> torch.Tensor:
+     """Pad the routing map to ensure each expert has a multiple of pad_multiple tokens.
+ 
+     This function ensures that each expert has a number of tokens that is a multiple of
+@@ -740,6 +744,11 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
+         routing_map (torch.Tensor): A boolean or integer tensor of shape [num_tokens,
+             num_experts] indicating which tokens are routed to which experts.
+         pad_multiple (int): The multiple to pad each expert's token count to.
++        fixed_num_tokens (Optional[int]): If set, add zero-probability dummy
++            assignments until the total number of assignments reaches this
++            static value. The value must be a multiple of pad_multiple. This is
++            used by the EP1 CUDA-graph path so permutation output shapes do not
++            depend on device routing counts.
+ 
+     Returns:
+         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
+@@ -751,12 +760,30 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
+     num_ones = routing_map.sum(dim=1)
+     num_to_pad = (-num_ones) % pad_multiple
+ 
++    if fixed_num_tokens is not None:
++        assert fixed_num_tokens % pad_multiple == 0
++        rounded_counts = num_ones + num_to_pad
++        extra_blocks = (fixed_num_tokens - rounded_counts.sum()) // pad_multiple
++        assert fixed_num_tokens <= routing_map.numel()
++        # Assign complete dummy blocks in expert order. Some experts can already
++        # contain every token (notably at initialization), so distribute against
++        # actual per-expert free capacity rather than adding one block blindly.
++        available_blocks = (
++            routing_map.size(1) - rounded_counts
++        ) // pad_multiple
++        blocks_before = torch.cumsum(available_blocks, dim=0) - available_blocks
++        assigned_blocks = torch.clamp(extra_blocks - blocks_before, min=0)
++        assigned_blocks = torch.minimum(
++            assigned_blocks, available_blocks
++        )
++        num_to_pad = num_to_pad + assigned_blocks * pad_multiple
++
+     # Find the positions of zeros in each row and their ranks
+     is_zero = routing_map == 0
+     zero_ranks = torch.cumsum(is_zero.int(), dim=1)
+ 
+     # Create mask for elements that need to be padded (converted from 0 to 1)
+-    mask = zero_ranks <= num_to_pad.unsqueeze(1)
++    mask = is_zero & (zero_ranks <= num_to_pad.unsqueeze(1))
+     routing_map[mask] = 1
+ 
+     routing_map = routing_map.transpose(0, 1)
+@@ -835,7 +862,7 @@ def topk_routing_with_score_function(
+                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                 "Please upgrade Transformer Engine or disable moe_router_fusion."
+             )
+-        return fused_topk_with_score_function(
++        routing_probs, routing_map = fused_topk_with_score_function(
+             logits=logits,
+             topk=topk,
+             use_pre_softmax=use_pre_softmax,
+@@ -845,6 +872,10 @@ def topk_routing_with_score_function(
+             score_function=score_function,
+             expert_bias=expert_bias,
+         )
++        # TE saves routing_map for backward, while router padding/permutation
++        # mutates the consumer-visible mask in place. Preserve TE's saved
++        # version counter by transferring ownership through a clone.
++        return routing_probs, routing_map.clone()
+ 
+     def _compute_topk(
+         scores: torch.Tensor,
+diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+index ecb45cf79605adfa1a2f31dcea6bc92ef4a08893..aeb0fa3a6b729ac36b3dbed9db350301623cf73e 100644
+--- a/megatron/core/transformer/moe/token_dispatcher.py
++++ b/megatron/core/transformer/moe/token_dispatcher.py
+@@ -498,6 +498,29 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+             self.cudagraph_attrs.append('shared_experts.gate_score')
+         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
+ 
++    def _use_fixed_ep1_graph_buffers(self) -> bool:
++        """Whether this dispatcher can use static EP1 permutation extents."""
++        return (
++            bool(int(os.environ.get("NVFP4_FIXED_EP1_MOE_BUFFERS", "0")))
++            and self.ep_size == 1
++            and self.tp_size == 1
++            and not self.drop_and_pad
++        )
++
++    def _fixed_ep1_num_out_tokens(self, num_tokens: int, align_size: int) -> int:
++        """Return a routing-independent upper bound with aligned expert segments."""
++        real_assignments = num_tokens * self.config.moe_router_topk
++        if align_size <= 0:
++            return real_assignments
++        # For non-negative expert counts with fixed sum N:
++        # sum(ceil(count_i / A)) <= ceil(N / A) + E - 1.
++        num_blocks = (
++            (real_assignments + align_size - 1) // align_size
++            + self.num_experts
++            - 1
++        )
++        return num_blocks * align_size
++
+     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
+         """
+         Preprocesses the token routing map for All-to-All communication and token permutation.
+@@ -546,10 +569,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+             self.config.moe_expert_capacity_factor is not None
+             or self.config.moe_router_padding_for_quantization
+         ):
+-            # When using token dropping or router padding, output size is dynamic.
+-            # Need to sync output size GPU->CPU before allocating output buffer
+-            self.num_out_tokens = num_local_tokens_per_expert.sum()
+-            self._maybe_update_cuda_sync_point("before_permutation_1")
++            if self._use_fixed_ep1_graph_buffers():
++                align_size = get_align_size_for_quantization(self.config)
++                self.num_out_tokens = self._fixed_ep1_num_out_tokens(
++                    routing_map.size(0), align_size
++                )
++            else:
++                # When using token dropping or router padding, output size is dynamic.
++                # Need to sync output size GPU->CPU before allocating output buffer.
++                self.num_out_tokens = num_local_tokens_per_expert.sum()
++                self._maybe_update_cuda_sync_point("before_permutation_1")
+         else:
+             # For dropless training, output size is static (num_tokens * topk)
+             # No explicit sync needed
+@@ -604,7 +633,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+             # to get the `num_tokens_per_local_expert` CPU value.
+             self._maybe_update_cuda_sync_point("before_finish")
+ 
+-        if self.num_local_experts > 1:
++        if self.num_local_experts > 1 and not self._use_fixed_ep1_graph_buffers():
+             # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
+             # to each local expert by all ranks.
+             self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(
+@@ -648,7 +677,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+ 
+         if self.config.moe_router_padding_for_quantization:
+             pad_multiple = get_align_size_for_quantization(self.config)
+-            if is_experimental_enabled() and self.config.moe_permute_fusion:
++            if self._use_fixed_ep1_graph_buffers():
++                fixed_num_tokens = self._fixed_ep1_num_out_tokens(
++                    self.routing_map.size(0), pad_multiple
++                )
++                self.routing_map = pad_routing_map(
++                    self.routing_map,
++                    pad_multiple,
++                    fixed_num_tokens=fixed_num_tokens,
++                )
++            elif is_experimental_enabled() and self.config.moe_permute_fusion:
+                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
+             else:
+                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
+@@ -754,7 +792,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+             "before_permutation_2", self.tokens_per_expert
+         )
+-        if self.num_local_experts > 1:
++        if self.num_local_experts > 1 and not self._use_fixed_ep1_graph_buffers():
+             if self.drop_and_pad:
+                 global_input_tokens = (
+                     global_input_tokens.view(
+@@ -800,7 +838,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+         parallel dimension.
+         """
+         # Unpermutation 2: Unsort tokens by local expert.
+-        if self.num_local_experts > 1:
++        if self.num_local_experts > 1 and not self._use_fixed_ep1_graph_buffers():
+             if self.drop_and_pad:
+                 hidden_states = (
+                     hidden_states.view(
+@@ -924,6 +962,20 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+         """
+         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
+         """
++        device_only_metadata = bool(
++            int(os.environ.get("NVFP4_DEVICE_ONLY_EXPERT_METADATA", "0"))
++        )
++        if (
++            device_only_metadata
++            and not self.drop_and_pad
++            and self.ep_size == 1
++            and self.tp_size == 1
++        ):
++            # Dropless EP1 has a static total token count. TE's GroupedTensor
++            # kernels consume per-expert split sizes directly on device, so no
++            # allocation or communication API needs the host copy.
++            return tokens_per_expert
++
+         if not self.drop_and_pad:
+             if point == self.cuda_dtoh_point:
+                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index c61f0eb75c93d2994da108c6079f12c0d4f36f96..7cb6efc112babedf15c64c45d0b09c1fef337887 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -2,6 +2,7 @@
+ 
+ import logging
+ import math
++import os
+ import warnings
+ from copy import deepcopy
+ from dataclasses import dataclass, field
+@@ -3096,9 +3097,16 @@ class TransformerConfig(ModelParallelConfig):
+                             'mlp cuda graph is only supported for dense layers, '
+                             'but not found in the model.'
+                         )
++                    allow_dropless_moe_graph = bool(
++                        int(os.environ.get("NVFP4_ALLOW_DROPLESS_MOE_GRAPH", "0"))
++                    )
+                     if (
+-                        self.moe_expert_capacity_factor is None
+-                        or not self.moe_pad_expert_input_to_capacity
++                        (
++                            self.moe_expert_capacity_factor is None
++                            or not self.moe_pad_expert_input_to_capacity
++                        )
++                        and self.moe_expert_rank_capacity_factor is None
++                        and not allow_dropless_moe_graph
+                     ):
+                         assert (
+                             CudaGraphModule.moe not in self.cuda_graph_modules

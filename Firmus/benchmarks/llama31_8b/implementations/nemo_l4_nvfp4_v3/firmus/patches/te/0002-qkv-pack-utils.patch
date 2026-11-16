@@ -1,0 +1,80 @@
+--- a/transformer_engine/pytorch/attention/dot_product_attention/utils.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+@@ -3361,6 +3361,60 @@
+         t._with_gemm_swizzled_scales = True
+ 
+ 
++# --- auto_kernel QKV-pack (2026-10-02, sec 168) -------------------------------------------------------------------
++# (Llama 3.1 8B campaign, 2026-10-02: the same two hunks re-applied to TE 2.20.0+131157b5's utils.py; case 3 of
++#  combine_and_quantize is unchanged from 2.19 around the cat.)
++# combine_and_quantize case 3 (q, k, v separate: sbhd_sbhd_sbhd under FP8 attention) concatenates them with torch.cat and
++# quantizes the flat result.  With AK_QKV_PACK=1, when q, k, v are already contiguous views of one storage laid out
++# [q | k | v] -- what the X12 rope overlay emits -- the flat buffer IS the cat's result, byte for byte, so it is quantized in
++# place (TE's own quantizer, unchanged) and the cat (~92 us, 0.5 GB of traffic per layer) is skipped.  The first eager call
++# is checked against the cat path (FP8 data, transpose and scale_inv as bytes); rank 0 prints one ARMED line; a mismatch
++# raises.  Anything else (other layouts, separate allocations, quantized inputs) takes the stock path.
++_AK_QKV_PACK = os.environ.get("AK_QKV_PACK", "0") == "1"
++_AK_QKV_PACK_STATE = {"checked": False, "hits": 0}
++
++
++def _ak_qkv_pack_view(tensors, numels):
++    """The flat [q | k | v] view when the three are adjacent contiguous plain tensors of one storage, else None."""
++    if not all(type(x) is torch.Tensor and x.is_contiguous() for x in tensors):
++        return None
++    t0 = tensors[0]
++    if any(x.dtype != t0.dtype or x.device != t0.device for x in tensors):
++        return None
++    base = t0.untyped_storage().data_ptr()
++    if any(x.untyped_storage().data_ptr() != base for x in tensors):
++        return None
++    off = t0.storage_offset()
++    if any(x.storage_offset() != off + numels[i] for i, x in enumerate(tensors)):
++        return None
++    return t0.as_strided((numels[-1],), (1,), off)
++
++
++def _ak_qkv_pack_same(a, b):
++    if a is None or b is None:
++        return a is None and b is None
++    return (a.shape == b.shape and a.dtype == b.dtype
++            and bool(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))))
++
++
++def _ak_qkv_pack_check(tensors, qkv_quantizer, qkv_fp8):
++    st = _AK_QKV_PACK_STATE
++    st["checked"] = True
++    ref = qkv_quantizer(torch.cat([x.view(-1) for x in tensors], dim=0))
++    ok = {f: _ak_qkv_pack_same(getattr(ref, f, None), getattr(qkv_fp8, f, None))
++          for f in ("_data", "_transpose", "_scale_inv")}
++    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++    if rank == 0:
++        print("[auto_kernel qkvpack] zero-copy QKV pack ARMED: q {} k {} v {} as views of one buffer, the cat skipped; "
++              "FP8 data {} / transpose {} / scale_inv {} byte-exact v the cat path: {}".format(
++                  list(tensors[0].shape), list(tensors[1].shape), list(tensors[2].shape),
++                  ok["_data"], ok["_transpose"], ok["_scale_inv"], all(ok.values())), flush=True)
++    if not all(ok.values()):
++        raise RuntimeError("[auto_kernel qkvpack] E0 self-check FAILED: %s" % ok)
++    del ref
++# -------------------------------------------------------------------------------------------------------------------
++
++
+ def combine_and_quantize(
+     qkv_layout,
+     q,
+@@ -3518,8 +3572,15 @@
+             shapes = [x.shape for x in tensors]
+             numels = [x.numel() for x in tensors]
+             numels = [sum(numels[:i]) for i in range(num_tensors + 1)]
+-            qkv = torch.cat([x.view(-1) for x in tensors], dim=0)
++            _ak_flat = _ak_qkv_pack_view(tensors, numels) if _AK_QKV_PACK else None  # auto_kernel QKV-pack
++            if _ak_flat is not None:
++                qkv = _ak_flat
++            else:
++                qkv = torch.cat([x.view(-1) for x in tensors], dim=0)
+             qkv_fp8 = qkv_quantizer(qkv)
++            if (_ak_flat is not None and not _AK_QKV_PACK_STATE["checked"]
++                    and not torch.cuda.is_current_stream_capturing()):
++                _ak_qkv_pack_check(tensors, qkv_quantizer, qkv_fp8)
+             q_data, k_data, v_data = [
+                 qkv_fp8._data[numels[i] : numels[i + 1]].view(shapes[i]) for i in range(num_tensors)
+             ]

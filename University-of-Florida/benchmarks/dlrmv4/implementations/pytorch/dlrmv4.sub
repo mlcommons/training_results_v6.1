@@ -1,0 +1,246 @@
+#!/bin/bash
+
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# HiPerGator port of run.sub: apptainer instead of pyxis/enroot.
+# The training code runs from the container (/workspace/dlrmv4). Configs come from
+# this directory and reach the container through the environment.
+# With STAGE_DATA=1 (default), each node copies SLOW_DATADIR to its local disk first.
+
+#SBATCH --exclusive
+#SBATCH --mem=0
+
+set -euxo pipefail
+
+echo "PROLOG_START $(date +%s)"
+
+# Vars without defaults
+: "${CONT:?CONT not set}"
+: "${DGXSYSTEM:?DGXSYSTEM not set}"
+: "${SLOW_DATADIR:?SLOW_DATADIR not set}"
+: "${WALLTIME_RUNANDTIME:?WALLTIME_RUNANDTIME not set}"
+
+# Vars with defaults
+: "${MLPERF_RULESET:=6.1.0}"
+: "${MLPERF_SCALE:='unknown'}"
+: "${MLPERF_CLUSTER_NAME:='unknown'}"
+: "${MILESTONE_YML:=unknown}"
+: "${NEXP:=1}"
+: "${NCCL_TEST:=0}"
+: "${NCCL_TEST_WALLTIME:=10}"
+: "${DATESTAMP:=$(date +'%y%m%d%H%M%S%N')}"
+: "${CLEAR_CACHES:=1}"
+: "${DROPCACHE_CMD:="sudo /sbin/sysctl vm.drop_caches=3"}"
+: "${USER_DROPCACHE:=}"
+: "${CHECK_COMPLIANCE:=1}"
+: "${SEED:=$RANDOM}"
+: "${LOGDIR:=./results}"
+: "${EXTRA_ASSETS:=}"
+: "${WORK_DIR:=/workspace/dlrmv4}"
+: "${STAGE_DATA:=1}"
+: "${DGXNGPU:=8}"
+export DGXNGPU
+: "${MASTER_PORT:=29500}"
+export MASTER_PORT
+# Host venv with mlperf_logging 4.1.67 (6.1.0 rules)
+: "${CHECKER_VENV:=/blue/rc-rse/mlperf/training/minh_training/v6.1/venv}"
+
+# RUNSUB_DIR is the directory containing this script
+if [[ "${SLURM_JOB_ID}" ]]; then
+    export RUNSUB_DIR=$(dirname $(scontrol show job "${SLURM_JOB_ID}" | awk -F= '/Command=/{print $2}'))
+else
+    export RUNSUB_DIR=$(dirname "${BASH_SOURCE[0]}")
+fi
+export LAUNCHER_GIT_COMMIT_ID=$(git -C "${RUNSUB_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+############################
+# Helper: srun_appt
+############################
+# Usage: srun_appt [srun args ...] -- <cmd ...>
+srun_appt() {
+  local srun_args=() cmd=() seen=0
+  for a in "$@"; do
+    if [[ $seen -eq 0 && "$a" == "--" ]]; then seen=1; continue; fi
+    (( seen == 0 )) && srun_args+=("$a") || cmd+=("$a")
+  done
+  srun "${srun_args[@]}" \
+    apptainer exec \
+      --nv \
+      -B "${_cont_mounts}" \
+      --pwd "${WORK_DIR}" \
+      --env MASTER_ADDR="${MASTER_ADDR}",MASTER_PORT="${MASTER_PORT}" \
+      "${CONT}" \
+      "${cmd[@]}"
+}
+
+export MODEL_NAME="dlrmv4"
+export MODEL_FRAMEWORK="pytorch"
+LOGBASE="${DATESTAMP}"
+export DATESTAMP LOGBASE DGXSYSTEM CONT MLPERF_SCALE MLPERF_CLUSTER_NAME MILESTONE_YML EXTRA_ASSETS
+export SPREFIX="${MODEL_NAME}_${MODEL_FRAMEWORK}_${DGXNNODES}x${DGXNGPU}x${BATCH_SIZE}_${DATESTAMP}"
+
+readonly _logfile_base="${LOGDIR}/${LOGBASE}"
+mounts_to_verify="DATADIR:/data"
+
+# make sure the results directory exists on the host
+( umask 0002; mkdir -p "${LOGDIR}" )
+
+# Copy the dataset to node-local disk (symlinks are followed)
+if [[ "${STAGE_DATA}" -eq 1 ]]; then
+    : "${TMPDIR:?TMPDIR not set, cannot stage the dataset}"
+    export DATADIR="${TMPDIR}/dlrmv4_data"
+    export SLOW_DATADIR
+    echo "STAGE_START $(date +%s)"
+    srun --label --ntasks-per-node=1 --output="${_logfile_base}_rsync.log" bash -c '
+        set -euo pipefail
+        hostname
+        df -h "${TMPDIR}"
+        mkdir -p "${DATADIR}"
+        rsync -rLt --whole-file --exclude="_*lock" --exclude=".ts-indices-*" "${SLOW_DATADIR}/" "${DATADIR}/"
+        du -sh "${DATADIR}"
+        '
+    echo "STAGE_STOP $(date +%s)"
+else
+    export DATADIR="${SLOW_DATADIR}"
+fi
+
+source ${RUNSUB_DIR}/config_mounts.sh
+echo _cont_mounts="${_cont_mounts}"
+
+# rendezvous address shared by all per-GPU workers
+export MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST-}" | head -n1)"
+echo "using MASTER_ADDR \"${MASTER_ADDR}\" of list \"${SLURM_JOB_NODELIST}\""
+
+# print info about infiniband device and gpu pcie
+echo MELLANOX_VISIBLE_DEVICES="${MELLANOX_VISIBLE_DEVICES:-}"
+srun_appt -N1 -n1 -- ibv_devinfo --list
+srun_appt -N1 -n1 -- nvidia-smi topo -m
+
+set +e
+# Check vbios version and fabric integrity
+srun --ntasks-per-node=1 nvidia-smi --query-gpu=gpu_name,gpu_bus_id,vbios_version --format=csv
+srun -l --ntasks-per-node=1 bash -c "nvidia-smi -q | grep Fabric -A 4 | grep CliqueId"
+set -e
+
+# CPUs and torch threads per rank, started as the training is (slurm2pytorch + CPU binding).
+# slurm2pytorch sets OMP_NUM_THREADS=1. Without it, the forked DataLoader workers
+# (WORKER_NUM_THREADS=4) hang in GNU OpenMP (fork_omp_test.py).
+srun_appt -l --ntasks-per-node="${DGXNGPU}" -- slurm2pytorch bash -c \
+    '${BINDCMD:-} python3 -c "import os, torch; print(\"cpus\", len(os.sched_getaffinity(0)), \"torch_threads\", torch.get_num_threads(), \"OMP_NUM_THREADS\", os.environ.get(\"OMP_NUM_THREADS\"))"' \
+    || true
+
+echo "NCCL_TEST = ${NCCL_TEST}"
+if [[ ${NCCL_TEST} -eq 1 ]]; then
+    set +e
+    echo "NCCL_TEST_START_nccl_alltoall_half $(date +%s)"
+    (srun_appt --mpi="${SLURM_MPI_TYPE:-pmix}" --ntasks-per-node=1 --time="${NCCL_TEST_WALLTIME}" -- \
+         alltoall_perf_mpi -b 4.1M -e 8.2M -f 2 -t ${DGXNGPU} -d half
+    ) |& tee "${LOGDIR}/${SPREFIX}_nccl_alltoall_half.log"
+    echo "NCCL_TEST_START_nccl_allreduce $(date +%s)"
+    (srun_appt --mpi="${SLURM_MPI_TYPE:-pmix}" --ntasks-per-node=1 --time="${NCCL_TEST_WALLTIME}" -- \
+         all_reduce_perf_mpi -b 38.3M -e 38.3M -t ${DGXNGPU} -d half
+    ) |& tee "${LOGDIR}/${SPREFIX}_nccl_allreduce.log"
+    echo "NCCL_TEST_STOP $(date +%s)"
+    set -e
+fi
+
+if [[ "${VERIFY_MOUNTS:-1}" -eq 1 ]]; then
+    (srun_appt --ntasks-per-node=1 -- \
+        python3 -m mlperf_common.mountcheck --expected_mounts_csv expected-mounts.csv --mounts_to_verify $mounts_to_verify
+    ) |& tee "${LOGDIR}/${SPREFIX}_mountcheck.log"
+fi
+
+echo "PROLOG_STOP $(date +%s)"
+
+if [[ "${USER_DROPCACHE:-}" ]]; then
+    DROPCACHE_CMD="${USER_DROPCACHE} ${DATADIR}"
+fi
+
+# Run experiments
+export SEED
+for _experiment_index in $(seq -w 1 "${NEXP}"); do
+    echo "EXPERIMENT_START $(date +%s)"
+
+    export _experiment_index
+    (
+        echo ":::DLPAL ${CONT} ${SLURM_JOB_ID} ${SLURM_JOB_NUM_NODES} ${SLURM_JOB_NODELIST} ${MLPERF_CLUSTER_NAME} ${DGXSYSTEM}"
+        echo ":::SYSJSON $(srun_appt -N1 -n1 -- mlperf-sysjson.sh)"
+        srun_appt -N1 -n1 -- bash -c 'echo ":::GITCOMMITID ${GIT_COMMIT_ID:-} ${LAUNCHER_GIT_COMMIT_ID:-}"'
+
+        # Clear caches. Log cache_clear only when the drop succeeds on every node.
+        if [[ "${CLEAR_CACHES}" -eq 1 ]]; then
+            if srun --ntasks-per-node=1 bash -c '
+                 set -e
+                 host=$(hostname)
+                 echo "$host sync_start"
+                 sync && echo "$host sync_done"
+                 cache_before=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 '"${DROPCACHE_CMD}"'
+                 cache_after=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 echo "$host cache_cleared ${cache_before}kB to ${cache_after}kB"
+            '; then
+                srun_appt --ntasks-per-node=1 -- python3 -c "
+import mlperf_logging.mllog as mllog
+mllogger = mllog.get_mllogger()
+mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
+            else
+                echo "WARNING: cache drop failed, cache_clear not logged"
+            fi
+        fi
+
+        echo "Beginning trial ${_experiment_index} of ${NEXP}"
+
+        # Save environment vars
+        export -p > "${LOGDIR}/${SLURM_JOB_ID}_${_experiment_index}.env"
+
+        set +e
+        echo "RUNANDTIME_START $(date +%s)"
+        # one task per GPU; each task directly runs one Python rank
+        srun_appt -l --mpi="${SLURM_MPI_TYPE:-pmix}" \
+            --ntasks-per-node="${DGXNGPU}" \
+            --time="${WALLTIME_RUNANDTIME}" -- \
+            slurm2pytorch ./run_and_time.sh
+        RUN_AND_TIME_EXIT_STATUS=$?
+        echo "RUNANDTIME_STOP $(date +%s)"
+        echo "${RUN_AND_TIME_EXIT_STATUS}" > "/tmp/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt"
+        set -e
+
+    ) |& tee "${_logfile_base}_raw_${_experiment_index}.log"
+    export SEED=$RANDOM     # choose a new seed for the next experiment
+
+    RUN_AND_TIME_EXIT_STATUS=$(cat "/tmp/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt" 2>/dev/null || echo "255")
+    if [[ "${RUN_AND_TIME_EXIT_STATUS}" -ne 0 ]]; then
+        echo "WARNING: run_and_time.sh failed with status ${RUN_AND_TIME_EXIT_STATUS}" >&2
+    fi
+
+    # MLPerf lines sorted by timestamp. Strip the "N: " srun label first, so that
+    # field 5 is time_ms (run.sub sorts the labelled lines, where field 5 is not a number).
+    grep ":::" "${_logfile_base}_raw_${_experiment_index}.log" | sed -E 's/^ *[0-9]+: (:::)/\1/' \
+        | sort -k5 -n -s | tee "${_logfile_base}_${_experiment_index}.log"
+
+    # compliance checker (host venv)
+    if [[ "${CHECK_COMPLIANCE}" -eq 1 ]]; then
+      (
+        set +eux
+        module load python/3.12
+        "${CHECKER_VENV}/bin/python" -m mlperf_logging.compliance_checker --usage training \
+            --ruleset "${MLPERF_RULESET}" \
+            --log_output "${LOGDIR}/compliance_${DATESTAMP}_${_experiment_index}.out" \
+            "${_logfile_base}_${_experiment_index}.log"
+      ) || true
+    fi
+
+    echo "EXPERIMENT_STOP $(date +%s)"
+done

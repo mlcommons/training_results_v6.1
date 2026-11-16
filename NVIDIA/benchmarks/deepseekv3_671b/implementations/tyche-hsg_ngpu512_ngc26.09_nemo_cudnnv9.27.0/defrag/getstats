@@ -1,0 +1,12 @@
+#!/bin/bash
+
+pg=$(getconf PAGESIZE)
+
+for n in $(awk '{ sub(/,/, "", $2); print $2 }' /proc/buddyinfo | sort -un); do   awk -v n="$n" -v pg="$pg" '
+    FNR==NR { sub(/:$/, "", $3); m[$3] = $4 / 2^20; next }    # node meminfo: kB -> GiB
+    $2 == n "," { o = NF - 5; big += $NF * pg * 2^o / 2^30 }   # buddyinfo: last column = max order
+    END {
+      other = m["MemUsed"] - m["FilePages"] - m["Slab"] - m["AnonPages"]
+      printf "node %s: used %.1f  pagecache %.1f  slab %.1f  anon %.1f  other %.1f  free %.1f  free-in-%dMiB-blocks %.1f\n",
+        n, m["MemUsed"], m["FilePages"], m["Slab"], m["AnonPages"], other, m["MemFree"], pg * 2^o / 2^20, big
+    }' /sys/devices/system/node/node$n/meminfo /proc/buddyinfo; done

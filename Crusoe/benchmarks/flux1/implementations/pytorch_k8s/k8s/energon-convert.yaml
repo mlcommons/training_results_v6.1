@@ -1,0 +1,76 @@
+# Converts preprocessed Flux.1 data (.arrow) to the Energon/WebDataset format the
+# trainer streams: cc12m->train, coco->val, + energon_prepare index. CPU-only Job.
+# Idempotent — completed splits (index.txt present) are skipped on restart.
+# Logs: kubectl logs -f job/flux-energon-convert
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flux-energon-convert
+  labels: { app: mlperf-training-v60, role: energon-convert }
+spec:
+  backoffLimit: 4
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: { app: mlperf-training-v60, role: energon-convert }
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector: { crusoe.ai/nodepool.id: 4901849f-1a0a-4e28-bbd6-bb48fbc8e9b5 }
+      containers:
+        - name: convert
+          image: rocm/amd-mlperf:flux1_training_6.0
+          workingDir: /workspace/code
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euxo pipefail
+              R=/data/datasets/flux1
+              E=$R/energon
+              NW="${NUM_WORKERS:-32}"
+              mkdir -p "$E"
+              S=/workspace/code/scripts
+
+              # 1) cc12m -> energon/train  (skip if already indexed)
+              if [ -f "$E/train/index.txt" ]; then
+                echo "train split already converted — skipping"
+              else
+                python "$S/to_webdataset.py" --input_path "$R/cc12m_preprocessed" \
+                  --output_path "$E/train" --num_workers "$NW"
+              fi
+
+              # 2) coco -> energon/val  (skip if already indexed)
+              if [ -f "$E/val/index.txt" ]; then
+                echo "val split already converted — skipping"
+              else
+                python "$S/to_webdataset.py" --input_path "$R/coco_preprocessed" \
+                  --output_path "$E/val" --num_workers "$NW"
+              fi
+
+              # 3) build the Energon index/metadata (self-skips if .nv-meta/dataset.yaml exists)
+              python "$S/energon_prepare.py" "$E" --num-workers "$NW" \
+                --template-dir "$S/dataset_template/"
+
+              # 4) empty encodings alongside the splits
+              if [ ! -d "$E/empty_encodings" ]; then
+                cp -r "$R/empty_encodings" "$E/empty_encodings"
+              fi
+
+              echo "==================== result ===================="
+              echo "train shards: $(ls "$E"/train/*.tar 2>/dev/null | wc -l)"
+              echo "val   shards: $(ls "$E"/val/*.tar   2>/dev/null | wc -l)"
+              ls -la "$E/.nv-meta" 2>/dev/null | head
+              echo "ENERGON_DONE"
+          env:
+            - { name: NUM_WORKERS, value: "32" }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: shm, mountPath: /dev/shm }
+          resources:
+            requests: { cpu: "24", memory: 48Gi }
+            limits:   { cpu: "48", memory: 96Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: mlperf-training-shared }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }

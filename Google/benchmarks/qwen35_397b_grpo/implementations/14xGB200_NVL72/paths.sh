@@ -1,0 +1,10 @@
+export RL_ROOT=/lustre/xiaotongyang_google_com/mlperf-rl
+export DATADIR=/lustre/xiaotongyang_google_com/mlperf-rl/data
+export HF_CKPT_PATH=/lustre/xiaotongyang_google_com/mlperf-rl/data/qwen35-397b-a17b
+export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/xiaotongyang_google_com/mlperf-rl/mcore_ckpt_1013_gb200_tp4pp2ep16
+export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/xiaotongyang_google_com/mlperf-rl/data/benchmark-r2e-gym-easy/benchmark_r2e_gym_easy_train.jsonl
+export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/xiaotongyang_google_com/mlperf-rl/data/benchmark-r2e-gym-easy/benchmark_r2e_gym_easy_val.jsonl
+export NEMO_GYM_SWE_SIF_DIR=/lustre/xiaotongyang_google_com/mlperf-rl/data/r2egym-sifs-aarch64/images
+export GB200_RUN_DIR=/lustre/xiaotongyang_google_com/mlperf-rl/results/train/gb200_14n_gbs512_1013_ctx8_c640_mb96_20261016T043451Z.byb5UM
+export GB200_LLMDIR=/lustre/xiaotongyang_google_com/mlperf-rl/results/train/gb200_14n_gbs512_1013_ctx8_c640_mb96_20261016T043451Z.byb5UM/image_payload/workspace/optimized/qwen35_397b_grpo_trtllm/pytorch
+export CONT=/lustre/xiaotongyang_google_com/mlperf-rl/images/train64-1006-image.p8HANa/qwen35_397b_grpo-arm+20261013.sqsh

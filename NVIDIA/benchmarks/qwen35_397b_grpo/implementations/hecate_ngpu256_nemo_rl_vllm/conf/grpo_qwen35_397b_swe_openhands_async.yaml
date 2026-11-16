@@ -1,0 +1,377 @@
+grpo:
+  seed: 42
+  max_num_epochs: 100
+  num_prompts_per_step: ${oc.decode:${oc.env:NUM_PROMPTS_PER_STEP,16}}
+  num_generations_per_prompt: ${oc.decode:${oc.env:NUM_GENERATIONS_PER_PROMPT,16}}
+  max_rollout_turns: 1
+  max_num_steps: ${oc.decode:${oc.env:MAX_STEPS,30}}
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 1
+  val_start_at: ${oc.decode:${oc.env:VAL_START_AT,18}}
+  val_at_start: false
+  val_at_end: false
+  deferred_evaluation:
+    enabled: ${oc.decode:${oc.env:OFFLINE_EVAL,0}}
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: null
+  val_num_generations_per_prompt: 4
+  stop_at_validation_metric: pass_k
+  stop_at_validation_threshold: null
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  adv_estimator:
+    name: grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: ${oc.decode:${oc.env:MAX_TRAJECTORY_AGE_STEPS,4}}
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+loss_fn:
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  truncated_importance_sampling_ratio: 1.002
+  truncated_importance_sampling_ratio_min: 0.999
+  truncated_importance_sampling_type: seq-mask-tis
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  seq_logprob_error_in_loss: true
+  metrics_level: "minimal"
+  enable_torch_compile: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen35-397b-swe-openhands
+  metric_name: val:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 100
+  save_period: 5
+  checkpoint_must_save_by: null
+  save_optimizer: false
+policy:
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: false
+  model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
+  tokenizer:
+    name: ${oc.env:CONTAINER_HF_CKPT_PATH}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 65536
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    _v2: false
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+  megatron_cfg:
+    enabled: true
+    attention_backend: fused
+    model_overrides:
+      gdn_kernel_backend: ${oc.env:MEGATRON_GDN_BACKEND,transformer_engine}
+      gdn_pre_gated_delta_rule_fusion: true
+      gdn_gated_output_norm_fusion: true
+      moe_use_grouped_tensor: ${oc.decode:${oc.env:MOE_USE_GROUPED_TENSOR,false}}
+    empty_unused_memory_level: 1
+    train_iters: 100000
+    activation_checkpointing: ${oc.decode:${oc.env:ACTIVATION_CHECKPOINTING,true}}
+    recompute_granularity: ${oc.env:RECOMPUTE_GRANULARITY,full}
+    recompute_modules: ${oc.decode:${oc.env:RECOMPUTE_MODULES,null}}
+    fine_grained_activation_offloading: ${oc.decode:${oc.env:FINE_GRAINED_ACTIVATION_OFFLOADING,false}}
+    offload_modules: ${oc.decode:${oc.env:OFFLOAD_MODULES,null}}
+    bias_activation_fusion: true
+    tensor_model_parallel_size: ${oc.decode:${oc.env:TP,4}}
+    expert_tensor_parallel_size: ${oc.decode:${oc.env:ETP,1}}
+    expert_model_parallel_size: ${oc.decode:${oc.env:EP,32}}
+    pipeline_model_parallel_size: ${oc.decode:${oc.env:PP,2}}
+    num_layers_in_first_pipeline_stage: ${oc.decode:${oc.env:NUM_LAYERS_IN_FIRST_PIPELINE_STAGE,null}}
+    num_layers_in_last_pipeline_stage: ${oc.decode:${oc.env:NUM_LAYERS_IN_LAST_PIPELINE_STAGE,null}}
+    context_parallel_size: ${oc.decode:${oc.env:CP,1}}
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: ${oc.decode:${oc.env:SEQUENCE_PARALLEL,true}}
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: ${oc.env:MOE_TOKEN_DISPATCHER_TYPE,flex}
+    moe_shared_expert_overlap: ${oc.decode:${oc.env:MOE_SHARED_EXPERT_OVERLAP,true}}
+    moe_per_layer_logging: false
+    gradient_accumulation_fusion: true
+    use_fused_weighted_squared_relu: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    optimizer:
+      optimizer: adam
+      lr: ${oc.decode:${oc.env:LEARNING_RATE,1.0e-06}}
+      min_lr: ${policy.megatron_cfg.optimizer.lr}
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: ${oc.decode:${oc.env:OPTIMIZER_CPU_OFFLOAD,false}}
+      optimizer_offload_fraction: ${oc.decode:${oc.env:OPTIMIZER_OFFLOAD_FRACTION,0.0}}
+      optimizer_cpu_chunk_size: ${oc.decode:${oc.env:OPTIMIZER_CPU_CHUNK_SIZE,1048576}}
+      overlap_cpu_optimizer_d2h_h2d: ${oc.decode:${oc.env:OVERLAP_CPU_OPTIMIZER_D2H_H2D,false}}
+      chunked_optimizer_state_offload: ${oc.decode:${oc.env:CHUNKED_OPTIMIZER_STATE_OFFLOAD,false}}
+      optimizer_state_offload_chunk_size_mb: ${oc.decode:${oc.env:OPTIMIZER_STATE_OFFLOAD_CHUNK_SIZE_MB,256}}
+      optimizer_state_offload_fraction: ${oc.decode:${oc.env:OPTIMIZER_STATE_OFFLOAD_FRACTION,1.0}}
+      main_params_dtype: float32
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+      clip_grad: ${policy.max_grad_norm}
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 100000
+      lr_warmup_iters: 0
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: ${oc.decode:${oc.env:OVERLAP_GRAD_REDUCE,false}}
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    env_vars:
+      NVTE_CPU_OFFLOAD_V1: "${oc.env:NVTE_CPU_OFFLOAD_V1,'1'}"
+      MCORE_GDN_FUSION: "${oc.env:MCORE_GDN_FUSION,'0'}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      LD_LIBRARY_PATH: "/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${oc.env:LD_LIBRARY_PATH,''}"
+      NCCL_DEBUG: "WARN"
+      NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+      PYTHONFAULTHANDLER: "1"
+      FLA_TILELANG: "0"
+    checkpoint:
+      async_strategy: mcore
+    mtp_loss_scaling_factor: 0.0
+    mtp_num_layers: 0
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    moe_flex_dispatcher_backend: ${oc.env:MOE_FLEX_DISPATCHER_BACKEND,hybridep}
+    moe_hybridep_num_sms: 32
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 512
+  max_grad_norm: ${oc.decode:${oc.env:MAX_GRAD_NORM,0.125}}
+  offload_optimizer_for_logprob: false
+  optimizer: null
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+  generation:
+    backend: vllm
+    max_new_tokens: 65536
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: 0.1
+    val_top_p: 0.95
+    val_top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    refit_transport: nccl_reshard
+    vllm_cfg:
+      async_engine: true
+      kv_cache_dtype: auto
+      precision: ${policy.precision}
+      tensor_parallel_size: ${oc.decode:${oc.env:GTP,8}}
+      pipeline_parallel_size: ${oc.decode:${oc.env:GPP,1}}
+      expert_parallel_size: ${oc.decode:${oc.env:GEP,8}}
+      gpu_memory_utilization: ${oc.decode:${oc.env:VLLM_GPU_MEMORY_UTILIZATION,0.8}}
+      max_model_len: 65536
+      enforce_eager: false
+      enable_prefix_caching: true
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 10
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_xml
+        reasoning_parser: qwen3
+    vllm_kwargs:
+      language_model_only: true
+      attention_backend: ${oc.env:NRL_VLLM_ATTENTION_BACKEND,FLASH_ATTN}
+      attention_config:
+        flash_attn_version: ${oc.decode:${oc.env:NRL_VLLM_FLASH_ATTN_VERSION,2}}
+      enable_logging_iteration_details: ${oc.decode:${oc.env:NRL_VLLM_ITERATION_LOGGING,false}}
+      moe_backend: ${oc.env:VLLM_MOE_BACKEND,triton}
+      enable_chunked_prefill: true
+      async_scheduling: true
+      scheduler_cls: ${oc.env:VLLM_SCHEDULER_CLS,null}
+      prefill_schedule_interval: ${oc.decode:${oc.env:VLLM_PREFILL_SCHEDULE_INTERVAL,1}}
+      max_num_batched_tokens: 16384
+      performance_mode: throughput
+      compilation_config:
+        mode: ${oc.decode:${oc.env:VLLM_COMPILATION_MODE,VLLM_COMPILE}}
+        backend: ${oc.env:VLLM_COMPILATION_BACKEND,inductor}
+        cudagraph_mode: ${oc.env:VLLM_CUDAGRAPH_MODE,FULL_DECODE_ONLY}
+        cudagraph_capture_sizes: ${oc.decode:${oc.env:VLLM_CUDAGRAPH_CAPTURE_SIZES,'[1,2,4,8,16,32,64]'}}
+        pass_config:
+          fuse_allreduce_rms: ${oc.decode:${oc.env:NRL_VLLM_FUSE_ALLREDUCE_RMS,false}}
+      generation_config: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 48
+    mcore_generation_config:
+      buffer_size_gb: 8
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
+    repeat: 2
+  validation:
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: false
+  nemo_gym:
+    skip_venv_if_present: true
+    allow_openai_version_skew: true
+    results_dir: /logs/nemo_gym
+    is_trajectory_collection: false
+    shards:
+    - name: swe
+      replicas: ${oc.decode:${oc.env:NEMO_GYM_REPLICAS,1}}
+      config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    use_absolute_ip: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_framework_commit: 193be2fbae833c5b9bf3e24989451b6a837180f0
+          agent_prompt_overrides:
+          - user_prompt_template: /workspace/llm/prompts/openhands/user_prompt.j2
+            system_prompt_template: /workspace/llm/prompts/openhands/system_prompt.j2
+            agent_cls: CodeActAgent
+            diversify_tool_names: false
+          agent_max_turns: 30
+          swebench_agent_timeout: 1800
+          swebench_tests_timeout: 60
+          command_exec_timeout: 60
+          concurrency: ${div:${oc.decode:${oc.env:GYM_TRAIN_CONCURRENCY,${mul:2,${policy.train_global_batch_size}}}},${env.nemo_gym.shards.0.replicas}}
+          dataset_path: ${data.train.data_path}
+          container_formatter:
+          - ${sif_dir}/r2egym/{instance_id}.sif
+          - ${sif_dir}/{instance_id}.sif
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_framework_commit: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_framework_commit}
+          agent_prompt_overrides: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_prompt_overrides}
+          agent_max_turns: 30
+          swebench_agent_timeout: 1800
+          swebench_tests_timeout: 60
+          command_exec_timeout: 60
+          concurrency: ${div:${oc.decode:${oc.env:GYM_EVAL_CONCURRENCY,1024}},${env.nemo_gym.shards.0.replicas}}
+          dataset_path: ${data.validation.data_path}
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: ${oc.decode:${oc.env:NEMO_GYM_NUM_WORKERS,4}}
+          uses_reasoning_parser: true
+          chat_template_kwargs:
+            enable_thinking: false
+          sequential_reasoning_allowed: false
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: grpo-dev
+    name: grpo-qwen35-397b-swe-openhands
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+mlperf_warmup:
+  generation_requests_per_engine: ${grpo.num_generations_per_prompt}
+  generation_max_tokens: 192
+  generation_http_timeout_s: 900
+cluster:
+  gpus_per_node: 4
+  num_nodes: 64

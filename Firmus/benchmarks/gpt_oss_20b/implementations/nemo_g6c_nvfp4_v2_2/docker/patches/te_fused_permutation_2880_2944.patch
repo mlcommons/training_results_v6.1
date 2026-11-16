@@ -1,0 +1,335 @@
+diff --git a/transformer_engine/common/permutation/permutation.cu b/transformer_engine/common/permutation/permutation.cu
+index aa7cb50e8b229e3b6324374dde50418463cd8c8f..f3105f8f52f167a6e57928b6da01f8a7d65c7dbc 100644
+--- a/transformer_engine/common/permutation/permutation.cu
++++ b/transformer_engine/common/permutation/permutation.cu
+@@ -37,7 +37,7 @@ static __global__ void moe_permute_row_map(const int *sorted_row_id, int *row_id
+ template <typename T, typename TCompute, bool hasProb>
+ __global__ void moe_unpermute_kernel(const T *input, T *unpermuted_output, const int *row_id_map,
+                                      const float *prob, const int num_rows, const int topK,
+-                                     const int num_cols) {
++                                     const int input_cols, const int output_cols) {
+   extern __shared__ int8_t s_mem[];
+   TCompute *s_prob = reinterpret_cast<TCompute *>(s_mem);
+ 
+@@ -61,7 +61,8 @@ __global__ void moe_unpermute_kernel(const T *input, T *unpermuted_output, const
+   static constexpr int kElementsPerAccess = 16 / sizeof(T);
+ 
+   // Traverse along the hidden dimention
+-  for (int i = tid * kElementsPerAccess; i < num_cols; i += blockDim.x * kElementsPerAccess) {
++  for (int i = tid * kElementsPerAccess; i < output_cols;
++       i += blockDim.x * kElementsPerAccess) {
+     TCompute frag_elem[kElementsPerAccess];
+     TCompute frag_sum[kElementsPerAccess];
+ 
+@@ -69,7 +70,7 @@ __global__ void moe_unpermute_kernel(const T *input, T *unpermuted_output, const
+ 
+     // source_row == -1 represents a dropped token
+     if (source_row != -1) {
+-      const T *source_row_ptr = input + source_row * num_cols;
++      const T *source_row_ptr = input + source_row * input_cols;
+ 
+       frag_load_store = __ldlu(reinterpret_cast<const float4 *>(source_row_ptr + i));
+ 
+@@ -93,7 +94,7 @@ __global__ void moe_unpermute_kernel(const T *input, T *unpermuted_output, const
+ 
+       if (source_row == -1) continue;
+ 
+-      const T *source_row_ptr = input + source_row * num_cols;
++      const T *source_row_ptr = input + source_row * input_cols;
+ 
+       frag_load_store = __ldlu(reinterpret_cast<const float4 *>(source_row_ptr + i));
+ 
+@@ -112,7 +113,7 @@ __global__ void moe_unpermute_kernel(const T *input, T *unpermuted_output, const
+       }
+     }
+ 
+-    T *dest_row_ptr = unpermuted_output + source_token * num_cols;
++    T *dest_row_ptr = unpermuted_output + source_token * output_cols;
+ 
+     for (int e = 0; e < kElementsPerAccess; e++) {
+       if constexpr ((std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
+@@ -129,7 +130,8 @@ __global__ void moe_unpermute_kernel(const T *input, T *unpermuted_output, const
+ template <typename T, typename TCompute, int topKTile, bool hasProb>
+ __global__ void moe_permute_kernel(const T *input_bwd, const T *input_fwd, T *act_grad,
+                                    const float *prob, float *prob_grad, const int *row_id_map,
+-                                   const int num_rows, const int topK, const int num_cols) {
++                                   const int num_rows, const int topK, const int input_cols,
++                                   const int output_cols, const bool fill_fc1_bias_channel) {
+   extern __shared__ int8_t s_mem[];
+   TCompute *s_prob = reinterpret_cast<TCompute *>(s_mem);
+ 
+@@ -156,15 +158,25 @@ __global__ void moe_permute_kernel(const T *input_bwd, const T *input_fwd, T *ac
+   static constexpr int kElementsPerAccess = 16 / sizeof(T);
+ 
+   // The starting address of each source row
+-  const T *source_row_ptr = input_bwd + source_token * num_cols;
++  const T *source_row_ptr = input_bwd + source_token * input_cols;
+ 
+   // Traverse along the hidden dimention
+-  for (int i = tid * kElementsPerAccess; i < num_cols; i += blockDim.x * kElementsPerAccess) {
++  for (int i = tid * kElementsPerAccess; i < output_cols;
++       i += blockDim.x * kElementsPerAccess) {
+     TCompute frag_src[kElementsPerAccess];
+ 
+-    frag_load_store = __ldlu(reinterpret_cast<const float4 *>(source_row_ptr + i));
+-
+-    for (int e = 0; e < kElementsPerAccess; e++) frag_src[e] = TCompute(frag_load_store_ptr[e]);
++    if (i < input_cols) {
++      frag_load_store = __ldlu(reinterpret_cast<const float4 *>(source_row_ptr + i));
++      for (int e = 0; e < kElementsPerAccess; e++) {
++        frag_src[e] = TCompute(frag_load_store_ptr[e]);
++      }
++    } else {
++      for (int e = 0; e < kElementsPerAccess; e++) {
++        const int col = i + e;
++        frag_src[e] =
++            TCompute(fill_fc1_bias_channel && col == input_cols ? 1.0f : 0.0f);
++      }
++    }
+ 
+     int index = source_token;
+ 
+@@ -185,12 +197,12 @@ __global__ void moe_permute_kernel(const T *input_bwd, const T *input_fwd, T *ac
+           for (int e = 0; e < kElementsPerAccess; e++) frag_load_store_ptr[e] = T(frag_src[e]);
+         }
+ 
+-        T *dest_row_ptr = act_grad + dest_row * num_cols;
++        T *dest_row_ptr = act_grad + dest_row * output_cols;
+         *reinterpret_cast<float4 *>(dest_row_ptr + i) = frag_load_store;
+ 
+         if (hasProb) {
+           // Inner product calculation for prob_grad in unpermute bwd
+-          const T *input_fwd_ptr = input_fwd + dest_row * num_cols;
++          const T *input_fwd_ptr = input_fwd + dest_row * output_cols;
+ 
+           frag_load_store = __ldlu(reinterpret_cast<const float4 *>(input_fwd_ptr + i));
+ 
+@@ -227,7 +239,8 @@ __global__ void moe_permute_kernel(const T *input_bwd, const T *input_fwd, T *ac
+ template <typename T>
+ void nvte_permute_launcher(const T *input, T *output, const int *sorted_row_id, int *row_id_map,
+                            const float *prob, float *prob_grad, const T *input_fwd,
+-                           const int num_rows, const int topK, const int num_cols,
++                           const int num_rows, const int topK, const int input_cols,
++                           const int output_cols,
+                            const int num_out_tokens, cudaStream_t stream) {
+   using TCompute = typename std::conditional<(std::is_same<T, __nv_fp8_e5m2>::value ||
+                                               std::is_same<T, __nv_fp8_e4m3>::value),
+@@ -246,9 +259,10 @@ void nvte_permute_launcher(const T *input, T *output, const int *sorted_row_id,
+     NVTE_CHECK_CUDA(cudaGetLastError());
+ 
+     blocks = num_rows;
+-    threads = std::min(num_cols / kElementsPerAccess, 1024);
++    threads = std::min(output_cols / kElementsPerAccess, 1024);
+     moe_permute_kernel<T, TCompute, 128, false><<<blocks, threads, 0, stream>>>(
+-        input, nullptr, output, nullptr, nullptr, row_id_map, num_rows, topK, num_cols);
++        input, nullptr, output, nullptr, nullptr, row_id_map, num_rows, topK, input_cols,
++        output_cols, output_cols > input_cols);
+     NVTE_CHECK_CUDA(cudaGetLastError());
+   } else {
+     // moe_unpermute_bwd
+@@ -260,7 +274,8 @@ void nvte_permute_launcher(const T *input, T *output, const int *sorted_row_id,
+       // moe_unpermute_bwd without probs
+ 
+       moe_permute_kernel<T, TCompute, 1, false><<<blocks, threads, 0, stream>>>(
+-          input, input_fwd, output, nullptr, nullptr, row_id_map, num_rows, topK, num_cols);
++          input, input_fwd, output, nullptr, nullptr, row_id_map, num_rows, topK, input_cols,
++          output_cols, false);
+       NVTE_CHECK_CUDA(cudaGetLastError());
+     } else {
+       // moe_unpermute_bwd with probs
+@@ -269,19 +284,24 @@ void nvte_permute_launcher(const T *input, T *output, const int *sorted_row_id,
+ 
+       if (topK <= 8) {
+         moe_permute_kernel<T, TCompute, 8, true><<<blocks, threads, smem_bytes, stream>>>(
+-            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, num_cols);
++            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, input_cols,
++            output_cols, false);
+       } else if (topK <= 16) {
+         moe_permute_kernel<T, TCompute, 16, true><<<blocks, threads, smem_bytes, stream>>>(
+-            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, num_cols);
++            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, input_cols,
++            output_cols, false);
+       } else if (topK <= 32) {
+         moe_permute_kernel<T, TCompute, 32, true><<<blocks, threads, smem_bytes, stream>>>(
+-            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, num_cols);
++            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, input_cols,
++            output_cols, false);
+       } else if (topK <= 64) {
+         moe_permute_kernel<T, TCompute, 64, true><<<blocks, threads, smem_bytes, stream>>>(
+-            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, num_cols);
++            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, input_cols,
++            output_cols, false);
+       } else if (topK <= 128) {
+         moe_permute_kernel<T, TCompute, 128, true><<<blocks, threads, smem_bytes, stream>>>(
+-            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, num_cols);
++            input, input_fwd, output, prob, prob_grad, row_id_map, num_rows, topK, input_cols,
++            output_cols, false);
+       } else {
+         NVTE_ERROR("topK cannot exceed 128.");
+       }
+@@ -292,7 +312,8 @@ void nvte_permute_launcher(const T *input, T *output, const int *sorted_row_id,
+ 
+ template <typename T>
+ void nvte_unpermute_launcher(const T *input, T *output, int *row_id_map, const float *prob,
+-                             const int num_rows, const int topK, const int num_cols,
++                             const int num_rows, const int topK, const int input_cols,
++                             const int output_cols,
+                              cudaStream_t stream) {
+   using TCompute = typename std::conditional<(std::is_same<T, __nv_fp8_e5m2>::value ||
+                                               std::is_same<T, __nv_fp8_e4m3>::value),
+@@ -301,7 +322,7 @@ void nvte_unpermute_launcher(const T *input, T *output, int *row_id_map, const f
+   static constexpr int kElementsPerAccess = 16 / sizeof(T);
+ 
+   int blocks = num_rows;
+-  int threads = std::min(num_cols / kElementsPerAccess, 1024);
++  int threads = std::min(output_cols / kElementsPerAccess, 1024);
+   size_t smem_bytes = topK * sizeof(TCompute);
+ 
+   if (prob == nullptr) {
+@@ -309,13 +330,13 @@ void nvte_unpermute_launcher(const T *input, T *output, int *row_id_map, const f
+     // moe_unpermute_fwd without probs
+ 
+     moe_unpermute_kernel<T, TCompute, false><<<blocks, threads, smem_bytes, stream>>>(
+-        input, output, row_id_map, nullptr, num_rows, topK, num_cols);
++        input, output, row_id_map, nullptr, num_rows, topK, input_cols, output_cols);
+     NVTE_CHECK_CUDA(cudaGetLastError());
+   } else {
+     // moe_unpermute_fwd with probs
+ 
+     moe_unpermute_kernel<T, TCompute, true><<<blocks, threads, smem_bytes, stream>>>(
+-        input, output, row_id_map, prob, num_rows, topK, num_cols);
++        input, output, row_id_map, prob, num_rows, topK, input_cols, output_cols);
+     NVTE_CHECK_CUDA(cudaGetLastError());
+   }
+ }
+@@ -334,6 +355,8 @@ void nvte_permute(const NVTETensor input, NVTETensor output, const NVTETensor so
+   const Tensor *prob_cu = convertNVTETensorCheck(prob);
+   const Tensor *prob_grad_cu = convertNVTETensorCheck(prob_grad);
+   const Tensor *input_fwd_cu = convertNVTETensorCheck(input_fwd);
++  const int input_cols = input_cu->data.shape[1];
++  const int output_cols = output_cu->data.shape[1];
+ 
+   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+       input_cu->data.dtype, T,
+@@ -344,7 +367,7 @@ void nvte_permute(const NVTETensor input, NVTETensor output, const NVTETensor so
+                             reinterpret_cast<const float *>(prob_cu->data.dptr),
+                             reinterpret_cast<float *>(prob_grad_cu->data.dptr),
+                             reinterpret_cast<const T *>(input_fwd_cu->data.dptr), num_rows, topK,
+-                            num_cols, num_out_tokens, stream););
++                            input_cols, output_cols, num_out_tokens, stream););
+ }
+ 
+ void nvte_unpermute(const NVTETensor input, NVTETensor output, NVTETensor row_id_map,
+@@ -357,6 +380,8 @@ void nvte_unpermute(const NVTETensor input, NVTETensor output, NVTETensor row_id
+   const Tensor *output_cu = convertNVTETensorCheck(output);
+   const Tensor *row_id_map_cu = convertNVTETensorCheck(row_id_map);
+   const Tensor *prob_cu = convertNVTETensorCheck(prob);
++  const int input_cols = input_cu->data.shape[1];
++  const int output_cols = output_cu->data.shape[1];
+ 
+   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+       input_cu->data.dtype, T,
+@@ -364,7 +389,7 @@ void nvte_unpermute(const NVTETensor input, NVTETensor output, NVTETensor row_id
+                               reinterpret_cast<T *>(output_cu->data.dptr),
+                               reinterpret_cast<int *>(row_id_map_cu->data.dptr),
+                               reinterpret_cast<const float *>(prob_cu->data.dptr), num_rows, topK,
+-                              num_cols, stream););
++                              input_cols, output_cols, stream););
+ }
+ 
+ void nvte_device_radix_sort_pairs(void *temp_storage, size_t *temp_storage_bytes, int *keys_in,
+diff --git a/transformer_engine/pytorch/csrc/extensions/permutation.cpp b/transformer_engine/pytorch/csrc/extensions/permutation.cpp
+index 226705b16931227fa2a05e24c8aed115492cbdd2..adfd5efa858766494142aea5477b1e3a02ca914a 100644
+--- a/transformer_engine/pytorch/csrc/extensions/permutation.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/permutation.cpp
+@@ -6,8 +6,19 @@
+ 
+ #include "../extensions.h"
+ 
++#include <cstdlib>
++#include <string>
++
+ namespace transformer_engine::pytorch {
+ 
++namespace {
++int64_t get_env_hidden_size(const char *name, int64_t fallback) {
++  const char *value = std::getenv(name);
++  if (value == nullptr || value[0] == '\0') return fallback;
++  return std::stoll(value);
++}
++}  // namespace
++
+ std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> moe_permute_fwd(
+     at::Tensor input, const DType dtype, at::Tensor indices, int64_t num_out_tokens,
+     std::vector<at::Tensor> workspace, int64_t max_expanded_token_num) {
+@@ -53,8 +64,12 @@ std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> moe_permute_fwd(
+ 
+   // Output buffer alloc
+   num_out_tokens = (num_out_tokens > 0) ? num_out_tokens : num_tokens * topK;
++  const int64_t output_cols =
++      get_env_hidden_size("NVFP4_PERMUTE_PADDED_HIDDEN", num_cols);
++  NVTE_CHECK(output_cols >= num_cols,
++             "NVFP4_PERMUTE_PADDED_HIDDEN must not be smaller than the input width.");
+   at::Tensor permuted_output =
+-      torch::empty({num_out_tokens, num_cols},
++      torch::empty({num_out_tokens, output_cols},
+                    torch::dtype(input.scalar_type()).device(torch::kCUDA).requires_grad(false));
+   at::Tensor row_id_map = torch::empty(
+       {num_tokens * topK}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+@@ -68,7 +83,7 @@ std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> moe_permute_fwd(
+   auto permuted_output_cu =
+       makeTransformerEngineTensor(permuted_output.data_ptr(),
+                                   std::vector<size_t>{static_cast<size_t>(permuted_output.size(0)),
+-                                                      static_cast<size_t>(num_cols)},
++                                                      static_cast<size_t>(output_cols)},
+                                   dtype);
+   auto sorted_row_id_cu = makeTransformerEngineTensor(
+       sorted_row_id_ptr, std::vector<size_t>{static_cast<size_t>(num_tokens * topK)},
+@@ -90,10 +105,14 @@ at::Tensor moe_permute_bwd(at::Tensor input, const DType dtype, at::Tensor row_i
+ at::Tensor moe_unpermute_fwd(at::Tensor input, const DType dtype, at::Tensor row_id_map,
+                              at::Tensor prob, int64_t num_tokens, int64_t topK) {
+   int num_cols = input.size(1);
++  const int64_t output_cols =
++      get_env_hidden_size("NVFP4_PERMUTE_LOGICAL_HIDDEN", num_cols);
++  NVTE_CHECK(output_cols <= num_cols,
++             "NVFP4_PERMUTE_LOGICAL_HIDDEN must not exceed the input width.");
+ 
+   // Output buffer alloc
+   at::Tensor unpermuted_output =
+-      torch::empty({num_tokens, num_cols},
++      torch::empty({num_tokens, output_cols},
+                    torch::dtype(input.scalar_type()).device(torch::kCUDA).requires_grad(false));
+ 
+   auto stream = at::cuda::getCurrentCUDAStream().stream();
+@@ -105,7 +124,7 @@ at::Tensor moe_unpermute_fwd(at::Tensor input, const DType dtype, at::Tensor row
+   auto unpermuted_output_cu = makeTransformerEngineTensor(
+       unpermuted_output.data_ptr(),
+       std::vector<size_t>{static_cast<size_t>(unpermuted_output.size(0)),
+-                          static_cast<size_t>(num_cols)},
++                          static_cast<size_t>(output_cols)},
+       dtype);
+   auto row_id_map_cu = makeTransformerEngineTensor(row_id_map);
+   auto prob_cu = makeTransformerEngineTensor(prob);
+@@ -122,10 +141,11 @@ std::tuple<at::Tensor, at::Tensor> moe_unpermute_bwd(at::Tensor input_bwd, at::T
+   const int topK = (prob.numel() > 0) ? prob.size(1) : 1;
+   const int num_tokens = (prob.numel() > 0) ? prob.size(0) : row_id_map.size(0);
+   int num_cols = input_bwd.size(1);
++  const int64_t output_cols = input_fwd.size(1);
+ 
+   // Output buffer alloc
+   at::Tensor act_grad =
+-      torch::empty({input_fwd.size(0), num_cols},
++      torch::empty({input_fwd.size(0), output_cols},
+                    torch::dtype(input_bwd.scalar_type()).device(torch::kCUDA).requires_grad(false));
+   at::Tensor prob_grad = torch::empty(
+       {num_tokens, topK}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+@@ -138,7 +158,8 @@ std::tuple<at::Tensor, at::Tensor> moe_unpermute_bwd(at::Tensor input_bwd, at::T
+       dtype);
+   auto act_grad_cu = makeTransformerEngineTensor(
+       act_grad.data_ptr(),
+-      std::vector<size_t>{static_cast<size_t>(act_grad.size(0)), static_cast<size_t>(num_cols)},
++      std::vector<size_t>{static_cast<size_t>(act_grad.size(0)),
++                          static_cast<size_t>(output_cols)},
+       dtype);
+   auto input_fwd_cu = makeTransformerEngineTensor(
+       input_fwd.data_ptr(),

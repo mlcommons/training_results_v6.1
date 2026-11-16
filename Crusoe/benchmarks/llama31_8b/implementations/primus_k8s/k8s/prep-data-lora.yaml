@@ -1,0 +1,68 @@
+# llama2_70b_lora data + model prep, inside the LoRA trainer image, using AMD's own
+# scripts/prepare_data_and_model.sh: GovReport (packed to 8192) + Llama-2-70b-hf -> Megatron
+# checkpoint. Needs a HuggingFace token whose account accepted the Llama 2 license.
+# Lands at <pvc>/datasets/llama2_70b_lora/data (~270 GB incl. HF cache); the trainer mounts it
+# at /data (packed npy) and /ckpt (megatron_checkpoints/...).
+#   sed -e 's|__IMAGE__|<llama2-70b-lora image>|' -e 's|__PULL_SECRET__|<secret>|' \
+#       -e 's|__HF_SECRET__|<secret holding key "token">|' -e 's|__NODE__|<gpu-node>|' prep-data-lora.yaml \
+#     | kubectl --context <ctx> -n <ns> apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prep-llama2-70b-lora-data
+  labels: { app: llama-v61, role: data-prep }
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: { labels: { app: llama-v61, role: data-prep } }
+    spec:
+      restartPolicy: Never
+      nodeName: __NODE__
+      imagePullSecrets: [{ name: __PULL_SECRET__ }]
+      containers:
+        - name: prep
+          image: __IMAGE__
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euo pipefail
+              # Same steps as AMD's scripts/prepare_data_and_model.sh, split so that the
+              # dataset download + directory-hash check run on local scratch: on a shared NFS
+              # volume, files still open during the script's cleanup leave .nfs* leftovers that
+              # break hash_directory(). The HF cache lives OUTSIDE /data for the same reason.
+              export HF_HOME=/hf_cache
+              cd /workspace/code
+              if [ -f /data/.complete ]; then echo "already prepared: $(cat /data/.complete)"; exit 0; fi
+              S=/scratch/govreport; rm -rf "$S"; mkdir -p "$S"
+              python scripts/download_dataset.py --data_dir "$S"
+              find /data -mindepth 1 -maxdepth 1 ! -name megatron_checkpoints -exec rm -rf {} + 2>/dev/null || true
+              cp "$S"/*.parquet /data/
+              python scripts/convert_dataset.py --data_dir /data
+              python3 scripts/create_metadata.py 8192 /data/packed_metadata.jsonl
+              # Pre-fetch the HF weights with 16 parallel shard downloads into HF_HOME; the
+              # converter's from_pretrained then reads them from the cache instead of fetching serially.
+              python3 -c "from huggingface_hub import snapshot_download as s; print(s('meta-llama/Llama-2-70b-hf', allow_patterns=['*.safetensors','*.json','tokenizer*'], max_workers=16))"
+              if [ ! -f /data/megatron_checkpoints/Llama-2-70b-hf/latest_checkpointed_iteration.txt ]; then
+                bash scripts/convert_megatron_checkpoint.sh "meta-llama/Llama-2-70b-hf" "/data/megatron_checkpoints/Llama-2-70b-hf"
+              fi
+              echo "--- tree"; find /data -maxdepth 4 -not -path '*/hf_cache/*' -type f -printf '%s\t%p\n' | sort -k2 | awk '{printf "%8.1f GB  %s\n", $1/1e9, $2}'
+              date -u +%FT%TZ > /data/.complete
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: __HF_SECRET__, key: token } }
+          resources:
+            requests: { amd.com/gpu: 8, cpu: 64, memory: 1Ti }
+            limits:   { amd.com/gpu: 8, cpu: 200, memory: 2Ti }
+          volumeMounts:
+            - { name: shared, mountPath: /data, subPath: datasets/llama2_70b_lora/data }
+            - { name: shared, mountPath: /hf_cache, subPath: cache/hf }
+            - { name: scratch, mountPath: /scratch }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: shared
+          persistentVolumeClaim: { claimName: mlperf-training-shared }
+        - name: scratch
+          emptyDir: { sizeLimit: 4Gi }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }

@@ -1,0 +1,115 @@
+# Flux.1 COMPLIANCE run (v6.1). Render with run-flux-compliance.sh, not by hand.
+# Template vars: __J__ (job/dns name), __SEED__, __RUN__ (log subdir), __N__ (nodes),
+# __GBS__ __MBS__ __LR__ __WARMUP__ (recipe; must match an RCP row), __SELKEY__/__SELVAL__,
+# __IMAGE__, __PULL_SECRET__. Adds the 3 missing v6.1 mllog keys purely
+# at runtime (no image rebuild): sed-injects attn/comm precision into custom_callbacks.py
+# and emits cache_clear on rank 0. The attn/comm precision values below are what the v6.1
+# submission disclosed; confirm them against the image if you change it.
+---
+apiVersion: v1
+kind: Service
+metadata: { name: __J__ }
+spec: { clusterIP: None, publishNotReadyAddresses: true, selector: { job-name: __J__ }, ports: [{ port: 29501, name: c10d }] }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: __J__ }
+spec:
+  completionMode: Indexed
+  completions: __N__
+  parallelism: __N__
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        k8s.v1.cni.cncf.io/networks: >-
+          kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad
+    spec:
+      restartPolicy: Never
+      subdomain: __J__
+      imagePullSecrets: [{ name: __PULL_SECRET__ }]   # line removed by the runner when PULL_SECRET is unset
+      # Pool-agnostic on purpose: the old nodepool.name / bare `rccl` keys matched 0
+      # nodes after the pool was rebuilt, which leaves every pod Pending with no error.
+      nodeSelector: { amd.com/gpu.product-name: AMD_Instinct_MI355_OAM, __SELKEY__: "__SELVAL__" }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { job-name: __J__ } }
+              topologyKey: kubernetes.io/hostname
+      # MLPerf training rules ("Data State at Start of Run"): flush the cache before benchmarking.
+      # Drop the host page cache (incl. NFS client cache) on every node and leave evidence; rank 0
+      # logs cache_clear only when every node's evidence file exists.
+      initContainers:
+        - name: cache-flush
+          image: mirror.gcr.io/library/busybox:1.36
+          securityContext: { privileged: true }
+          env:
+            - name: IDX
+              valueFrom: { fieldRef: { fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']" } }
+            - name: NODE
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e; d=/joblogs/__RUN__; mkdir -p "$d"
+              b=$(grep -E '^Cached:' /proc/meminfo | tr -s ' '); sync; echo 3 > /proc/sys/vm/drop_caches
+              a=$(grep -E '^Cached:' /proc/meminfo | tr -s ' ')
+              echo "$(date -u +%FT%TZ) node=${NODE%%.*} drop_caches=3 before=[$b] after=[$a]" > "$d/cacheflush-node${IDX}.txt"
+          volumeMounts:
+            - { name: energon, mountPath: /joblogs, subPath: logs }
+      containers:
+        - name: train
+          image: __IMAGE__   # built from training/docker/bundle2/Dockerfile.flux-trainer-bundle2.1
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/code
+          securityContext: { capabilities: { add: ["IPC_LOCK"] } }
+          envFrom: [{ configMapRef: { name: rccl-roce-env } }]
+          env:
+            - { name: MAX_STEPS, value: "-1" }
+            - { name: SEED, value: "__SEED__" }
+            - { name: RUN_NAME, value: "__RUN__" }
+            - { name: MLLOG_LOWEST_NUMERICAL_PRECISION_ATTN, value: "fp8" }
+            - { name: MLLOG_LOWEST_NUMERICAL_PRECISION_COMM, value: "bfloat16" }
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euo pipefail
+              ulimit -n 1048576 2>/dev/null || ulimit -n 262144 2>/dev/null || true
+              cd /workspace/code
+              # --- v6.1 mllog patch: add attn/comm precision disclosure keys (idempotent) ---
+              CB=src/custom_callbacks.py
+              grep -q lowest_numerical_precision_in_comm "$CB" || sed -i '/lowest_numerical_precision_in_linear/a\            "lowest_numerical_precision_in_comm": os.getenv("MLLOG_LOWEST_NUMERICAL_PRECISION_COMM", "bfloat16"),' "$CB"
+              grep -q lowest_numerical_precision_in_attn "$CB" || sed -i '/lowest_numerical_precision_in_linear/a\            "lowest_numerical_precision_in_attn": os.getenv("MLLOG_LOWEST_NUMERICAL_PRECISION_ATTN", "fp8"),' "$CB"
+              source ./config_MI355X_08x08x32.sh
+              export BATCHSIZE=__GBS__ LEARNING_RATE=__LR__ WARMUP_STEPS=__WARMUP__ MBS=__MBS__ DGXNNODES=__N__ SEGMENT=__N__
+              export MLPERF_SUBMISSION_ORG="Crusoe" MLPERF_SUBMISSION_PLATFORM="MI355X-288GB_2xEPYC-9575F"
+              IDX="${JOB_COMPLETION_INDEX:-0}"; MASTER=__J__-0.__J__
+              mkdir -p "/joblogs/${RUN_NAME}"
+              until getent hosts "${MASTER}" >/dev/null 2>&1; do echo "  waiting for ${MASTER}..."; sleep 3; done
+              {
+                # cache_clear (v6.1 required; K8s path skips the docker-wrapper that emits it) - rank 0 only
+                if [ "$IDX" = "0" ]; then
+                  for _ in $(seq 1 180); do [ "$(ls /joblogs/${RUN_NAME}/cacheflush-node*.txt 2>/dev/null | wc -l)" -ge __N__ ] && break; sleep 5; done
+                  echo "[cache-flush evidence: $(ls /joblogs/${RUN_NAME}/cacheflush-node*.txt 2>/dev/null | wc -l)/__N__ nodes]"; cat /joblogs/${RUN_NAME}/cacheflush-node*.txt
+                  [ "$(ls /joblogs/${RUN_NAME}/cacheflush-node*.txt 2>/dev/null | wc -l)" -ge __N__ ] || { echo "!! cache flush evidence missing - not logging cache_clear"; sleep 3; exit 2; }
+                  python3 -c 'import json,time; print(":::MLLOG "+json.dumps({"namespace":"","time_ms":int(time.time()*1000),"event_type":"POINT_IN_TIME","key":"cache_clear","value":True,"metadata":{"file":"launch.sh","lineno":1}}))'
+                fi
+                torchrun --nnodes=__N__ --nproc_per_node="${DGXNGPU}" --node_rank="${IDX}" \
+                     --master_addr="${MASTER}" --master_port=29501 \
+                     src/train.py model="${MODEL}" data="${DATA}" ${EXTRA_ARGS:-}
+              } 2>&1 | tee "/joblogs/${RUN_NAME}/rank${IDX}.log"; exit "${PIPESTATUS[0]}"
+          resources:
+            requests: { amd.com/gpu: 8, amd.com/vnic: 8, cpu: 32, memory: 256Gi }
+            limits:   { amd.com/gpu: 8, amd.com/vnic: 8, cpu: 64, memory: 2Ti }
+          volumeMounts:
+            - { name: energon, mountPath: /dataset/energon, subPath: datasets/flux1/energon }
+            - { name: energon, mountPath: /joblogs, subPath: logs }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: rccl-topo, mountPath: /etc/crusoe/rccl_topo/mi355x-288gb-ib.xml, readOnly: true }
+      volumes:
+        - name: energon
+          persistentVolumeClaim: { claimName: mlperf-training-shared }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+        - name: rccl-topo
+          hostPath: { path: /etc/crusoe/rccl_topo/mi355x-288gb-ib.xml, type: File }

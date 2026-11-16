@@ -1,0 +1,27 @@
+# Prebuild the DLRMv4 time-window index (~18 GB) once, in the shared dataset copy, so per-node staging
+# carries it and no run builds it under an flock over NFS (AMD README "Prebuild the Time-Window Index").
+apiVersion: batch/v1
+kind: Job
+metadata: { name: dlrmv4-index-build, labels: { app: v61-drop, role: dataset } }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata: { labels: { app: v61-drop, role: dataset } }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: idx
+          image: __IMAGE__
+          workingDir: /workspace/code
+          command: [ "bash", "-c" ]
+          args:
+            - |
+              set -e; date -u
+              python3 -m generative_recommenders.dlrm_v4.datasets.offline_ts_indices \
+                --cache-dir /data/processed_5b/hstu_cache_L4086 --history-length 4086 --min-history 4086 --window-seconds 86400
+              date -u; ls -la /data/processed_5b/hstu_cache_L4086 | tail -8; du -sh /data
+          resources: { requests: { cpu: "32", memory: 512Gi }, limits: { cpu: "64", memory: 1Ti } }
+          volumeMounts: [ { name: shared, mountPath: /data, subPath: datasets/dlrmv4/data } ]
+      volumes:
+        - { name: shared, persistentVolumeClaim: { claimName: mlperf-training-shared } }

@@ -1,0 +1,40 @@
+diff --git a/examples/mlperf/llama3.1_8b/config_MI355X_1x8x1.sh b/examples/mlperf/llama3.1_8b/config_MI355X_1x8x1.sh
+index f56e999d..24055a1e 100755
+--- a/examples/mlperf/llama3.1_8b/config_MI355X_1x8x1.sh
++++ b/examples/mlperf/llama3.1_8b/config_MI355X_1x8x1.sh
+@@ -14,7 +14,7 @@ export PYTHONPATH="${PRIMUS_PATH}:${PRIMUS_PATH}/third_party/Megatron-LM:${PYTHO
+ export EXP=${PRIMUS_PATH}/examples/mlperf/llama3.1_8b/configs/MI355X/llama3.1_8B-pretrain-FP4.yaml
+ export DATA_PATH=/data
+ 
+-export PRIMUS_MICRO_BATCH_SIZE=2
++export PRIMUS_MICRO_BATCH_SIZE=${PRIMUS_MICRO_BATCH_SIZE:-4}  # HPE: grad-accum 1 (+3.5% on v6.0)
+ export PRIMUS_GLOBAL_BATCH_SIZE=32
+ export PRIMUS_LR=8e-4
+ export PRIMUS_MIN_LR=8e-5
+@@ -78,7 +78,7 @@ export MLLOG_TENSOR_PARALLELISM=1
+ export MLLOG_PIPELINE_PARALLELISM=1
+ export MLLOG_CONTEXT_PARALLELISM=1
+ export MLLOG_EXPERT_PARALLELISM=1
+-export MLLOG_MICRO_BATCH_SIZE=2
++export MLLOG_MICRO_BATCH_SIZE=${PRIMUS_MICRO_BATCH_SIZE}  # HPE: must mirror the real micro-batch
+ MLLOG_CONFIG_FILENAME=$(basename "${BASH_SOURCE[0]}")
+ export MLLOG_CONFIG_FILENAME
+ export MLLOG_LOWEST_NUMERICAL_PRECISION_LINEAR='mxfp4'
+@@ -113,3 +113,4 @@ export HSA_ENABLE_SDMA_OPTIMIZATIONS=1
+ export PYTORCH_ROC_ALLOC_CONF=expandable_segments:True
+ export HIP_API_BLOCKING=0
+ export PYTORCH_NO_CUDA_MEMORY_CACHING=0
++export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-1}  # HPE: pin each rank to its GPU NUMA node (+1.8% on v6.0)
+diff --git a/examples/mlperf/llama3.1_8b/configs/MI355X/llama3.1_8B-pretrain-FP4.yaml b/examples/mlperf/llama3.1_8b/configs/MI355X/llama3.1_8B-pretrain-FP4.yaml
+index db2e3122..b365f031 100644
+--- a/examples/mlperf/llama3.1_8b/configs/MI355X/llama3.1_8B-pretrain-FP4.yaml
++++ b/examples/mlperf/llama3.1_8b/configs/MI355X/llama3.1_8B-pretrain-FP4.yaml
+@@ -103,7 +103,7 @@ modules:
+       fp4_recipe: mxfp4
+       accumulate_allreduce_grads_in_fp32: false
+       grad_reduce_in_bf16: true
+-      attention_softmax_in_fp32: false
++      attention_softmax_in_fp32: true   # HPE: our softmax32 setting (best v6.0 set, 86.21 min)
+ 
+ 
+       # --- Primus Turbo Config ---

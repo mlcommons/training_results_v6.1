@@ -1,0 +1,23 @@
+## Steps to launch training
+
+### hecate_ngpu8_ngc26.09_nemo_plus
+
+Launch configuration and system-specific hyperparameters for the
+hecate_ngpu8_ngc26.09_nemo_plus submission are in the
+`benchmarks/gpt_oss_20b/implementations/hecate_ngpu8_ngc26.09_nemo_plus/config_VR_2x4x3xtp1pp1cp1ep1_mxfp8.sh` script.
+
+Steps required to launch training for hecate_ngpu8_ngc26.09_nemo_plus.  The sbatch
+script assumes a cluster running Slurm with the Pyxis containerization plugin.
+
+1. Build the docker container and push to a docker registry
+
+```
+docker build --pull -t <docker/registry:benchmark-tag> .
+docker push <docker/registry:benchmark-tag>
+```
+
+2. Launch the training
+```
+source config_VR_2x4x3xtp1pp1cp1ep1_mxfp8.sh
+CONT=<docker/registry:benchmark-tag> DATADIR=<path/to/data/dir> LOGDIR=<path/to/output/dir> sbatch --segment=${SEGMENT} -N ${DGXNNODES} -t ${WALLTIME} run.sub
+```

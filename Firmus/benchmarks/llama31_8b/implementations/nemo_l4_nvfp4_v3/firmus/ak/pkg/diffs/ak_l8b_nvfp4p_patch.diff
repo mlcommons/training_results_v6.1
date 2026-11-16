@@ -1,0 +1,282 @@
+--- a/ak_l8b_nvfp4p_patch.py (validated 07ac727d6244dbd5)
++++ b/ak_l8b_nvfp4p_patch.py (L4)
+@@ -69,7 +69,7 @@
+ Here `ak_l8b_nvfp4p.swiglu_amax` / `.dswiglu_amax` compute the same BF16 result with TE's arithmetic and both amaxes in
+ the same pass, and `tex.nvfp4_quantize_with_amax` runs TE's own cast with them: the amax pass is gone.
+ 
+-Armed by AK_NVFP4P=1 in the training entry point.  Only the recipe's quantizer configuration takes the new path (NVFP4,
++Armed by AK_NVFP4P=1 alone (firmus_ak).  Only the recipe's quantizer configuration takes the new path (NVFP4,
+ RHT with post-RHT amax, 1D, no 4over6 / row scaling / amax reduction, BF16 contiguous input, rows % 32 == 0 and
+ N % 256 == 0); anything else calls TE unchanged.  The first eager call of each (op, usage) pair is checked against TE's
+ own call on the same inputs, every buffer of the quantized result as bytes (row and column data, scales, amaxes), with
+@@ -166,7 +166,7 @@
+ import os
+ import sys
+ 
+-_ARMED = os.environ.get("AK_NVFP4P", "0") == "1" and "pretrain" in os.path.basename(sys.argv[0] if sys.argv else "")
++_ARMED = os.environ.get("AK_NVFP4P", "0") == "1"
+ _STATE = {"checked": set(), "fast_calls": 0, "ext": None}
+ # kernel version of the SwiGLU pair (job 19966: v1 446.8 / 243.5 us, v2 497.0 / 242.2 us for dSwiGLU / SwiGLU; v4 the
+ # padded staging; v6 the epilogue of ak_l8b_rht_epi.cuh; v7 = dSwiGLU in warp-owned blocks, SwiGLU as v6)
+@@ -182,7 +182,7 @@
+ 
+ def _ext():
+     if _STATE["ext"] is None:
+-        d = os.environ.get("AK_NVFP4P_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p/ext")
++        d = os.environ.get("AK_NVFP4P_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_nvfp4p
+@@ -192,7 +192,7 @@
+ 
+ def _ext_norm():
+     if _STATE.get("ext_norm") is None:
+-        d = os.environ.get("AK_NVFP4P_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p/ext")
++        d = os.environ.get("AK_NVFP4P_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_nvfp4n
+@@ -202,7 +202,7 @@
+ 
+ def _ext_w():
+     if _STATE.get("ext_w") is None:
+-        d = os.environ.get("AK_NVFP4P_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p/ext")
++        d = os.environ.get("AK_NVFP4P_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_nvfp4w
+@@ -211,45 +211,25 @@
+ 
+ 
+ def _ext_s():
+-    if _STATE.get("ext_s") is None:
+-        d = os.environ.get("AK_NVFP4P_SR_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4s/ext")
++    # L4: ak_l8b_nvfp4s (AK_NVFP4P_SR) is not part of this build; the import-time check below refuses the switch
++    raise RuntimeError("[auto_kernel nvfp4p] ak_l8b_nvfp4s is not part of this build (AK_NVFP4P_SR)")
++
++
++_BX_ON = os.environ.get("AK_NVFP4P_BX", "0") == "1"           # version 21: ak_l8b_nvfp4bx in place of ak_l8b_nvfp4b
++_RAVER = int(os.environ.get("AK_NVFP4P_RHTAMAX_VER", "2"))     # version 21: 3 = rht_amax_kernel_r2 (persistent)
++
++
++def _ext_b():
++    if _STATE.get("ext_b") is None:
++        if not _BX_ON:  # L4: ak_l8b_nvfp4b is not part of this build (ak_l8b_nvfp4bx carries its kernels)
++            raise RuntimeError("[auto_kernel nvfp4p] ak_l8b_nvfp4b is not part of this build: AK_NVFP4P_BX=1 is "
++                               "required")
++        d = os.environ.get("AK_NVFP4P_BX_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+-        import ak_l8b_nvfp4s
+-        _STATE["ext_s"] = ak_l8b_nvfp4s
+-    return _STATE["ext_s"]
+-
+-
+-_BX_ON = os.environ.get("AK_NVFP4P_BX", "0") == "1"           # version 21: ak_l8b_nvfp4bx in place of ak_l8b_nvfp4b
+-_RAVER = int(os.environ.get("AK_NVFP4P_RHTAMAX_VER", "2"))     # version 21: 3 = rht_amax_kernel_r2 (persistent)
+-
+-
+-def _ext_b():
+-    if _STATE.get("ext_b") is None:
+-        if _BX_ON:
+-            d = os.environ.get("AK_NVFP4P_BX_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p21/ext")
+-            if d not in sys.path:
+-                sys.path.insert(0, d)
+-            import ak_l8b_nvfp4bx
+-            _STATE["ext_b"] = ak_l8b_nvfp4bx
+-            return _STATE["ext_b"]
+-        d = os.environ.get("AK_NVFP4P_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p/ext")
+-        if d not in sys.path:
+-            sys.path.insert(0, d)
+-        import ak_l8b_nvfp4b
+-        _STATE["ext_b"] = ak_l8b_nvfp4b
++        import ak_l8b_nvfp4bx
++        _STATE["ext_b"] = ak_l8b_nvfp4bx
+     return _STATE["ext_b"]
+-
+-
+-def _ext_wq():
+-    if _STATE.get("ext_wq") is None:
+-        d = os.environ.get("AK_NVFP4P_WQ_EXT_DIR", os.environ.get("AK_NVFP4P_EXT_DIR",
+-                                                                   "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p/ext"))
+-        if d not in sys.path:
+-            sys.path.insert(0, d)
+-        import ak_l8b_wq
+-        _STATE["ext_wq"] = ak_l8b_wq
+-    return _STATE["ext_wq"]
+ 
+ 
+ # version 6: the RMSNorm backward + residual add + amaxes (ak_l8b_nvfp4b kernel version; TE's CTAs per SM for its tuned
+@@ -311,7 +291,7 @@
+ 
+ 
+ def _fp4g():
+-    """version 13g: the FP4G overlay's module when it is armed (its .pth sorts before this patch's), else None"""
++    """version 13g: the FP4G overlay's module when it is armed (firmus_ak imports it before this patch), else None"""
+     m = sys.modules.get("ak_l8b_fp4g_patch")
+     return m if (m is not None and getattr(m, "_ARMED", False)) else None
+ 
+@@ -336,10 +316,9 @@
+     if _w2d_ok(tensor, q, row, col):
+         _w2d_cast(tensor, output._rowwise_data, output._rowwise_scale_inv, output._columnwise_data if col else e,
+                   output._columnwise_scale_inv if col else e, a, swz)
+-    else:
+-        _ext_wq().quantize_2d_into(tensor, int(q.dtype), output._rowwise_data if row else e,
+-                                   output._rowwise_scale_inv if row else e, output._columnwise_data if col else e,
+-                                   output._columnwise_scale_inv if col else e, a, swz, int(q.nvfp4_e4m3_max))
++    else:  # L4: ak_l8b_wq is not part of this build; _wq_slot admits only the weights ak_l8b_w2d7 covers
++        raise RuntimeError("[auto_kernel nvfp4p] a module weight workspace outside ak_l8b_w2d7's cases reached the "
++                           "in-place cast ({} row {} col {})".format(list(tensor.shape), row, col))
+     if row:
+         output._amax_rowwise = a
+     if col:
+@@ -383,10 +362,7 @@
+             bad.append((tag, {kk.lstrip("_"): vv for kk, vv in ok.items() if not vv}))
+     good = not bad
+     if _rank() == 0:
+-        import hashlib
+-        path = _ext_wq().__file__
+-        te_cast = "TE's 2D cast (nvte_quantize_v2, module {} sha256={})".format(
+-            os.path.basename(path), hashlib.sha256(open(path, "rb").read()).hexdigest()[:16])
++        te_cast = "TE's 2D cast (tex.quantize)"   # L4: ak_l8b_wq dropped; such workspaces stay on TE's own path
+         if ours:
+             cast = "our 2D cast into {} of them ({}; variants {}), {} into the other {}; no amax pass".format(
+                 ours, _w2d_desc(), sorted({_w2d_pick(*w.shape) for _, (w, _r, _c, _o, _q) in todo}), te_cast,
+@@ -449,7 +425,7 @@
+         raise RuntimeError("[auto_kernel nvfp4p] a second DistributedOptimizer instance: the weight-amax buffer covers one")
+     _STATE["wamax_calls"] += 1
+     if _WQ_ON:
+-        _ext_wq()                   # loaded eagerly: its first call is inside the training graph's capture
++        _ext_2d()                   # loaded eagerly: its first call is inside the training graph's capture (L4: w2d7)
+     cptr, clen, cslot = _STATE["wamax_table"]
+     if getattr(opt, "_ak_x9_wamax_done", False):
+         # version 10: the fused AdamW step (x9step3, AK_X9_WAMAX=1) already folded this rank's shard amaxes into the
+@@ -545,24 +521,14 @@
+ _RHTCAST_ON = os.environ.get("AK_NVFP4P_RHTCAST", "0") == "1"
+ # (width, SR) -> (variant, tokens per tile): the fastest exact variant of each recipe call in the dev tests (job 20771,
+ # us per call v TE's: 4096 RN 37.3 v 41.3, 4096 SR 48.1 v 56.0, 6144 SR 67.5 v 78.4, 14336 RN 112.6 v 118.8,
+-# 28672 SR 272.1 v 293.9); other widths take the default of their rounding.  AK_NVFP4P_RHTCAST_FORCE=<variant>:<tile>
+-# forces one for every call (the first-call check still decides).
++# 28672 SR 272.1 v 293.9); other widths take the default of their rounding.  (L4, C2: the
++# development override that forced one variant for every call is not read.)
+ _RHTCAST_TABLE = {(4096, False): (70, 256), (4096, True): (79, 512), (6144, True): (79, 256),
+                   (14336, False): (103, 256), (28672, True): (99, 1024)}
+ _RHTCAST_DEFAULT = {False: (70, 256), True: (79, 512)}
+-_RHTCAST_FORCE = os.environ.get("AK_NVFP4P_RHTCAST_FORCE", "")
++_RHTCAST_FORCE = ""          # L4 (C2): the development override is not read; the table decides
+ _FAST_MATH = os.environ.get("NVTE_USE_FAST_MATH", "0") not in ("", "0")
+ _STATE.update({"rhtcast_checked": set(), "rhtcast_calls": 0, "rhtcast_capture_fallback": 0, "rhtcast_results": {}})
+-
+-
+-def _ext_r():
+-    if _STATE.get("ext_r") is None:
+-        d = os.environ.get("AK_NVFP4P_RHTCAST_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p12/ext")
+-        if d not in sys.path:
+-            sys.path.insert(0, d)
+-        import ak_l8b_rht6
+-        _STATE["ext_r"] = ak_l8b_rht6
+-    return _STATE["ext_r"]
+ 
+ 
+ # ---- version 14: the training norms' apply rescheduled or folded into the RHT cast (AK_NVFP4P_NORMCAST; ak_l8b_rht7) --
+@@ -594,7 +560,7 @@
+ 
+ def _ext_r8():
+     if _STATE.get("ext_r8") is None:
+-        d = os.environ.get("AK_NVFP4P_RHT8_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p20/ext")
++        d = os.environ.get("AK_NVFP4P_RHT8_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_rht8
+@@ -604,7 +570,7 @@
+ 
+ def _ext_r7():
+     if _STATE.get("ext_r7") is None:
+-        d = os.environ.get("AK_NVFP4P_NORMCAST_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p14/ext")
++        d = os.environ.get("AK_NVFP4P_NORMCAST_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_rht7
+@@ -668,7 +634,7 @@
+     """the extension module a cast of this (width, SR, variant) runs in"""
+     if _rhtcast_r8(width, sr):
+         return _ext_r8()
+-    return _ext_r7() if _rhtcast_vp(sr, var) else _ext_r()
++    return _ext_r7()                       # L4: _rhtcast sends every other cast to TE (ak_l8b_rht6 dropped)
+ 
+ 
+ def _rhtcast_ok(x, q, a_pre, a_post):
+@@ -703,11 +669,13 @@
+ 
+ def _rhtcast(tex, x, q, a_pre, a_post):
+     """tex.nvfp4_quantize_with_amax (cast.cpp:93-136) with the cast ours: the output from the quantizer's own
+-    create_tensor, its amaxes set to the given tensors (as TE sets them), ak_l8b_rht6's copy of TE's fused kernel; None
+-    when the output would not take GEMM-swizzled scales (TE then runs)"""
++    create_tensor, its amaxes set to the given tensors (as TE sets them), ak_l8b_rht8's (or rht7's) copy of TE's fused
++    kernel; None when the output would not take GEMM-swizzled scales or neither module covers the cast (TE then runs)"""
+     h = x.size(-1)
+     sr = bool(getattr(q, "stochastic_rounding", False))
+     var, kt = _rhtcast_pick(h, sr)
++    if not _rhtcast_r8(h, sr) and not _rhtcast_vp(sr, var):
++        return None                          # L4: ak_l8b_rht6 is not part of this build: TE's cast
+     out = tex.create_empty_quantized_tensor(q, list(x.shape), x.dtype, x.device, False)
+     if getattr(out, "_with_gemm_swizzled_scales", None) is not True:
+         return None
+@@ -723,9 +691,7 @@
+         _ext_r7().rht_cast_vp(x.view(-1, h), a_pre, a_post, out._rowwise_data, out._rowwise_scale_inv,
+                               out._columnwise_data, out._columnwise_scale_inv, q.rht_matrix, sr, kt, var)
+         return out
+-    _ext_r().rht_cast_v(x.view(-1, h), a_pre, a_post, out._rowwise_data, out._rowwise_scale_inv, out._columnwise_data,
+-                        out._columnwise_scale_inv, q.rht_matrix, sr, kt, var)
+-    return out
++    raise RuntimeError("[auto_kernel nvfp4p] an RHT cast outside ak_l8b_rht8 / ak_l8b_rht7 reached the cast")
+ 
+ 
+ def _make_rhtcast(tex, te_cast):
+@@ -788,13 +754,13 @@
+ _W2D_ON = os.environ.get("AK_NVFP4P_W2D", "0") == "1"
+ _W2D_TABLE = {(6144, 4096): 23, (4096, 4096): 23, (28672, 4096): 21, (4096, 14336): 23}
+ _W2D_DEFAULT = 23
+-_W2D_FORCE = os.environ.get("AK_NVFP4P_W2D_FORCE", "")
++_W2D_FORCE = ""              # L4 (C2): the development override is not read; the table decides
+ _STATE.update({"w2d_calls": 0})
+ 
+ 
+ def _ext_2d():
+     if _STATE.get("ext_2d") is None:
+-        d = os.environ.get("AK_NVFP4P_W2D_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/nvfp4p13/ext")
++        d = os.environ.get("AK_NVFP4P_W2D_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_w2d7
+@@ -892,6 +858,21 @@
+         out[k] = _same(getattr(ref, k, None), getattr(new, k, None))
+     return out
+ 
++
++# L4 (2026-10-09, C5 fail early): the extensions dropped from this build (ak_l8b_wq, ak_l8b_rht6, ak_l8b_nvfp4b,
++# ak_l8b_nvfp4s) leave switches that would otherwise run silently on TE's path; an armed patch refuses them here.
++if _ARMED:
++    if _SR_ON:
++        raise RuntimeError("[auto_kernel nvfp4p] AK_NVFP4P_SR=1: ak_l8b_nvfp4s is not part of this build")
++    if (_BWD_ON or _RHTAMAX_ON) and not _BX_ON:
++        raise RuntimeError("[auto_kernel nvfp4p] AK_NVFP4P_BWDNORM / AK_NVFP4P_RHTAMAX need AK_NVFP4P_BX=1: "
++                           "ak_l8b_nvfp4b is not part of this build")
++    if _WQ_ON and not _W2D_ON:
++        raise RuntimeError("[auto_kernel nvfp4p] AK_NVFP4P_WQ=1 needs AK_NVFP4P_W2D=1: ak_l8b_wq is not part of "
++                           "this build")
++    if _RHTCAST_ON and not _RHT8_ON:
++        raise RuntimeError("[auto_kernel nvfp4p] AK_NVFP4P_RHTCAST=1 needs AK_NVFP4P_RHT8=1: ak_l8b_rht6 is not "
++                           "part of this build")
+ 
+ if _ARMED:
+     import importlib.abc
+@@ -1292,6 +1273,8 @@
+                 return None
+             if bool(getattr(quantizer, "optimize_for_gemm", False)) and not _wq_swizzled(quantizer, n, k):
+                 return None              # TE swizzles the scales after the cast
++            if not _w2d_ok(tensor, quantizer, row, col):
++                return None              # L4: TE's own quantize (ak_l8b_wq dropped); the recipe's are all w2d7's
+             return _STATE["wamax_slot"].get((tensor.data_ptr(), tensor.numel()))
+ 
+         def _weight_ok(tensor, quantizer, output, noop):

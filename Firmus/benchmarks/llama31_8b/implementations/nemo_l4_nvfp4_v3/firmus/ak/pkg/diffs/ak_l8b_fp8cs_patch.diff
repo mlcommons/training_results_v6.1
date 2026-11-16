@@ -1,0 +1,28 @@
+--- a/ak_l8b_fp8cs_patch.py (validated f54467d05ef03033)
++++ b/ak_l8b_fp8cs_patch.py (L4)
+@@ -25,13 +25,13 @@
+ quantize of the written buffer and the amax with the written path's (the partials themselves are reported).
+ The output is what tex.quantize allocates (tex.create_empty_quantized_tensor) with _data and _scale_inv filled.  The
+ first eager call of each (path, shape, format) is checked against TE's tex.quantize on the same tensor (FP8 data,
+-scale_inv, transpose, type) as bytes; rank 0 prints the proof line, a mismatch raises.  Loaded by zz-ak-l8b-fp8cs.pth;
+-armed by AK_FP8CS=1 in the training entry point.  AK_FP8CS_EXT_DIR names the directory holding ak_l8b_fp8q*.so.
++scale_inv, transpose, type) as bytes; rank 0 prints the proof line, a mismatch raises.  Loaded by `import firmus_ak`;
++armed by AK_FP8CS=1 alone.  AK_FP8CS_EXT_DIR names the directory holding ak_l8b_fp8q*.so.
+ """
+ import os
+ import sys
+ 
+-_ARMED = os.environ.get("AK_FP8CS", "0") == "1" and "pretrain" in os.path.basename(sys.argv[0] if sys.argv else "")
++_ARMED = os.environ.get("AK_FP8CS", "0") == "1"
+ _STATE = {"checked": set(), "ext": None, "calls": {"partials": 0, "amax": 0}}
+ # the amax path (dO): ak_l8b_fp8q.amax_cast; the q|k|v cast's and the amax path's launch shapes (dev f1 / f2)
+ _AMAX_PATH = os.environ.get("AK_FP8CS_AMAX", "0") == "1"
+@@ -49,7 +49,7 @@
+ 
+ def _ext():
+     if _STATE["ext"] is None:
+-        d = os.environ.get("AK_FP8CS_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/fp8cs2/ext")
++        d = os.environ.get("AK_FP8CS_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_fp8q

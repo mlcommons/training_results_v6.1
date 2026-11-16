@@ -1,0 +1,46 @@
+# llama31_8b dataset (pre-tokenized C4, ~80 GB) + tokenizer/model (~30 GB) into the shared
+# RWX volume, via the MLCommons R2 downloader (public; no auth for these two URIs).
+# Lands at <pvc>/datasets/llama31_8b/{data,model}; the trainer mounts them at /data and /model.
+#   kubectl --context <ctx> -n <ns> apply -f prep-data-8b.yaml
+#   kubectl --context <ctx> -n <ns> logs -f job/prep-llama31-8b-data
+# Idempotent: wget --continue + md5 verification, so a re-apply resumes a partial download.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prep-llama31-8b-data
+  labels: { app: llama-v61, role: data-prep }
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: { labels: { app: llama-v61, role: data-prep } }
+    spec:
+      restartPolicy: Never
+      # any node without GPUs is fine; this is network + disk only
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions: [{ key: amd.com/gpu.product-name, operator: DoesNotExist }]
+      containers:
+        - name: dl
+          image: mirror.gcr.io/library/ubuntu:24.04
+          command: ["/bin/bash","-c"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq wget curl ca-certificates >/dev/null
+              R2=https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh
+              M=https://training.mlcommons-storage.org/metadata
+              D=/shared/datasets/llama31_8b; mkdir -p $D/data $D/model; cd $D
+              bash <(curl -fsSL $R2) -j 4 -d $D/data  $M/llama-3-1-8b-preprocessed-c4-dataset.uri
+              bash <(curl -fsSL $R2) -j 8 -d $D/model $M/llama-3-1-8b-tokenizer.uri
+              echo "--- tree"; find $D -maxdepth 3 -type f -printf '%s\t%p\n' | sort -k2 | awk '{printf "%8.1f GB  %s\n", $1/1e9, $2}'
+              date -u +%FT%TZ > $D/.complete
+          resources:
+            requests: { cpu: "2", memory: 4Gi }
+            limits:   { cpu: "3", memory: 12Gi }
+          volumeMounts: [{ name: shared, mountPath: /shared }]
+      volumes:
+        - name: shared
+          persistentVolumeClaim: { claimName: mlperf-training-shared }

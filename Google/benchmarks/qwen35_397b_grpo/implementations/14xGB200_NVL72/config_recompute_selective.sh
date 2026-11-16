@@ -1,0 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+export ACTIVATION_CHECKPOINTING=${ACTIVATION_CHECKPOINTING:-true}
+export RECOMPUTE_GRANULARITY=${RECOMPUTE_GRANULARITY:-selective}
+export RECOMPUTE_MODULES=${RECOMPUTE_MODULES:-"[layernorm,attention,gdn,moe_act,shared_experts]"}
+export MOE_SHARED_EXPERT_OVERLAP=${MOE_SHARED_EXPERT_OVERLAP:-false}

@@ -1,0 +1,3810 @@
+diff --git a/transformer_engine/pytorch/graph.py b/transformer_engine/pytorch/graph.py
+index 86b8a4acf404e97a1ddc4a03595e337f649c1d95..18e4b2daf7fd012e6372d2c94467ce672cd07fd7 100644
+--- a/transformer_engine/pytorch/graph.py
++++ b/transformer_engine/pytorch/graph.py
+@@ -6,6 +6,7 @@
+ from collections.abc import Iterable
+ import contextlib
+ import gc
++import os
+ import warnings
+ from math import ceil
+ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+@@ -559,6 +560,22 @@ def _make_graphed_callables(
+     # the safest approach is to capture all passes in the same order they'll run:
+     # fwd 1, fwd 2, ... fwd N, then bwd N, bwd N-1, ... bwd 1.
+ 
++    # Within one chunk and microbatch, layer l+1's first input is layer l's first output and
++    # layer l's first grad output is layer l+1's first grad input. Aliasing those static
++    # buffers lets replay skip the copies between consecutive layer graphs.
++    chain_io = (
++        os.environ.get("NVFP4_GRAPH_CHAIN_IO", "0") == "1" and _order is not None and is_training
++    )
++
++    def _chainable(prev, cur):
++        return (
++            isinstance(prev, torch.Tensor)
++            and isinstance(cur, torch.Tensor)
++            and prev.shape == cur.shape
++            and prev.dtype == cur.dtype
++            and prev.stride() == cur.stride()
++        )
++
+     if _order is not None:  # pylint: disable=too-many-nested-blocks
+         per_callable_static_outputs = [None] * len(flatten_sample_args)
+         per_callable_output_unflatten_spec = [None] * len(flatten_sample_args)
+@@ -582,6 +599,22 @@ def _make_graphed_callables(
+                     per_callable_fwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
+                         fwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
+                     )
++                    if chain_io and l_no > 0:
++                        prev_out = per_callable_static_outputs[per_callable_fwd_idx - 1][0]
++                        cur = flatten_sample_args[per_callable_fwd_idx][0]
++                        shared = sum(1 for s in flatten_sample_args if s and s[0] is cur) > 1
++                        if not shared and _chainable(prev_out, cur):
++                            alias = prev_out.detach().requires_grad_(cur.requires_grad)
++                            alias._te_chain_alias = True
++                            sample_args[per_callable_fwd_idx] = (alias,) + tuple(
++                                sample_args[per_callable_fwd_idx][1:]
++                            )
++                            flatten_sample_args[per_callable_fwd_idx] = (
++                                alias,
++                            ) + flatten_sample_args[per_callable_fwd_idx][1:]
++                            per_callable_static_input_surfaces[per_callable_fwd_idx] = (
++                                alias,
++                            ) + per_callable_static_input_surfaces[per_callable_fwd_idx][1:]
+                     args = sample_args[per_callable_fwd_idx]
+                     kwargs = sample_kwargs[per_callable_fwd_idx]
+                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
+@@ -682,6 +715,16 @@ def _make_graphed_callables(
+                             torch.empty_like(o) if o is not None and o.requires_grad else None
+                             for o in static_outputs
+                         )
++                    if chain_io and l_no < _num_layers_per_chunk[m_chunk] - 1:
++                        next_grad_inputs = per_callable_static_grad_inputs[
++                            per_callable_bwd_idx + 1
++                        ]
++                        next_grad = next_grad_inputs[0] if next_grad_inputs else None
++                        if static_grad_outputs[0] is not None and _chainable(
++                            next_grad, static_grad_outputs[0]
++                        ):
++                            next_grad._te_chain_alias = True
++                            static_grad_outputs = (next_grad,) + tuple(static_grad_outputs[1:])
+                     if is_training:
+                         inputs = tuple(i for i in static_input_surface if i.requires_grad)
+                         with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
+@@ -826,6 +869,10 @@ def _make_graphed_callables(
+         static_grad_outputs,
+         static_grad_inputs,
+     ):
++        # Inputs tagged `_te_graph_const` are never written after creation, so a static
++        # buffer that already holds one (same storage, same version) needs no new copy.
++        const_input_src = [None] * len_user_args
++
+         class Graphed(torch.autograd.Function):
+             """Autograd function for graph replay."""
+ 
+@@ -845,6 +892,16 @@ def _make_graphed_callables(
+                         isinstance(static_input_surface[i], torch.Tensor)
+                         and static_input_surface[i].data_ptr() != inputs[i].data_ptr()
+                     ):
++                        if getattr(inputs[i], "_te_graph_const", False):
++                            src = (inputs[i].data_ptr(), inputs[i]._version)
++                            if const_input_src[i] == src:
++                                continue
++                            const_input_src[i] = src
++                        if getattr(static_input_surface[i], "_te_chain_alias", False):
++                            raise RuntimeError(
++                                "NVFP4_GRAPH_CHAIN_IO: graph input is not the previous layer "
++                                "graph's output; the aliased buffer would be overwritten."
++                            )
+                         static_input_surface[i].copy_(inputs[i])
+ 
+                 # Replay forward graph
+@@ -882,6 +939,11 @@ def _make_graphed_callables(
+                         # don't copy if autograd gods have been kind and the
+                         # incoming grad is already in the right place
+                         if g.data_ptr() != grad.data_ptr():
++                            if getattr(g, "_te_chain_alias", False):
++                                raise RuntimeError(
++                                    "NVFP4_GRAPH_CHAIN_IO: grad output is not the next layer "
++                                    "graph's grad input; the aliased buffer would be overwritten."
++                                )
+                             g.copy_(grad)
+                 if ctx.cuda_graph_stream != torch.cuda.current_stream():
+                     ctx.cuda_graph_stream.wait_stream(torch.cuda.current_stream())
+diff --git a/transformer_engine/pytorch/ops/basic/nvfp4_lmhead_mxfp8.py b/transformer_engine/pytorch/ops/basic/nvfp4_lmhead_mxfp8.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bb1d0722eb916d9b5bf23a80f3ea445e9610890
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/basic/nvfp4_lmhead_mxfp8.py
+@@ -0,0 +1,119 @@
++"""Run the GPT LM head (output_layer) under MXFP8 while the model trains in NVFP4.
++
++Megatron's own ``fp8_output_proj`` needs ``fp8=True`` with the mxfp8 recipe,
++which cannot be combined with fp4. Instead the existing ColumnParallelLinear
++keeps its parameter (same state-dict key, optimizer and DDP buffers) and only
++its forward is rerouted through a TE Linear that shares the weight Parameter
++and is not registered as a submodule.
++"""
++
++import os
++
++import torch
++import transformer_engine.pytorch as te
++from transformer_engine.common import recipe as te_recipe
++
++_FORMATS = {"e4m3": te_recipe.Format.E4M3, "hybrid": te_recipe.Format.HYBRID}
++
++
++def _recipe():
++    fmt = os.environ.get("NVFP4_LMHEAD_MXFP8_FORMAT", "e4m3")
++    return te_recipe.MXFP8BlockScaling(fp8_format=_FORMATS[fmt])
++
++
++def patch_output_layer(layer, gradient_accumulation_fusion=None):
++    """Reroute ``layer.forward`` (a TP=1 ColumnParallelLinear without bias) to MXFP8."""
++    weight = layer.weight
++    out_features, in_features = weight.shape
++    if getattr(layer, "tp_size", 1) != 1 or getattr(layer, "sequence_parallel", False):
++        raise RuntimeError("MXFP8 LM head supports TP=1 without sequence parallel only")
++    if getattr(layer, "bias", None) is not None:
++        raise RuntimeError("MXFP8 LM head expects bias=False")
++    if in_features % 32 or out_features % 32:
++        raise RuntimeError(f"MXFP8 needs dims divisible by 32, got {tuple(weight.shape)}")
++    if gradient_accumulation_fusion is None:
++        gradient_accumulation_fusion = bool(getattr(layer, "gradient_accumulation_fusion", False))
++
++    helper = te.Linear(
++        in_features,
++        out_features,
++        bias=False,
++        params_dtype=weight.dtype,
++        device="meta",
++        fuse_wgrad_accumulation=gradient_accumulation_fusion,
++    )
++    helper.weight = weight
++    recipe = _recipe()
++    output_dtype = getattr(layer, "output_dtype", None)
++    # full: MXFP8 fprop/dgrad/wgrad. fprop: MXFP8 fprop with BF16 dgrad/wgrad (MXFP8
++    # gradients through the LM head degrade convergence). fwd / bwd are convergence
++    # diagnostics that run both a BF16 and an MXFP8 GEMM and take only the forward value
++    # or only the gradient from MXFP8.
++    mode = os.environ.get("NVFP4_LMHEAD_MXFP8_MODE", "full")
++    if mode not in ("full", "fprop", "fwd", "bwd"):
++        raise RuntimeError(f"NVFP4_LMHEAD_MXFP8_MODE={mode!r}")
++
++    def _mx(x):
++        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
++            return helper(x)
++
++    class _Fprop(torch.autograd.Function):
++        @staticmethod
++        def forward(ctx, x, w):
++            ctx.save_for_backward(x, w)
++            return _mx(x)
++
++        @staticmethod
++        def backward(ctx, dy):
++            x, w = ctx.saved_tensors
++            dy2 = dy.reshape(-1, dy.shape[-1])
++            dx = (dy2 @ w).reshape(x.shape)
++            dw = dy2.t() @ x.reshape(-1, x.shape[-1])
++            return dx, dw
++
++    def forward(input_, weight=None, runtime_gather_output=None):
++        if weight is not None and weight is not layer.weight:
++            raise RuntimeError("MXFP8 LM head does not support a runtime weight")
++        if mode == "full":
++            out = _mx(input_)
++        elif mode == "fprop":
++            out = _Fprop.apply(input_, layer.weight)
++        elif mode == "fwd":
++            ref = torch.nn.functional.linear(input_, layer.weight)
++            with torch.no_grad():
++                q = _mx(input_)
++            out = ref + (q - ref).detach()
++        else:
++            q = _mx(input_)
++            with torch.no_grad():
++                ref = torch.nn.functional.linear(input_, layer.weight)
++            out = q + (ref - q).detach()
++        if output_dtype is not None and out.dtype != output_dtype:
++            out = out.to(output_dtype)
++        return out, None
++
++    object.__setattr__(layer, "_nvfp4_mxfp8_helper", helper)
++    layer.forward = forward
++    return layer
++
++
++def install():
++    """Patch GPTModel.__init__ so every post-process stage gets the MXFP8 LM head."""
++    from megatron.core.models.gpt.gpt_model import GPTModel
++
++    orig_init = GPTModel.__init__
++
++    def init(self, *args, **kwargs):
++        orig_init(self, *args, **kwargs)
++        layer = getattr(self, "output_layer", None)
++        if self.post_process and layer is not None and not self.share_embeddings_and_output_weights:
++            patch_output_layer(layer, self.config.gradient_accumulation_fusion)
++            if int(os.environ.get("RANK", "0")) == 0:
++                print(
++                    f"NVFP4 LM head MXFP8 ({os.environ.get('NVFP4_LMHEAD_MXFP8_FORMAT', 'e4m3')}, "
++                    f"mode={os.environ.get('NVFP4_LMHEAD_MXFP8_MODE', 'full')}) "
++                    f"weight {tuple(layer.weight.shape)} gaf={self.config.gradient_accumulation_fusion}",
++                    flush=True,
++                )
++
++    GPTModel.__init__ = init
+diff --git a/transformer_engine/pytorch/ops/basic/nvfp4_swa_attention.py b/transformer_engine/pytorch/ops/basic/nvfp4_swa_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..691fd768929606d000608362f8d4aa9f0668de8d
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/basic/nvfp4_swa_attention.py
+@@ -0,0 +1,562 @@
++"""Triton sliding-window attention with learnable softmax sinks (GPT-OSS SWA layers).
++
++Semantics match TE DotProductAttention(softmax_type="learnable", window_size=(W, 0),
++attn_mask_type="causal", qkv_format="sbhd"): query i attends keys [i - W, i]; the
++per-head sink is an extra logit column (in scaled-logit units) that joins the
++softmax and carries no value. GQA: head h reads KV group h // (H // G).
++
++Backward is deterministic: dK/dV programs own a key block and loop over the
++query heads of their group; the sink gradient is written as per-program partials.
++"""
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++_LOG2E = 1.4426950408889634
++
++
++def _cfg(name, default):
++    """(BLOCK_M, BLOCK_N, num_warps, num_stages) from NVFP4_SWA_<name>=m,n,w,s."""
++    return tuple(int(x) for x in os.environ.get(f"NVFP4_SWA_{name}", default).split(","))
++
++
++CFG = {"FWD": _cfg("FWD", "64,32,4,3"), "DKDV": _cfg("DKDV", "64,64,4,2"), "DQ": _cfg("DQ", "64,32,4,2")}
++# Packed kernels: (HP, BMQ, BLOCK_N, num_warps, num_stages) from NVFP4_SWA_P<name>.
++PACKED = [os.environ.get("NVFP4_SWA_PACKED", "1") == "1"]
++PCFG = {"FWD": _cfg("PFWD", "4,32,32,4,3"), "DKDV": _cfg("PDKDV", "2,32,64,4,2"), "DQ": _cfg("PDQ", "4,32,32,4,3")}
++
++
++@triton.jit
++def _swa_fwd(
++    Q, K, V, SINK, O, LSE,
++    sq_s, sq_b, sq_h, sk_s, sk_b, sk_h, sv_s, sv_b, sv_h, so_s, so_b, so_h,
++    S, qk_scale,
++    H: tl.constexpr, G: tl.constexpr, WINDOW: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_bh = tl.program_id(1)
++    b = pid_bh // H
++    h = pid_bh % H
++    g = h // (H // G)
++    start = pid_m * BLOCK_M
++    offs_m = start + tl.arange(0, BLOCK_M)
++    offs_d = tl.arange(0, D)
++    row_ok = offs_m < S
++
++    q = tl.load(Q + b * sq_b + h * sq_h + offs_m[:, None] * sq_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    sink2 = tl.load(SINK + h).to(tl.float32) * 1.4426950408889634
++    m_i = tl.zeros([BLOCK_M], tl.float32) + sink2
++    l_i = tl.full([BLOCK_M], 1.0, tl.float32)
++    acc = tl.zeros([BLOCK_M, D], tl.float32)
++
++    k_base = K + b * sk_b + g * sk_h
++    v_base = V + b * sv_b + g * sv_h
++    lo = (tl.maximum(start - WINDOW, 0) // BLOCK_N) * BLOCK_N
++    hi = tl.minimum(start + BLOCK_M, S)
++    for n0 in range(lo, hi, BLOCK_N):
++        offs_n = n0 + tl.arange(0, BLOCK_N)
++        col_ok = offs_n < S
++        kt = tl.load(k_base + offs_n[None, :] * sk_s + offs_d[:, None], mask=col_ok[None, :], other=0.0)
++        s = tl.dot(q, kt) * qk_scale
++        valid = (
++            (offs_n[None, :] <= offs_m[:, None])
++            & (offs_n[None, :] >= offs_m[:, None] - WINDOW)
++            & col_ok[None, :]
++        )
++        s = tl.where(valid, s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(v_base + offs_n[:, None] * sv_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    o = acc / l_i[:, None]
++    tl.store(
++        O + b * so_b + h * so_h + offs_m[:, None] * so_s + offs_d[None, :],
++        o.to(O.dtype.element_ty),
++        mask=row_ok[:, None],
++    )
++    tl.store(LSE + pid_bh * S + offs_m, m_i + tl.log2(l_i), mask=row_ok)
++
++
++@triton.jit
++def _swa_bwd_pre(
++    O, DO, DELTA,
++    so_s, so_b, so_h, sdo_s, sdo_b, sdo_h,
++    S, H: tl.constexpr, BLOCK_M: tl.constexpr, D: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_bh = tl.program_id(1)
++    b = pid_bh // H
++    h = pid_bh % H
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_d = tl.arange(0, D)
++    row_ok = offs_m < S
++    o = tl.load(O + b * so_b + h * so_h + offs_m[:, None] * so_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    do = tl.load(DO + b * sdo_b + h * sdo_h + offs_m[:, None] * sdo_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    tl.store(DELTA + pid_bh * S + offs_m, tl.sum(o.to(tl.float32) * do.to(tl.float32), 1), mask=row_ok)
++
++
++@triton.jit
++def _swa_bwd_dkdv(
++    Q, K, V, DO, LSE, DELTA, DK, DV,
++    sq_s, sq_b, sq_h, sk_s, sk_b, sk_h, sv_s, sv_b, sv_h, sdo_s, sdo_b, sdo_h,
++    sdk_s, sdk_b, sdk_h,
++    S, qk_scale, sm_scale,
++    H: tl.constexpr, G: tl.constexpr, WINDOW: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    pid_bg = tl.program_id(1)
++    b = pid_bg // G
++    g = pid_bg % G
++    HPG: tl.constexpr = H // G
++    ks = pid_n * BLOCK_N
++    offs_n = ks + tl.arange(0, BLOCK_N)
++    offs_d = tl.arange(0, D)
++    col_ok = offs_n < S
++
++    k = tl.load(K + b * sk_b + g * sk_h + offs_n[:, None] * sk_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++    v = tl.load(V + b * sv_b + g * sv_h + offs_n[:, None] * sv_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++    dk = tl.zeros([BLOCK_N, D], tl.float32)
++    dv = tl.zeros([BLOCK_N, D], tl.float32)
++
++    q_lo = (ks // BLOCK_M) * BLOCK_M
++    q_hi = tl.minimum(ks + BLOCK_N + WINDOW, S)
++    for hh in range(HPG):
++        h = g * HPG + hh
++        bh = b * H + h
++        for m0 in range(q_lo, q_hi, BLOCK_M):
++            offs_m = m0 + tl.arange(0, BLOCK_M)
++            row_ok = offs_m < S
++            q = tl.load(Q + b * sq_b + h * sq_h + offs_m[:, None] * sq_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++            do = tl.load(DO + b * sdo_b + h * sdo_h + offs_m[:, None] * sdo_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++            lse = tl.load(LSE + bh * S + offs_m, mask=row_ok, other=0.0)
++            delta = tl.load(DELTA + bh * S + offs_m, mask=row_ok, other=0.0)
++            s = tl.dot(q, tl.trans(k)) * qk_scale
++            valid = (
++                (offs_n[None, :] <= offs_m[:, None])
++                & (offs_n[None, :] >= offs_m[:, None] - WINDOW)
++                & col_ok[None, :]
++                & row_ok[:, None]
++            )
++            p = tl.where(valid, tl.exp2(s - lse[:, None]), 0.0)
++            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
++            dp = tl.dot(do, tl.trans(v))
++            ds = p * (dp - delta[:, None])
++            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
++
++    dk = dk * sm_scale
++    base = b * sdk_b + g * sdk_h + offs_n[:, None] * sdk_s + offs_d[None, :]
++    tl.store(DK + base, dk.to(DK.dtype.element_ty), mask=col_ok[:, None])
++    tl.store(DV + base, dv.to(DV.dtype.element_ty), mask=col_ok[:, None])
++
++
++@triton.jit
++def _swa_bwd_dq(
++    Q, K, V, DO, LSE, DELTA, SINK, DQ, DSINK,
++    sq_s, sq_b, sq_h, sk_s, sk_b, sk_h, sv_s, sv_b, sv_h, sdo_s, sdo_b, sdo_h,
++    sdq_s, sdq_b, sdq_h,
++    S, qk_scale, sm_scale, n_mblocks,
++    H: tl.constexpr, G: tl.constexpr, WINDOW: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_bh = tl.program_id(1)
++    b = pid_bh // H
++    h = pid_bh % H
++    g = h // (H // G)
++    start = pid_m * BLOCK_M
++    offs_m = start + tl.arange(0, BLOCK_M)
++    offs_d = tl.arange(0, D)
++    row_ok = offs_m < S
++
++    q = tl.load(Q + b * sq_b + h * sq_h + offs_m[:, None] * sq_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    do = tl.load(DO + b * sdo_b + h * sdo_h + offs_m[:, None] * sdo_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    lse = tl.load(LSE + pid_bh * S + offs_m, mask=row_ok, other=0.0)
++    delta = tl.load(DELTA + pid_bh * S + offs_m, mask=row_ok, other=0.0)
++    dq = tl.zeros([BLOCK_M, D], tl.float32)
++
++    k_base = K + b * sk_b + g * sk_h
++    v_base = V + b * sv_b + g * sv_h
++    lo = (tl.maximum(start - WINDOW, 0) // BLOCK_N) * BLOCK_N
++    hi = tl.minimum(start + BLOCK_M, S)
++    for n0 in range(lo, hi, BLOCK_N):
++        offs_n = n0 + tl.arange(0, BLOCK_N)
++        col_ok = offs_n < S
++        k = tl.load(k_base + offs_n[:, None] * sk_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++        v = tl.load(v_base + offs_n[:, None] * sv_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        valid = (
++            (offs_n[None, :] <= offs_m[:, None])
++            & (offs_n[None, :] >= offs_m[:, None] - WINDOW)
++            & col_ok[None, :]
++            & row_ok[:, None]
++        )
++        p = tl.where(valid, tl.exp2(s - lse[:, None]), 0.0)
++        dp = tl.dot(do, tl.trans(v))
++        ds = p * (dp - delta[:, None])
++        dq += tl.dot(ds.to(k.dtype), k)
++
++    dq = dq * sm_scale
++    tl.store(
++        DQ + b * sdq_b + h * sdq_h + offs_m[:, None] * sdq_s + offs_d[None, :],
++        dq.to(DQ.dtype.element_ty),
++        mask=row_ok[:, None],
++    )
++    sink2 = tl.load(SINK + h).to(tl.float32) * 1.4426950408889634
++    p_sink = tl.where(row_ok, tl.exp2(sink2 - lse), 0.0)
++    tl.store(DSINK + pid_bh * n_mblocks + pid_m, -tl.sum(p_sink * delta, 0))
++
++
++# Packed variants: a tile holds HP query heads of one KV group x BMQ query rows, so
++# the MMA M dimension is HP * BMQ without widening the key band of the window.
++
++
++@triton.jit
++def _swa_fwd_packed(
++    Q, K, V, SINK, O, LSE,
++    sq_s, sq_b, sq_h, sk_s, sk_b, sk_h, sv_s, sv_b, sv_h, so_s, so_b, so_h,
++    S, qk_scale,
++    H: tl.constexpr, G: tl.constexpr, WINDOW: tl.constexpr,
++    HP: tl.constexpr, BMQ: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
++):
++    NP: tl.constexpr = (H // G) // HP
++    ROWS: tl.constexpr = HP * BMQ
++    pid_m = tl.program_id(0)
++    pid = tl.program_id(1)
++    b = pid // (G * NP)
++    g = (pid % (G * NP)) // NP
++    h0 = g * (H // G) + (pid % NP) * HP
++    start = pid_m * BMQ
++    r = tl.arange(0, ROWS)
++    hr = h0 + r // BMQ
++    qr = start + r % BMQ
++    offs_d = tl.arange(0, D)
++    row_ok = qr < S
++
++    q = tl.load(Q + b * sq_b + hr[:, None] * sq_h + qr[:, None] * sq_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    m_i = tl.load(SINK + hr).to(tl.float32) * 1.4426950408889634
++    l_i = tl.full([ROWS], 1.0, tl.float32)
++    acc = tl.zeros([ROWS, D], tl.float32)
++
++    k_base = K + b * sk_b + g * sk_h
++    v_base = V + b * sv_b + g * sv_h
++    lo = (tl.maximum(start - WINDOW, 0) // BLOCK_N) * BLOCK_N
++    hi = tl.minimum(start + BMQ, S)
++    for n0 in range(lo, hi, BLOCK_N):
++        offs_n = n0 + tl.arange(0, BLOCK_N)
++        col_ok = offs_n < S
++        kt = tl.load(k_base + offs_n[None, :] * sk_s + offs_d[:, None], mask=col_ok[None, :], other=0.0)
++        s = tl.dot(q, kt) * qk_scale
++        valid = (offs_n[None, :] <= qr[:, None]) & (offs_n[None, :] >= qr[:, None] - WINDOW) & col_ok[None, :]
++        s = tl.where(valid, s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(v_base + offs_n[:, None] * sv_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    o = acc / l_i[:, None]
++    tl.store(
++        O + b * so_b + hr[:, None] * so_h + qr[:, None] * so_s + offs_d[None, :],
++        o.to(O.dtype.element_ty),
++        mask=row_ok[:, None],
++    )
++    tl.store(LSE + (b * H + hr) * S + qr, m_i + tl.log2(l_i), mask=row_ok)
++
++
++@triton.jit
++def _swa_bwd_dkdv_packed(
++    Q, K, V, DO, LSE, DELTA, DK, DV,
++    sq_s, sq_b, sq_h, sk_s, sk_b, sk_h, sv_s, sv_b, sv_h, sdo_s, sdo_b, sdo_h,
++    sdk_s, sdk_b, sdk_h,
++    S, qk_scale, sm_scale,
++    H: tl.constexpr, G: tl.constexpr, WINDOW: tl.constexpr,
++    HP: tl.constexpr, BMQ: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
++):
++    HPG: tl.constexpr = H // G
++    NP: tl.constexpr = HPG // HP
++    ROWS: tl.constexpr = HP * BMQ
++    pid_n = tl.program_id(0)
++    pid_bg = tl.program_id(1)
++    b = pid_bg // G
++    g = pid_bg % G
++    ks = pid_n * BLOCK_N
++    offs_n = ks + tl.arange(0, BLOCK_N)
++    offs_d = tl.arange(0, D)
++    col_ok = offs_n < S
++    r = tl.arange(0, ROWS)
++
++    k = tl.load(K + b * sk_b + g * sk_h + offs_n[:, None] * sk_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++    v = tl.load(V + b * sv_b + g * sv_h + offs_n[:, None] * sv_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++    dk = tl.zeros([BLOCK_N, D], tl.float32)
++    dv = tl.zeros([BLOCK_N, D], tl.float32)
++
++    q_lo = (ks // BMQ) * BMQ
++    q_hi = tl.minimum(ks + BLOCK_N + WINDOW, S)
++    for hp in range(NP):
++        hr = g * HPG + hp * HP + r // BMQ
++        for m0 in range(q_lo, q_hi, BMQ):
++            qr = m0 + r % BMQ
++            row_ok = qr < S
++            q = tl.load(Q + b * sq_b + hr[:, None] * sq_h + qr[:, None] * sq_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++            do = tl.load(DO + b * sdo_b + hr[:, None] * sdo_h + qr[:, None] * sdo_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++            lse = tl.load(LSE + (b * H + hr) * S + qr, mask=row_ok, other=0.0)
++            delta = tl.load(DELTA + (b * H + hr) * S + qr, mask=row_ok, other=0.0)
++            s = tl.dot(q, tl.trans(k)) * qk_scale
++            valid = (
++                (offs_n[None, :] <= qr[:, None])
++                & (offs_n[None, :] >= qr[:, None] - WINDOW)
++                & col_ok[None, :]
++                & row_ok[:, None]
++            )
++            p = tl.where(valid, tl.exp2(s - lse[:, None]), 0.0)
++            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
++            dp = tl.dot(do, tl.trans(v))
++            ds = p * (dp - delta[:, None])
++            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
++
++    dk = dk * sm_scale
++    base = b * sdk_b + g * sdk_h + offs_n[:, None] * sdk_s + offs_d[None, :]
++    tl.store(DK + base, dk.to(DK.dtype.element_ty), mask=col_ok[:, None])
++    tl.store(DV + base, dv.to(DV.dtype.element_ty), mask=col_ok[:, None])
++
++
++@triton.jit
++def _swa_bwd_dq_packed(
++    Q, K, V, DO, LSE, DELTA, SINK, DQ, DSINK,
++    sq_s, sq_b, sq_h, sk_s, sk_b, sk_h, sv_s, sv_b, sv_h, sdo_s, sdo_b, sdo_h,
++    sdq_s, sdq_b, sdq_h,
++    S, qk_scale, sm_scale, n_mblocks,
++    H: tl.constexpr, G: tl.constexpr, WINDOW: tl.constexpr,
++    HP: tl.constexpr, BMQ: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr,
++):
++    NP: tl.constexpr = (H // G) // HP
++    ROWS: tl.constexpr = HP * BMQ
++    pid_m = tl.program_id(0)
++    pid = tl.program_id(1)
++    b = pid // (G * NP)
++    g = (pid % (G * NP)) // NP
++    h0 = g * (H // G) + (pid % NP) * HP
++    start = pid_m * BMQ
++    r = tl.arange(0, ROWS)
++    hr = h0 + r // BMQ
++    qr = start + r % BMQ
++    offs_d = tl.arange(0, D)
++    row_ok = qr < S
++
++    q = tl.load(Q + b * sq_b + hr[:, None] * sq_h + qr[:, None] * sq_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    do = tl.load(DO + b * sdo_b + hr[:, None] * sdo_h + qr[:, None] * sdo_s + offs_d[None, :], mask=row_ok[:, None], other=0.0)
++    lse = tl.load(LSE + (b * H + hr) * S + qr, mask=row_ok, other=0.0)
++    delta = tl.load(DELTA + (b * H + hr) * S + qr, mask=row_ok, other=0.0)
++    dq = tl.zeros([ROWS, D], tl.float32)
++
++    k_base = K + b * sk_b + g * sk_h
++    v_base = V + b * sv_b + g * sv_h
++    lo = (tl.maximum(start - WINDOW, 0) // BLOCK_N) * BLOCK_N
++    hi = tl.minimum(start + BMQ, S)
++    for n0 in range(lo, hi, BLOCK_N):
++        offs_n = n0 + tl.arange(0, BLOCK_N)
++        col_ok = offs_n < S
++        k = tl.load(k_base + offs_n[:, None] * sk_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++        v = tl.load(v_base + offs_n[:, None] * sv_s + offs_d[None, :], mask=col_ok[:, None], other=0.0)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        valid = (
++            (offs_n[None, :] <= qr[:, None])
++            & (offs_n[None, :] >= qr[:, None] - WINDOW)
++            & col_ok[None, :]
++            & row_ok[:, None]
++        )
++        p = tl.where(valid, tl.exp2(s - lse[:, None]), 0.0)
++        dp = tl.dot(do, tl.trans(v))
++        ds = p * (dp - delta[:, None])
++        dq += tl.dot(ds.to(k.dtype), k)
++
++    dq = dq * sm_scale
++    tl.store(
++        DQ + b * sdq_b + hr[:, None] * sdq_h + qr[:, None] * sdq_s + offs_d[None, :],
++        dq.to(DQ.dtype.element_ty),
++        mask=row_ok[:, None],
++    )
++    sink2 = tl.load(SINK + hr).to(tl.float32) * 1.4426950408889634
++    contrib = tl.where(row_ok, tl.exp2(sink2 - lse), 0.0) * delta
++    part = -tl.sum(tl.reshape(contrib, [HP, BMQ]), 1)
++    heads = h0 + tl.arange(0, HP)
++    tl.store(DSINK + (b * H + heads) * n_mblocks + pid_m, part)
++
++
++def _check(q, k, v):
++    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
++        raise ValueError("expected sbhd tensors")
++    for t in (q, k, v):
++        if t.stride(-1) != 1:
++            raise ValueError("last dim must be contiguous")
++    if k.shape != v.shape or q.shape[:2] != k.shape[:2] or q.shape[3] != k.shape[3]:
++        raise ValueError(f"shape mismatch q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}")
++    if q.shape[2] % k.shape[2]:
++        raise ValueError("query heads must be a multiple of kv heads")
++
++
++class SWAAttentionFunc(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, q, k, v, sink, sm_scale, window):
++        _check(q, k, v)
++        S, B, H, D = q.shape
++        G = k.shape[2]
++        sink_flat = sink.reshape(-1)
++        o = torch.empty((S, B, H, D), device=q.device, dtype=q.dtype)
++        lse = torch.empty((B * H, S), device=q.device, dtype=torch.float32)
++        qk_scale = sm_scale * _LOG2E
++        args = (
++            q, k, v, sink_flat, o, lse,
++            q.stride(0), q.stride(1), q.stride(2),
++            k.stride(0), k.stride(1), k.stride(2),
++            v.stride(0), v.stride(1), v.stride(2),
++            o.stride(0), o.stride(1), o.stride(2),
++            S, qk_scale,
++        )
++        if PACKED[0]:
++            hp, bmq, bn, w, st = PCFG["FWD"]
++            _swa_fwd_packed[(triton.cdiv(S, bmq), B * H // hp)](
++                *args, H=H, G=G, WINDOW=window, HP=hp, BMQ=bmq, BLOCK_N=bn, D=D,
++                num_warps=w, num_stages=st,
++            )
++        else:
++            bm, bn, w, st = CFG["FWD"]
++            _swa_fwd[(triton.cdiv(S, bm), B * H)](
++                *args, H=H, G=G, WINDOW=window, BLOCK_M=bm, BLOCK_N=bn, D=D,
++                num_warps=w, num_stages=st,
++            )
++        ctx.save_for_backward(q, k, v, sink, o, lse)
++        ctx.sm_scale = sm_scale
++        ctx.window = window
++        return o.view(S, B, H * D)
++
++    @staticmethod
++    def backward(ctx, dout):
++        q, k, v, sink, o, lse = ctx.saved_tensors
++        S, B, H, D = q.shape
++        G = k.shape[2]
++        do = dout.reshape(S, B, H, D)
++        if do.stride(-1) != 1:
++            do = do.contiguous()
++        sink_flat = sink.reshape(-1)
++        qk_scale = ctx.sm_scale * _LOG2E
++        delta = torch.empty((B * H, S), device=q.device, dtype=torch.float32)
++        _swa_bwd_pre[(triton.cdiv(S, 64), B * H)](
++            o, do, delta,
++            o.stride(0), o.stride(1), o.stride(2),
++            do.stride(0), do.stride(1), do.stride(2),
++            S, H=H, BLOCK_M=64, D=D, num_warps=4,
++        )
++        packed = PACKED[0]
++        dq_bm = PCFG["DQ"][1] if packed else CFG["DQ"][0]
++        n_m = triton.cdiv(S, dq_bm)
++        dq = torch.empty((S, B, H, D), device=q.device, dtype=q.dtype)
++        dk = torch.empty((S, B, G, D), device=q.device, dtype=k.dtype)
++        dv = torch.empty((S, B, G, D), device=q.device, dtype=v.dtype)
++        dsink_part = torch.empty((B, H, n_m), device=q.device, dtype=torch.float32)
++        strides = (
++            q.stride(0), q.stride(1), q.stride(2),
++            k.stride(0), k.stride(1), k.stride(2),
++            v.stride(0), v.stride(1), v.stride(2),
++            do.stride(0), do.stride(1), do.stride(2),
++        )
++        kv_args = (q, k, v, do, lse, delta, dk, dv, *strides,
++                   dk.stride(0), dk.stride(1), dk.stride(2), S, qk_scale, ctx.sm_scale)
++        dq_args = (q, k, v, do, lse, delta, sink_flat, dq, dsink_part, *strides,
++                   dq.stride(0), dq.stride(1), dq.stride(2), S, qk_scale, ctx.sm_scale, n_m)
++        if packed:
++            hp, bmq, bn, w, st = PCFG["DKDV"]
++            _swa_bwd_dkdv_packed[(triton.cdiv(S, bn), B * G)](
++                *kv_args, H=H, G=G, WINDOW=ctx.window, HP=hp, BMQ=bmq, BLOCK_N=bn, D=D,
++                num_warps=w, num_stages=st,
++            )
++            hp, bmq, bn, w, st = PCFG["DQ"]
++            _swa_bwd_dq_packed[(n_m, B * H // hp)](
++                *dq_args, H=H, G=G, WINDOW=ctx.window, HP=hp, BMQ=bmq, BLOCK_N=bn, D=D,
++                num_warps=w, num_stages=st,
++            )
++        else:
++            bm, bn, w, st = CFG["DKDV"]
++            _swa_bwd_dkdv[(triton.cdiv(S, bn), B * G)](
++                *kv_args, H=H, G=G, WINDOW=ctx.window, BLOCK_M=bm, BLOCK_N=bn, D=D,
++                num_warps=w, num_stages=st,
++            )
++            bm, bn, w, st = CFG["DQ"]
++            _swa_bwd_dq[(n_m, B * H)](
++                *dq_args, H=H, G=G, WINDOW=ctx.window, BLOCK_M=bm, BLOCK_N=bn, D=D,
++                num_warps=w, num_stages=st,
++            )
++        dsink = dsink_part.sum(dim=(0, 2)).view(sink.shape).to(sink.dtype)
++        return dq, dk, dv, dsink, None, None
++
++
++def swa_attention(q, k, v, sink, sm_scale, window):
++    """q [S, B, H, D], k/v [S, B, G, D], sink with H elements; returns [S, B, H * D]."""
++    return SWAAttentionFunc.apply(q, k, v, sink, sm_scale, window)
++
++
++def install():
++    """Route eligible Megatron TEDotProductAttention SWA calls to the Triton kernel."""
++    from megatron.core.extensions.transformer_engine import TEDotProductAttention
++    from megatron.core.transformer.enums import AttnMaskType
++
++    orig_forward = TEDotProductAttention.forward
++    logged, logged_fp8 = [False], [False]
++    full_fp8 = None
++    if os.environ.get("NVFP4_FULL_ATTN_FP8", "0") == "1":
++        import transformer_engine.pytorch as te
++        from transformer_engine.common import recipe as te_recipe
++
++        # Local amax only: a world all-reduce per full layer would sit on the critical path.
++        full_fp8 = te_recipe.DelayedScaling(
++            fp8_format=te_recipe.Format.HYBRID, fp8_dpa=True, fp8_mha=False, reduce_amax=False,
++            amax_history_len=int(os.environ.get("NVFP4_FULL_ATTN_FP8_HISTORY", "16")),
++        )
++
++    def forward(self, query, key, value, attention_mask, attn_mask_type, attention_bias=None,
++                packed_seq_params=None, num_splits=None, bf16_backward=None):
++        window = getattr(self, "window_size", None)
++        if (
++            window is not None
++            and tuple(window)[1] == 0
++            and tuple(window)[0] > 0
++            and getattr(self, "softmax_type", "vanilla") == "learnable"
++            and attn_mask_type == AttnMaskType.causal
++            and attention_bias is None
++            and packed_seq_params is None
++            and self.qkv_format == "sbhd"
++            and query.dtype == torch.bfloat16
++            and query.shape[-1] in (64, 128)
++        ):
++            if not logged[0] and int(os.environ.get("RANK", "0")) == 0:
++                logged[0] = True
++                print(
++                    f"NVFP4 SWA Triton attention window={tuple(window)} q={tuple(query.shape)} "
++                    f"k={tuple(key.shape)} packed={PACKED[0]} cfg={PCFG if PACKED[0] else CFG}",
++                    flush=True,
++                )
++            return swa_attention(
++                query, key, value, self.softmax_offset, self.fused_attention.softmax_scale, int(window[0])
++            )
++        if full_fp8 is not None and (window is None or tuple(window)[0] < 0):
++            if not logged_fp8[0] and int(os.environ.get("RANK", "0")) == 0:
++                logged_fp8[0] = True
++                print(f"NVFP4 full attention FP8 DPA recipe={full_fp8} q={tuple(query.shape)}", flush=True)
++            with te.fp8_autocast(enabled=True, fp8_recipe=full_fp8):
++                return orig_forward(self, query, key, value, attention_mask, attn_mask_type, attention_bias,
++                                    packed_seq_params, num_splits, bf16_backward)
++        return orig_forward(self, query, key, value, attention_mask, attn_mask_type, attention_bias,
++                            packed_seq_params, num_splits, bf16_backward)
++
++    TEDotProductAttention.forward = forward
+diff --git a/transformer_engine/pytorch/ops/basic/nvfp4_tail_mxfp8.py b/transformer_engine/pytorch/ops/basic/nvfp4_tail_mxfp8.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..05a3c57837a3e0184a030b97db9f9d4a0a4319f9
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/basic/nvfp4_tail_mxfp8.py
+@@ -0,0 +1,80 @@
++"""Run the BF16 tail layers (first_last_layers_bf16) under MXFP8 instead of BF16.
++
++The NVFP4 recipe keeps the last ``num_layers_at_end_in_bf16`` transformer layers in
++BF16. Their TE modules (attention linears and the expert MLP) are wrapped in an
++MXFP8 autocast at the instance level, so the TE CUDA-graph capture (which runs
++these callables with FP8/FP4 disabled) records MXFP8 kernels. Attention itself and
++the router stay BF16. Parameters, optimizer and DDP buffers are unchanged.
++Env: NVFP4_TAIL_MXFP8_FORMAT (e4m3|hybrid), NVFP4_TAIL_MXFP8_ATTN (1), NVFP4_TAIL_MXFP8_MLP (1).
++"""
++
++import os
++
++import transformer_engine.pytorch as te
++from transformer_engine.common import recipe as te_recipe
++
++_FORMATS = {"e4m3": te_recipe.Format.E4M3, "hybrid": te_recipe.Format.HYBRID}
++
++
++def _recipe():
++    return te_recipe.MXFP8BlockScaling(fp8_format=_FORMATS[os.environ.get("NVFP4_TAIL_MXFP8_FORMAT", "e4m3")])
++
++
++def _wrap(module, recipe):
++    orig = module.forward
++
++    def forward(*args, **kwargs):
++        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
++            return orig(*args, **kwargs)
++
++    module.forward = forward
++
++
++def tail_layer_indices(config):
++    if not getattr(config, "first_last_layers_bf16", False):
++        return set()
++    start = getattr(config, "num_layers_at_start_in_bf16", 0) or 0
++    end = getattr(config, "num_layers_at_end_in_bf16", 0) or 0
++    return set(range(start)) | set(range(config.num_layers - end, config.num_layers))
++
++
++def patch_layer(layer, recipe, attn=True, mlp=True):
++    """Wrap one TransformerLayer's TE linears and experts; returns the wrapped names."""
++    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
++
++    DotProductAttention = te.DotProductAttention
++    wrapped = []
++    experts = getattr(getattr(layer, "mlp", None), "experts", None)
++    if mlp and experts is not None:
++        _wrap(experts, recipe)
++        wrapped.append("mlp.experts")
++    if attn:
++        for name, mod in layer.named_modules():
++            if name.startswith("mlp") or isinstance(mod, DotProductAttention):
++                continue
++            if isinstance(mod, TransformerEngineBaseModule):
++                _wrap(mod, recipe)
++                wrapped.append(name)
++    return wrapped
++
++
++def install():
++    """Patch GPTModel.__init__ so the BF16 tail layers of every stage run MXFP8."""
++    from megatron.core.models.gpt.gpt_model import GPTModel
++
++    orig_init = GPTModel.__init__
++    attn = os.environ.get("NVFP4_TAIL_MXFP8_ATTN", "1") == "1"
++    mlp = os.environ.get("NVFP4_TAIL_MXFP8_MLP", "1") == "1"
++
++    def init(self, *args, **kwargs):
++        orig_init(self, *args, **kwargs)
++        tail = tail_layer_indices(self.config)
++        recipe = _recipe()
++        done = {}
++        for layer in getattr(self.decoder, "layers", []):
++            if layer.layer_number - 1 in tail:
++                done[layer.layer_number - 1] = patch_layer(layer, recipe, attn=attn, mlp=mlp)
++        if int(os.environ.get("RANK", "0")) == 0:
++            print(f"NVFP4 tail MXFP8 ({os.environ.get('NVFP4_TAIL_MXFP8_FORMAT', 'e4m3')}) layers {done}", flush=True)
++
++    GPTModel.__init__ = init
+diff --git a/transformer_engine/pytorch/ops/basic/nvfp4_triton_bias_residual.py b/transformer_engine/pytorch/ops/basic/nvfp4_triton_bias_residual.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..26530f77ce91fb87dd3fedbfd9463f74854a697a
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/basic/nvfp4_triton_bias_residual.py
+@@ -0,0 +1,59 @@
++# Classification: Internal
++"""One-pass ``residual + (x + bias)`` for Megatron's bias-dropout-add with dropout 0.
++
++Rounds ``x + bias`` to the input dtype before adding the residual, matching the
++two unfused PyTorch adds bit for bit.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _bias_residual_add_kernel(x_ptr, b_ptr, r_ptr, out_ptr, numel, hidden, BLOCK: tl.constexpr):
++    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < numel
++    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
++    r = tl.load(r_ptr + offs, mask=mask, other=0.0)
++    b = tl.load(b_ptr + offs % hidden, mask=mask, other=0.0)
++    t = (x.to(tl.float32) + b.to(tl.float32)).to(x.dtype)
++    out = (r.to(tl.float32) + t.to(tl.float32)).to(x.dtype)
++    tl.store(out_ptr + offs, out, mask=mask)
++
++
++class _BiasResidualAdd(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, bias, residual):
++        out = torch.empty_like(x)
++        numel = x.numel()
++        block = 4096
++        _bias_residual_add_kernel[(triton.cdiv(numel, block),)](
++            x, bias, residual, out, numel, x.shape[-1], BLOCK=block, num_warps=8
++        )
++        ctx.bias_shape = bias.shape
++        return out
++
++    @staticmethod
++    def backward(ctx, grad):
++        return grad, grad.sum_to_size(ctx.bias_shape), grad
++
++
++def eligible(x, bias, residual, prob, training):
++    return (
++        training
++        and prob == 0.0
++        and bias is not None
++        and x.dtype == residual.dtype == bias.dtype
++        and x.dtype in (torch.bfloat16, torch.float16)
++        and x.shape == residual.shape
++        and bias.dim() == 1
++        and bias.shape[0] == x.shape[-1]
++        and x.is_contiguous()
++        and residual.is_contiguous()
++        and bias.is_contiguous()
++    )
++
++
++def bias_residual_add(x, bias, residual):
++    return _BiasResidualAdd.apply(x, bias, residual)
+diff --git a/transformer_engine/pytorch/ops/basic/nvfp4_triton_qkv_rope.py b/transformer_engine/pytorch/ops/basic/nvfp4_triton_qkv_rope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6633451a79fd1904f48050cc00bada751219b7cf
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/basic/nvfp4_triton_qkv_rope.py
+@@ -0,0 +1,184 @@
++# Classification: Internal
++"""Triton replacement for TE's fused QKV RoPE (sbhd, non-interleaved, no CP).
++
++qkv is [s, b, g, (hq + 2) * d] with per-group layout [hq query heads, 1 key, 1 value];
++the outputs are contiguous q [s, b, g * hq, d], k and v [s, b, g, d], matching
++``tex.fused_qkv_rope_forward``/``fused_qkv_rope_backward`` bit for bit. Each
++single-warp program handles one KV group of one token row, so cos/sin are evaluated
++once per row on the half-width frequency vectors. More warps per program are several
++times slower on GB300.
++"""
++from typing import List
++
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra.cuda import libdevice
++
++
++@triton.jit
++def _cos_sin(fq_ptr, fk_ptr, pos, freq_stride, j, isq, HALF: tl.constexpr):
++    fb = pos * freq_stride + j
++    fq1 = tl.load(fq_ptr + fb)
++    fq2 = tl.load(fq_ptr + fb + HALF)
++    fk1 = tl.load(fk_ptr + fb)
++    fk2 = tl.load(fk_ptr + fb + HALF)
++    c1 = tl.where(isq, libdevice.cos(fq1), libdevice.cos(fk1))
++    s1 = tl.where(isq, libdevice.sin(fq1), libdevice.sin(fk1))
++    c2 = tl.where(isq, libdevice.cos(fq2), libdevice.cos(fk2))
++    s2 = tl.where(isq, libdevice.sin(fq2), libdevice.sin(fk2))
++    return c1, s1, c2, s2
++
++
++@triton.jit
++def _qkv_rope_fwd_kernel(
++    qkv_ptr, fq_ptr, fk_ptr, q_ptr, k_ptr, v_ptr, batch, freq_stride,
++    G: tl.constexpr, HQ: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr,
++):
++    HALF: tl.constexpr = D // 2
++    HG: tl.constexpr = HQ + 2
++    row = tl.program_id(0).to(tl.int64)
++    g = tl.program_id(1)
++    pos = row // batch
++    r = tl.arange(0, BLOCK_R)[:, None]
++    j = tl.arange(0, HALF)[None, :]
++    rmask = r < HG
++    isq = r < HQ
++    isv = r == HQ + 1
++
++    base = qkv_ptr + row * (G * HG * D) + (g * HG + r) * D + j
++    x1 = tl.load(base, mask=rmask, other=0.0).to(tl.float32)
++    x2 = tl.load(base + HALF, mask=rmask, other=0.0).to(tl.float32)
++    c1, s1, c2, s2 = _cos_sin(fq_ptr, fk_ptr, pos, freq_stride, j, isq, HALF)
++    o1 = x1 * c1 + (-x2) * s1
++    o2 = x2 * c2 + x1 * s2
++    o1 = tl.where(isv, x1, o1).to(q_ptr.dtype.element_ty)
++    o2 = tl.where(isv, x2, o2).to(q_ptr.dtype.element_ty)
++
++    qo = q_ptr + row * (G * HQ * D) + (g * HQ + r) * D + j
++    mq = rmask & isq
++    tl.store(qo, o1, mask=mq)
++    tl.store(qo + HALF, o2, mask=mq)
++    kvo = row * (G * D) + g * D + j + r * 0
++    mk = r == HQ
++    tl.store(k_ptr + kvo, o1, mask=mk)
++    tl.store(k_ptr + kvo + HALF, o2, mask=mk)
++    tl.store(v_ptr + kvo, o1, mask=isv)
++    tl.store(v_ptr + kvo + HALF, o2, mask=isv)
++
++
++@triton.jit
++def _qkv_rope_bwd_kernel(
++    gq_ptr, gk_ptr, gv_ptr, fq_ptr, fk_ptr, gqkv_ptr, batch, freq_stride,
++    G: tl.constexpr, HQ: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr,
++):
++    HALF: tl.constexpr = D // 2
++    HG: tl.constexpr = HQ + 2
++    row = tl.program_id(0).to(tl.int64)
++    g = tl.program_id(1)
++    pos = row // batch
++    r = tl.arange(0, BLOCK_R)[:, None]
++    j = tl.arange(0, HALF)[None, :]
++    rmask = r < HG
++    isq = r < HQ
++    isv = r == HQ + 1
++    mq = rmask & isq
++    mk = r == HQ
++
++    qo = gq_ptr + row * (G * HQ * D) + (g * HQ + r) * D + j
++    kvo = row * (G * D) + g * D + j + r * 0
++    y1 = (
++        tl.load(qo, mask=mq, other=0.0).to(tl.float32)
++        + tl.load(gk_ptr + kvo, mask=mk, other=0.0).to(tl.float32)
++        + tl.load(gv_ptr + kvo, mask=isv, other=0.0).to(tl.float32)
++    )
++    y2 = (
++        tl.load(qo + HALF, mask=mq, other=0.0).to(tl.float32)
++        + tl.load(gk_ptr + kvo + HALF, mask=mk, other=0.0).to(tl.float32)
++        + tl.load(gv_ptr + kvo + HALF, mask=isv, other=0.0).to(tl.float32)
++    )
++    c1, s1, c2, s2 = _cos_sin(fq_ptr, fk_ptr, pos, freq_stride, j, isq, HALF)
++    o1 = y1 * c1 + y2 * s2
++    o2 = y2 * c2 + (-y1) * s1
++    o1 = tl.where(isv, y1, o1).to(gqkv_ptr.dtype.element_ty)
++    o2 = tl.where(isv, y2, o2).to(gqkv_ptr.dtype.element_ty)
++    out = gqkv_ptr + row * (G * HG * D) + (g * HG + r) * D + j
++    tl.store(out, o1, mask=rmask)
++    tl.store(out + HALF, o2, mask=rmask)
++
++
++class TritonQKVRoPE(torch.autograd.Function):
++    """sbhd only: row = s_idx * b + b_idx, so the position is row // b."""
++
++    @staticmethod
++    def forward(ctx, qkv, q_freqs, k_freqs, split):
++        s, b, g, _ = qkv.shape
++        d = split[1]
++        hq = split[0] // d
++        q = qkv.new_empty(s, b, g * hq, d)
++        k = qkv.new_empty(s, b, g, d)
++        v = qkv.new_empty(s, b, g, d)
++        fq = q_freqs.float().contiguous()
++        fk = k_freqs.float().contiguous()
++        block_r = triton.next_power_of_2(hq + 2)
++        _qkv_rope_fwd_kernel[(s * b, g)](
++            qkv, fq, fk, q, k, v, b, fq.stride(0),
++            G=g, HQ=hq, D=d, BLOCK_R=block_r, num_warps=1,
++        )
++        ctx.save_for_backward(fq, fk)
++        ctx.meta = (g, hq, d, b, block_r, qkv.shape, qkv.dtype)
++        return q, k, v
++
++    @staticmethod
++    def backward(ctx, gq, gk, gv):
++        fq, fk = ctx.saved_tensors
++        g, hq, d, b, block_r, shape, dtype = ctx.meta
++        gq = gq.contiguous()
++        gk = gk.contiguous()
++        gv = gv.contiguous()
++        gqkv = torch.empty(shape, dtype=dtype, device=gq.device)
++        _qkv_rope_bwd_kernel[(shape[0] * shape[1], g)](
++            gq, gk, gv, fq, fk, gqkv, b, fq.stride(0),
++            G=g, HQ=hq, D=d, BLOCK_R=block_r, num_warps=1,
++        )
++        return gqkv, None, None, None
++
++
++def make_apply_fused_qkv_rotary_pos_emb(te_apply):
++    """Wrap TE's ``apply_fused_qkv_rotary_pos_emb``, routing the supported case to Triton."""
++
++    def apply_fused_qkv_rotary_pos_emb(
++        qkv: torch.Tensor,
++        q_freqs: torch.Tensor,
++        k_freqs: torch.Tensor,
++        qkv_split_arg_list: List[int],
++        tensor_format: str = "sbhd",
++        start_positions=None,
++        interleaved: bool = False,
++        cu_seqlens=None,
++        cp_size: int = 1,
++        cp_rank: int = 0,
++    ):
++        d = qkv_split_arg_list[1]
++        if (
++            tensor_format == "sbhd"
++            and start_positions is None
++            and not interleaved
++            and cp_size == 1
++            and qkv.dim() == 4
++            and qkv.is_contiguous()
++            and qkv_split_arg_list[2] == d
++            and qkv_split_arg_list[0] % d == 0
++            and q_freqs.shape[-1] == d
++            and k_freqs.shape[-1] == d
++            and q_freqs.shape[0] >= qkv.shape[0]
++            and d in (32, 64, 128)
++        ):
++            return TritonQKVRoPE.apply(qkv, q_freqs, k_freqs, list(qkv_split_arg_list))
++        return te_apply(
++            qkv, q_freqs, k_freqs, qkv_split_arg_list, tensor_format=tensor_format,
++            start_positions=start_positions, interleaved=interleaved, cu_seqlens=cu_seqlens,
++            cp_size=cp_size, cp_rank=cp_rank,
++        )
++
++    return apply_fused_qkv_rotary_pos_emb
+diff --git a/transformer_engine/pytorch/ops/basic/nvfp4_triton_rmsnorm_bwd.py b/transformer_engine/pytorch/ops/basic/nvfp4_triton_rmsnorm_bwd.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8820ffaaa112163e47760d52b8be4846ed9771f9
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/basic/nvfp4_triton_rmsnorm_bwd.py
+@@ -0,0 +1,140 @@
++# Classification: Internal
++"""Triton RMSNorm backward, a drop-in for ``transformer_engine_torch.rmsnorm_bwd``.
++
++TE's backward for hidden 2880 (not a tuned size) runs a main and a finalize
++kernel of about 240 us each on 24576 x 2880 BF16. This persistent kernel
++reads x and dz once, writes dx, and reduces dgamma through a small
++per-program partial buffer.
++
++v2 keeps the row-to-program assignment, the per-row arithmetic and the dgamma
++accumulation order of v1, so results are bit-identical. It only raises the
++number of rows in flight per program: ``NVFP4_RMSNORM_BWD_UNROLL`` (1, 2 or 4)
++issues the loads of that many rows before computing them, and
++``NVFP4_RMSNORM_BWD_STAGES`` software-pipelines the row loop.
++"""
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++_UNROLL = int(os.environ.get("NVFP4_RMSNORM_BWD_UNROLL", "1"))
++_STAGES = int(os.environ.get("NVFP4_RMSNORM_BWD_STAGES", "1"))
++
++
++@triton.jit
++def _load_row(x_ptr, dz_ptr, rsigma_ptr, row, rows, stride_row, offs, mask):
++    valid = row < rows
++    r = tl.minimum(row, rows - 1)
++    base = r.to(tl.int64) * stride_row
++    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
++    dz = tl.load(dz_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
++    rs = tl.load(rsigma_ptr + r)
++    return x, dz, rs, base, valid
++
++
++@triton.jit
++def _finish_row(x, dz, rs, base, valid, gamma, cols, dx_ptr, offs, mask):
++    xhat = x * rs
++    gdz = dz * gamma
++    mdot = tl.sum(gdz * xhat, axis=0) / cols
++    dx = rs * (gdz - xhat * mdot)
++    tl.store(dx_ptr + base + offs, dx.to(dx_ptr.dtype.element_ty), mask=mask & valid)
++    return dz * xhat
++
++
++@triton.jit
++def _rmsnorm_bwd_kernel(
++    dz_ptr, x_ptr, rsigma_ptr, gamma_ptr, dx_ptr, dgamma_part_ptr,
++    rows, cols, stride_row,
++    ZERO_CENTERED: tl.constexpr, BLOCK_N: tl.constexpr,
++    UNROLL: tl.constexpr, STAGES: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    num_programs = tl.num_programs(0)
++    offs = tl.arange(0, BLOCK_N)
++    mask = offs < cols
++    gamma = tl.load(gamma_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++    if ZERO_CENTERED:
++        gamma = gamma + 1.0
++    dgamma_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
++    for row0 in tl.range(pid, rows, num_programs * UNROLL, num_stages=STAGES):
++        if UNROLL == 1:
++            x0, dz0, rs0, b0, v0 = _load_row(x_ptr, dz_ptr, rsigma_ptr, row0, rows, stride_row, offs, mask)
++            dgamma_acc += _finish_row(x0, dz0, rs0, b0, v0, gamma, cols, dx_ptr, offs, mask)
++        elif UNROLL == 2:
++            x0, dz0, rs0, b0, v0 = _load_row(x_ptr, dz_ptr, rsigma_ptr, row0, rows, stride_row, offs, mask)
++            x1, dz1, rs1, b1, v1 = _load_row(
++                x_ptr, dz_ptr, rsigma_ptr, row0 + num_programs, rows, stride_row, offs, mask)
++            dgamma_acc += _finish_row(x0, dz0, rs0, b0, v0, gamma, cols, dx_ptr, offs, mask)
++            c1 = _finish_row(x1, dz1, rs1, b1, v1, gamma, cols, dx_ptr, offs, mask)
++            dgamma_acc += tl.where(v1, c1, 0.0)
++        else:
++            x0, dz0, rs0, b0, v0 = _load_row(x_ptr, dz_ptr, rsigma_ptr, row0, rows, stride_row, offs, mask)
++            x1, dz1, rs1, b1, v1 = _load_row(
++                x_ptr, dz_ptr, rsigma_ptr, row0 + num_programs, rows, stride_row, offs, mask)
++            x2, dz2, rs2, b2, v2 = _load_row(
++                x_ptr, dz_ptr, rsigma_ptr, row0 + 2 * num_programs, rows, stride_row, offs, mask)
++            x3, dz3, rs3, b3, v3 = _load_row(
++                x_ptr, dz_ptr, rsigma_ptr, row0 + 3 * num_programs, rows, stride_row, offs, mask)
++            dgamma_acc += _finish_row(x0, dz0, rs0, b0, v0, gamma, cols, dx_ptr, offs, mask)
++            c1 = _finish_row(x1, dz1, rs1, b1, v1, gamma, cols, dx_ptr, offs, mask)
++            dgamma_acc += tl.where(v1, c1, 0.0)
++            c2 = _finish_row(x2, dz2, rs2, b2, v2, gamma, cols, dx_ptr, offs, mask)
++            dgamma_acc += tl.where(v2, c2, 0.0)
++            c3 = _finish_row(x3, dz3, rs3, b3, v3, gamma, cols, dx_ptr, offs, mask)
++            dgamma_acc += tl.where(v3, c3, 0.0)
++    tl.store(dgamma_part_ptr + pid.to(tl.int64) * BLOCK_N + offs, dgamma_acc, mask=mask)
++
++
++@triton.jit
++def _reduce_rows_kernel(part_ptr, out_ptr, parts, cols, BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr, STRIDE: tl.constexpr):
++    pid = tl.program_id(0)
++    cols_offs = pid * BLOCK_C + tl.arange(0, BLOCK_C)
++    cmask = cols_offs < cols
++    acc = tl.zeros([BLOCK_C], dtype=tl.float32)
++    for p0 in range(0, parts, BLOCK_P):
++        p = p0 + tl.arange(0, BLOCK_P)
++        pmask = p < parts
++        tile = tl.load(
++            part_ptr + p[:, None].to(tl.int64) * STRIDE + cols_offs[None, :],
++            mask=pmask[:, None] & cmask[None, :],
++            other=0.0,
++        )
++        acc += tl.sum(tile, axis=0)
++    tl.store(out_ptr + cols_offs, acc.to(out_ptr.dtype.element_ty), mask=cmask)
++
++
++_NUM_SMS = {}
++
++
++def rmsnorm_bwd(dz, x, rsigma, gamma, sm_margin=0, zero_centered_gamma=False):
++    """Return ``(dx, dgamma)`` with the semantics of TE ``rmsnorm_bwd``."""
++    cols = gamma.numel()
++    x2 = x.reshape(-1, cols)
++    dz2 = dz.reshape(-1, cols)
++    if not x2.is_contiguous():
++        x2 = x2.contiguous()
++    if not dz2.is_contiguous():
++        dz2 = dz2.contiguous()
++    rows = x2.shape[0]
++    device = x2.device
++    if device not in _NUM_SMS:
++        _NUM_SMS[device] = torch.cuda.get_device_properties(device).multi_processor_count
++    block_n = triton.next_power_of_2(cols)
++    programs = max(1, min(rows, 2 * (_NUM_SMS[device] - int(sm_margin))))
++    dx = torch.empty_like(x2)
++    part = torch.empty((programs, block_n), dtype=torch.float32, device=device)
++    _rmsnorm_bwd_kernel[(programs,)](
++        dz2, x2, rsigma.reshape(-1), gamma.reshape(-1), dx, part,
++        rows, cols, x2.stride(0),
++        ZERO_CENTERED=bool(zero_centered_gamma), BLOCK_N=block_n,
++        UNROLL=_UNROLL, STAGES=_STAGES, num_warps=8,
++    )
++    dgamma = torch.empty_like(gamma)
++    block_c = 128
++    _reduce_rows_kernel[(triton.cdiv(cols, block_c),)](
++        part, dgamma.reshape(-1), programs, cols, BLOCK_P=32, BLOCK_C=block_c, STRIDE=block_n,
++        num_warps=4,
++    )
++    return dx.view(x.shape), dgamma
+diff --git a/transformer_engine/pytorch/ops/basic/swiglu.py b/transformer_engine/pytorch/ops/basic/swiglu.py
+index 02f330ede30ecc615d2e534b42c8fa35dadf2ba7..744659781e475dc8d98077d8df9b3f2cabd5c4ce 100644
+--- a/transformer_engine/pytorch/ops/basic/swiglu.py
++++ b/transformer_engine/pytorch/ops/basic/swiglu.py
+@@ -20,6 +20,103 @@ from .._common import maybe_dequantize
+ 
+ __all__ = ["SwiGLU", "ClampedSwiGLU", "ScaledSwiGLU", "ScaledClampedQGeGLU"]
+ 
++import os
++
++try:
++    import triton
++    import triton.language as tl
++
++    _HAVE_TRITON = True
++except ImportError:
++    _HAVE_TRITON = False
++
++
++if _HAVE_TRITON:
++
++    @triton.jit
++    def _interleaved_scaled_clamped_glu_fwd(
++        x_ptr,
++        s_ptr,
++        out_ptr,
++        hidden,
++        limit,
++        alpha,
++        offset,
++        INTERLEAVE: tl.constexpr,
++        BLOCK: tl.constexpr,
++    ):
++        # One program per row. Column j of the GLU output reads its activation
++        # half from x[64 * (j // 32) + j % 32] and its linear half 32 later.
++        row = tl.program_id(0).to(tl.int64)
++        cols = tl.arange(0, BLOCK)
++        mask = cols < hidden
++        a_idx = (cols // INTERLEAVE) * (2 * INTERLEAVE) + cols % INTERLEAVE
++        x_row = x_ptr + row * (2 * hidden)
++        a = tl.load(x_row + a_idx, mask=mask, other=0.0).to(tl.float32)
++        lin = tl.load(x_row + a_idx + INTERLEAVE, mask=mask, other=0.0).to(tl.float32)
++        s = tl.load(s_ptr + row).to(tl.float32)
++        xa = tl.minimum(a, limit)
++        act = xa * tl.sigmoid(alpha * xa)
++        glu = act * (tl.minimum(tl.maximum(lin, -limit), limit) + offset)
++        glu = glu.to(tl.bfloat16).to(tl.float32)
++        tl.store(out_ptr + row * hidden + cols, (glu * s).to(tl.bfloat16), mask=mask)
++
++    @triton.jit
++    def _interleaved_scaled_clamped_glu_bwd(
++        g_ptr,
++        x_ptr,
++        s_ptr,
++        dx_ptr,
++        ds_ptr,
++        hidden,
++        limit,
++        alpha,
++        offset,
++        INTERLEAVE: tl.constexpr,
++        BLOCK: tl.constexpr,
++        WITH_DS: tl.constexpr,
++    ):
++        row = tl.program_id(0).to(tl.int64)
++        cols = tl.arange(0, BLOCK)
++        mask = cols < hidden
++        a_idx = (cols // INTERLEAVE) * (2 * INTERLEAVE) + cols % INTERLEAVE
++        x_row = x_ptr + row * (2 * hidden)
++        a = tl.load(x_row + a_idx, mask=mask, other=0.0).to(tl.float32)
++        lin = tl.load(x_row + a_idx + INTERLEAVE, mask=mask, other=0.0).to(tl.float32)
++        g = tl.load(g_ptr + row * hidden + cols, mask=mask, other=0.0).to(tl.float32)
++        s = tl.load(s_ptr + row).to(tl.float32)
++        gs = (g * s).to(tl.bfloat16).to(tl.float32)
++        xa = tl.minimum(a, limit)
++        sig = tl.sigmoid(alpha * xa)
++        act = xa * sig
++        dact = tl.where(a <= limit, sig + sig * (1.0 - sig) * alpha * xa, 0.0)
++        lin_c = tl.minimum(tl.maximum(lin, -limit), limit) + offset
++        dlin = tl.where((lin > limit) | (lin < -limit), 0.0, 1.0)
++        dx_row = dx_ptr + row * (2 * hidden)
++        tl.store(dx_row + a_idx, (dact * gs * lin_c).to(tl.bfloat16), mask=mask)
++        tl.store(dx_row + a_idx + INTERLEAVE, (dlin * act * gs).to(tl.bfloat16), mask=mask)
++        if WITH_DS:
++            glu = (act * lin_c).to(tl.bfloat16).to(tl.float32)
++            ds = tl.sum(tl.where(mask, glu * g, 0.0), axis=0)
++            tl.store(ds_ptr + row, ds.to(tl.bfloat16).to(ds_ptr.dtype.element_ty))
++
++
++def _use_triton_interleaved_glu(op, input_: torch.Tensor) -> bool:
++    return (
++        _HAVE_TRITON
++        and os.environ.get("NVFP4_TRITON_INTERLEAVED_GLU", "1") == "1"
++        and isinstance(op, ScaledClampedQGeGLU)
++        and op.glu_interleave_size is not None
++        and isinstance(input_, torch.Tensor)
++        and input_.dtype == torch.bfloat16
++        and input_.is_cuda
++        and input_.shape[-1] % (2 * op.glu_interleave_size) == 0
++    )
++
++
++def _triton_block(hidden: int) -> int:
++    return max(triton.next_power_of_2(hidden), 128)
++
+ 
+ class SwiGLU(BasicOperation):
+     r"""Swish gated linear unit
+@@ -439,6 +536,9 @@ class _ScaledGLU(BasicOperation):
+         else:
+             dtype = extra_input.dtype
+ 
++        if dtype == torch.bfloat16 and _use_triton_interleaved_glu(self, input_):
++            return self._triton_forward(basic_op_ctxs[0], input_, extra_input, dtype)
++
+         # Make sure inputs are in correct dtype
+         input_ = maybe_dequantize(input_, dtype)
+         scales = maybe_dequantize(extra_input, dtype)
+@@ -492,6 +592,8 @@ class _ScaledGLU(BasicOperation):
+             )
+ 
+         ctx = basic_op_ctxs[0]
++        if getattr(ctx, "triton_interleaved_glu", False):
++            return self._triton_backward(ctx, grad_output)
+         input_, scales = ctx.saved_tensors
+         input_ = maybe_dequantize(input_, ctx.dtype)
+         if scales is not None:
+@@ -539,6 +641,69 @@ class _ScaledGLU(BasicOperation):
+ 
+         return grad_input, [()], [(grad_extra_input,)]
+ 
++    def _triton_forward(self, ctx, input_, extra_input, dtype):
++        x = input_.contiguous()
++        scales = maybe_dequantize(extra_input, dtype).reshape(-1).contiguous()
++        hidden = x.shape[-1] // 2
++        rows = x.numel() // x.shape[-1]
++        out = torch.empty(*x.shape[:-1], hidden, dtype=dtype, device=x.device)
++        clamped = self._clamped
++        if rows > 0:
++            _interleaved_scaled_clamped_glu_fwd[(rows,)](
++                x,
++                scales,
++                out,
++                hidden,
++                clamped.limit,
++                clamped.alpha,
++                clamped.glu_linear_offset,
++                INTERLEAVE=self.glu_interleave_size,
++                BLOCK=_triton_block(hidden),
++                num_warps=8,
++            )
++        if ctx.requires_grad:
++            if is_cpu_offload_enabled():
++                mark_activation_offload(x)
++            ctx.input_requires_grad = True
++            ctx.extra_input_requires_grad = extra_input.requires_grad
++            ctx.extra_input_dtype = extra_input.dtype
++            ctx.extra_input_shape = extra_input.shape
++            ctx.dtype = dtype
++            ctx.triton_interleaved_glu = True
++            ctx.save_for_backward(x, scales)
++        return out, [()]
++
++    def _triton_backward(self, ctx, grad_output):
++        x, scales = ctx.saved_tensors
++        g = maybe_dequantize(grad_output, ctx.dtype).contiguous()
++        hidden = x.shape[-1] // 2
++        rows = x.numel() // x.shape[-1]
++        dx = torch.empty_like(x)
++        with_ds = bool(ctx.extra_input_requires_grad)
++        ds = (
++            torch.empty(rows, dtype=ctx.extra_input_dtype, device=x.device) if with_ds else None
++        )
++        clamped = self._clamped
++        if rows > 0:
++            _interleaved_scaled_clamped_glu_bwd[(rows,)](
++                g,
++                x,
++                scales,
++                dx,
++                ds if with_ds else scales,
++                hidden,
++                clamped.limit,
++                clamped.alpha,
++                clamped.glu_linear_offset,
++                INTERLEAVE=self.glu_interleave_size,
++                BLOCK=_triton_block(hidden),
++                WITH_DS=with_ds,
++                num_warps=8,
++            )
++        grad_extra_input = ds.view(ctx.extra_input_shape) if with_ds else None
++        clear_tensor_data(x)
++        return dx, [()], [(grad_extra_input,)]
++
+ 
+ class ScaledSwiGLU(_ScaledGLU):
+     r"""SwiGLU with post-scaling (matches cuDNN grouped GEMM ``act_func="swiglu"``).
+diff --git a/transformer_engine/pytorch/ops/fused/grouped_mlp.py b/transformer_engine/pytorch/ops/fused/grouped_mlp.py
+index 31189af09c9cb8c0e8e40d2c7e338b1715ab992f..7c6912b6754cec026bacd9322e5a9433a0700a49 100644
+--- a/transformer_engine/pytorch/ops/fused/grouped_mlp.py
++++ b/transformer_engine/pytorch/ops/fused/grouped_mlp.py
+@@ -25,7 +25,7 @@ from ...tensor import NVFP4Quantizer, NVFP4Tensor, NVFP4TensorStorage, Quantizer
+ from ...tensor.grouped_tensor import GroupedTensor
+ from ...tensor.mxfp8_tensor import MXFP8Quantizer
+ from ...tensor.storage.grouped_tensor_storage import GroupedTensorStorage
+-from ...triton.grouped_dbias_dscales import compute_grouped_dbias_dscales
++from ...triton.grouped_dbias_dscales import compute_grouped_dbias, compute_grouped_dbias_dscales
+ from ...utils import (
+     ceil_div,
+     clear_tensor_data,
+@@ -53,6 +53,109 @@ from .._common import (
+ )
+ from ..basic.grouped_linear import GRAD_INPUT_BUFFER_KEY, OUTPUT_BUFFER_KEY
+ 
++_PERSISTENT_GEMM_OUT = os.environ.get("NVFP4_PERSISTENT_GEMM_OUT", "0") == "1"
++# The fused-pad unpermute adds the scaled FC2 expert bias instead of grouped_bias_add.
++_DEFER_FC2_BIAS = os.environ.get("NVFP4_DEFER_FC2_BIAS", "0") == "1"
++_PERSISTENT_GEMM_BUFFERS: dict = {}
++# Timing-only oracle: expert weights are quantized once and the stale NVFP4 copies are
++# reused for every later step. The loss is wrong; only step time is meaningful.
++_ORACLE_REUSE_WQ = os.environ.get("NVFP4_ORACLE_REUSE_WQ", "0") == "1"
++
++
++def _tile_kwargs(name: str) -> dict:
++    """NVFP4_<name>_TILE="M,N,CM,CN" overrides the cuDNN grouped GEMM tiler and cluster shape."""
++    spec = os.environ.get(f"NVFP4_{name}_TILE", "")
++    if not spec:
++        return {}
++    m, n, cm, cn = (int(v) for v in spec.split(","))
++    if name not in _TILE_LOGGED and int(os.environ.get("RANK", "0")) == 0:
++        _TILE_LOGGED.add(name)
++        print(f"NVFP4 {name} tiler ({m}, {n}) cluster ({cm}, {cn})", flush=True)
++    return {"mma_tiler_mn": (m, n), "cluster_shape_mn": (cm, cn)}
++
++
++_TILE_LOGGED = set()
++
++# NVFP4_DUMP_DGLU=<path>: rank 0 saves the first eager dGLU call's kwargs (tensors on CPU,
++# strides kept) plus the discrete FC2 weights, for offline kernel benchmarking. Only calls
++# with sf_vec_size == NVFP4_DUMP_DGLU_SF (16 = NVFP4, 32 = MXFP8 tail layers) are dumped.
++_DUMP_DGLU = os.environ.get("NVFP4_DUMP_DGLU", "")
++_DUMP_DGLU_SF = int(os.environ.get("NVFP4_DUMP_DGLU_SF", "16"))
++_DUMP_DGLU_DONE = [False]
++_DGLU_TRITON_DBIAS = os.environ.get("NVFP4_DGLU_TRITON_DBIAS", "0") in ("1", "2")
++_DGLU_TRITON_DBIAS_SIDE = os.environ.get("NVFP4_DGLU_TRITON_DBIAS", "0") == "2"
++_dbias_streams = {}
++
++
++def _patch_dglu_kernel_class(path: str) -> None:
++    """Swap cuDNN FE's dGLU kernel class for a variant file (tuning knobs read from env)."""
++    import importlib.util
++    import sys
++
++    import cudnn.grouped_gemm.grouped_gemm_dglu.api as dglu_api
++
++    name = "cudnn.grouped_gemm.grouped_gemm_dglu._nvfp4_variant"
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    module.__package__ = "cudnn.grouped_gemm.grouped_gemm_dglu"
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    dglu_api.BlockScaledMoEGroupedGemmDgluDbiasKernel = module.BlockScaledMoEGroupedGemmDgluDbiasKernel
++    dglu_api._cache_of_GroupedGemmDgluSm100Objects.clear()
++
++
++def _dbias_stream(device):
++    stream = _dbias_streams.get(device)
++    if stream is None:
++        stream = torch.cuda.Stream(device=device)
++        _dbias_streams[device] = stream
++    return stream
++
++
++def _maybe_dump_dglu(kwargs: dict, discrete_weights) -> None:
++    if not _DUMP_DGLU or _DUMP_DGLU_DONE[0] or torch.cuda.is_current_stream_capturing():
++        return
++    if kwargs.get("sf_vec_size") != _DUMP_DGLU_SF:
++        return
++    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
++        return
++    _DUMP_DGLU_DONE[0] = True
++    out, skipped = {}, []
++    for key, value in kwargs.items():
++        if key in ("current_stream", "b_ptrs", "sfb_ptrs"):
++            continue
++        if torch.is_tensor(value):
++            out[key] = value.detach().cpu()
++        elif value is None or isinstance(value, (bool, int, float, str, tuple)):
++            out[key] = value
++        else:
++            out[key] = repr(value)
++            skipped.append(key)
++    if discrete_weights is not None:
++        out["_fc2_col_data"] = [w._columnwise_data.detach().cpu() for w in discrete_weights]
++        out["_fc2_col_scale"] = [w._columnwise_scale_inv.detach().cpu() for w in discrete_weights]
++    torch.save(out, _DUMP_DGLU)
++    print(f"NVFP4_DUMP_DGLU saved {sorted(out)} to {_DUMP_DGLU}; repr only: {skipped}", flush=True)
++
++
++def _finite_grouped_gemm_out(role, buffer, shape, dtype, device):
++    """Output buffer for a grouped GEMM that reads C even with a device-side beta of 0.
++
++    C only has to be finite. A buffer shared across layers and zeroed once keeps
++    finite contents (earlier GEMM outputs), so the per-call zero fill is skipped.
++    It is only valid for outputs consumed before the same GEMM runs again.
++    """
++    if buffer is None and _PERSISTENT_GEMM_OUT:
++        key = (role, tuple(shape), dtype, str(device))
++        out = _PERSISTENT_GEMM_BUFFERS.get(key)
++        if out is None:
++            out = torch.zeros(shape, dtype=dtype, device=device)
++            _PERSISTENT_GEMM_BUFFERS[key] = out
++        return out
++    out = validate_or_alloc_output(buffer, shape, dtype, device)
++    out.zero_()
++    return out
++
+ 
+ @functools.lru_cache(maxsize=None)
+ def _cudnn_frontend_version_at_least(min_version: str) -> bool:
+@@ -71,6 +174,17 @@ def _cudnn_frontend_version_supported() -> bool:
+     return _cudnn_frontend_version_at_least("1.23.0")
+ 
+ 
++@functools.lru_cache(maxsize=None)
++def _get_cached_full_tensor(
++    numel: int,
++    value: float,
++    dtype: torch.dtype,
++    device: torch.device,
++) -> torch.Tensor:
++    """Get a persistent graph-safe constant tensor."""
++    return torch.full((numel,), value, dtype=dtype, device=device)
++
++
+ def _cudnn_frontend_geglu_runtime_params() -> bool:
+     """Check cuDNN frontend is at least 1.24.0.
+ 
+@@ -297,6 +411,183 @@ def _nvfp4_single_tensor_from_grouped(
+     )
+ 
+ 
++def _quantize_expert_weights(linear_op, weights, input_requires_grad):
++    if not _ORACLE_REUSE_WQ:
++        return _quantize_expert_weights_impl(linear_op, weights, input_requires_grad)
++    cache = linear_op.__dict__.setdefault("_nvfp4_oracle_wq", {})
++    key = bool(input_requires_grad)
++    hit = cache.get(key)
++    if hit is not None:
++        return list(hit)
++    out = _quantize_expert_weights_impl(linear_op, weights, input_requires_grad)
++    if not torch.cuda.is_current_stream_capturing():
++        cache[key] = list(out)
++        if not getattr(_quantize_expert_weights, "_oracle_warned", False):
++            _quantize_expert_weights._oracle_warned = True
++            print("NVFP4_ORACLE_REUSE_WQ: expert weight quant reused (timing only)", flush=True)
++    return out
++
++
++def _quantize_expert_weights_impl(linear_op, weights, input_requires_grad):
++    """Quantize per-expert weights, in one grouped launch when NVFP4_GROUP_WEIGHT_QUANT=1."""
++    quantizers = []
++    for idx, weight in enumerate(weights):
++        quantizer = linear_op.get_quantizer("forward", 2 * idx + 1)
++        if not is_quantized_tensor(weight):
++            quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
++        quantizers.append(quantizer)
++    if os.environ.get("NVFP4_GROUP_WEIGHT_QUANT", "0") == "1" and not any(
++        is_quantized_tensor(w) for w in weights
++    ):
++        from .nvfp4_group_weight_quant import group_quantize_weights, unsupported_reason
++
++        grouped = group_quantize_weights(weights, quantizers)
++        if grouped is not None:
++            return grouped
++        if not getattr(linear_op, "_nvfp4_group_quant_warned", False):
++            linear_op._nvfp4_group_quant_warned = True
++            print(
++                "NVFP4 grouped weight quant not applicable "
++                f"({unsupported_reason(weights, quantizers)}); per-expert fallback",
++                flush=True,
++            )
++    if os.environ.get("NVFP4_SHARD_WEIGHT_AMAX", "0") == "1":
++        return _quantize_expert_weights_shard_amax(linear_op, weights, quantizers)
++    if os.environ.get("NVFP4_CACHED_WEIGHT_QUANT", "0") == "1":
++        return _quantize_expert_weights_cached(linear_op, weights, quantizers)
++    return [
++        weight if is_quantized_tensor(weight) else quantizer(weight)
++        for weight, quantizer in zip(weights, quantizers)
++    ]
++
++
++def _quantize_expert_weights_cached(linear_op, weights, quantizers):
++    """Re-quantize each expert weight into one persistent NVFP4 tensor per usage.
++
++    The row-wise and column-wise amax of a non-RHT NVFP4 quantization are equal, and TE
++    issues a 4-byte device copy to keep them in sync unless both point at one buffer.
++    Sharing the buffer drops that copy (1 per expert weight per step inside the graph).
++    """
++    cache = linear_op.__dict__.setdefault("_nvfp4_cached_weight_quant", {})
++    out = []
++    for idx, (weight, quantizer) in enumerate(zip(weights, quantizers)):
++        if is_quantized_tensor(weight):
++            out.append(weight)
++            continue
++        key = (idx, quantizer.rowwise_usage, quantizer.columnwise_usage)
++        quantized = cache.get(key)
++        if quantized is None:
++            quantized = quantizer(weight)
++            if (
++                quantized._amax_rowwise is not None
++                and quantized._amax_columnwise is not None
++                and not quantizer.with_rht
++            ):
++                quantized._amax_columnwise = quantized._amax_rowwise
++            cache[key] = quantized
++        else:
++            tex.quantize(weight, quantizer, quantized, None)
++        out.append(quantized)
++    return out
++
++
++_PREQUANT_KEY = "_nvfp4_prequant"
++_PREQUANT_PEER = "_nvfp4_prequant_peer"
++_QUANT_TENSOR_ATTRS = (
++    "_rowwise_data",
++    "_rowwise_scale_inv",
++    "_columnwise_data",
++    "_columnwise_scale_inv",
++    "_amax_rowwise",
++    "_amax_columnwise",
++)
++_prequant_streams = {}
++
++
++def _prequant_stream(device):
++    stream = _prequant_streams.get(device)
++    if stream is None:
++        stream = torch.cuda.Stream(device=device)
++        _prequant_streams[device] = stream
++    return stream
++
++
++def launch_expert_weight_prequant(fc1_op, input_requires_grad):
++    """Quantize both expert weight groups of a grouped MLP on a side stream.
++
++    Called at the start of the transformer layer so the casts overlap attention. The
++    grouped MLP forward joins the side stream before using the stashed weights.
++    """
++    peer = fc1_op.__dict__.get(_PREQUANT_PEER)
++    if peer is None:
++        return False
++    fc2_op, num_groups = peer
++    main = torch.cuda.current_stream()
++    side = _prequant_stream(main.device)
++    side.wait_stream(main)
++    with torch.cuda.stream(side):
++        for op in (fc1_op, fc2_op):
++            weights = [getattr(op, f"weight{idx}") for idx in range(num_groups)]
++            quantized = _quantize_expert_weights(op, weights, input_requires_grad)
++            op.__dict__[_PREQUANT_KEY] = (quantized, side, input_requires_grad)
++    return True
++
++
++def _take_prequant(linear_op, input_requires_grad):
++    """Join the prequant side stream and return the stashed weights if usable."""
++    entry = linear_op.__dict__.pop(_PREQUANT_KEY, None)
++    if entry is None:
++        return None
++    quantized, side, usage = entry
++    main = torch.cuda.current_stream()
++    main.wait_stream(side)
++    for q in quantized:
++        for attr in _QUANT_TENSOR_ATTRS:
++            t = getattr(q, attr, None)
++            if isinstance(t, torch.Tensor):
++                t.record_stream(main)
++    if usage != input_requires_grad:
++        return None
++    return quantized
++
++
++def _quantize_expert_weights_shard_amax(linear_op, weights, quantizers):
++    """Quantize with amaxes precomputed from the optimizer shards (see nvfp4_shard_weight_amax)."""
++    from . import nvfp4_shard_weight_amax as shard_amax
++
++    out = []
++    fallback = []
++    for idx, (weight, quantizer) in enumerate(zip(weights, quantizers)):
++        if is_quantized_tensor(weight):
++            out.append(weight)
++            continue
++        amax = None
++        if (
++            isinstance(quantizer, NVFP4Quantizer)
++            and not quantizer.with_rht
++            and not quantizer.with_amax_reduction
++        ):
++            amax = shard_amax.slot_for(weight)
++            if amax is None:
++                amax = shard_amax.register(weight)
++        if amax is None:
++            fallback.append(idx)
++            out.append(None)
++            continue
++        out.append(tex.nvfp4_quantize_with_amax(weight, quantizer, amax, amax))
++    if fallback:
++        if not getattr(linear_op, "_nvfp4_shard_amax_warned", False):
++            linear_op._nvfp4_shard_amax_warned = True
++            print(
++                f"NVFP4_SHARD_WEIGHT_AMAX: {len(fallback)} expert weights use the TE amax path "
++                f"({shard_amax.disabled_reason()})",
++                flush=True,
++            )
++        for i in fallback:
++            out[i] = quantizers[i](weights[i])
++    return out
++
++
+ def _pack_grouped_linear_bias_for_cudnn(linear_op: GroupedLinear) -> Optional[torch.Tensor]:
+     """Bias layout expected by cuDNN grouped GEMM: shape (n, num_groups), stride (1, n)."""
+     if not linear_op.has_bias:
+@@ -468,6 +759,7 @@ def _cudnn_compute_wgrad(
+         "current_stream": current_stream,
+     }
+     if use_nvfp4:
++        common_wgrad_kwargs.update(_tile_kwargs("WGRAD"))
+         global_scale_denom = 448.0 * 6.0
+         if total_tokens == 0:
+             global_scale_shape = (offsets.shape[0],)
+@@ -530,6 +822,8 @@ def _compute_grad_params(
+     scale_view_dtype,
+     sf_vec_size,
+     offsets,
++    folded_bias_column=None,
++    folded_bias_grad=None,
+ ):
+     """Compute weight gradients and build grad_params for a GroupedLinear layer.
+     Returns the grad_params list in parameter registration order.
+@@ -591,11 +885,21 @@ def _compute_grad_params(
+         delay_wgrad = fc_op.wgrad_store is not None and fc_op.wgrad_store.delay_wgrad_compute()
+         if cudnn_wgrad_kernel_fn is not None:
+             offsets = offsets if offsets.dtype == torch.int32 else offsets.to(dtype=torch.int32)
++            # With one microbatch per step the fused main-grad destination can be
++            # overwritten; the cuDNN kernel stores zeros for experts with no tokens.
++            # Tagged weights are skipped by the DDP grad-buffer zero fill.
++            overwrite_wgrad = (
++                accumulate_into_main_grad
++                and os.environ.get("NVFP4_OVERWRITE_EXPERT_WGRAD", "0") == "1"
++            )
++            if overwrite_wgrad:
++                for w in weights:
++                    w._nvfp4_wgrad_overwrite = True
+             gemm_fn = functools.partial(
+                 _cudnn_compute_wgrad,
+                 weight_shape=weight_shape,
+                 offsets=offsets,
+-                accumulate=accumulate_into_main_grad,
++                accumulate=accumulate_into_main_grad and not overwrite_wgrad,
+                 wgrad_kernel_fn=cudnn_wgrad_kernel_fn,
+                 single_grouped_weight=fc_op.single_grouped_weight,
+                 use_nvfp4=use_nvfp4,
+@@ -627,6 +931,44 @@ def _compute_grad_params(
+             fc_op.wgrad_store.put([grouped_x, grouped_dy, wgrad_output], gemm_fn)
+         else:
+             gemm_fn(grouped_x, grouped_dy, wgrad_output)
++            replace_folded_bias_grad = (
++                folded_bias_column is not None
++                and folded_bias_grad is not None
++                and (
++                    not accumulate_into_main_grad
++                    or os.environ.get(
++                        "NVFP4_EXACT_FOLDED_BIAS_MAIN_GRAD", "0"
++                    )
++                    == "1"
++                )
++            )
++            if replace_folded_bias_grad:
++                # A post-GEMM column copy is exact for an ordinary autograd
++                # destination. Do not mutate a fused main-grad destination by
++                # default: its overlap-reduction lifecycle may already treat
++                # the buffer as accumulated/ready. Production instead keeps
++                # the finite quantized folded column until exact dbias can be
++                # written inside the GEMM epilogue.
++                if fc_op.single_grouped_weight:
++                    exact_wgrad = grouped_wgrad.rowwise_data.view(
++                        num_groups, *weight_shape
++                    )
++                    exact_wgrad[..., folded_bias_column].copy_(folded_bias_grad)
++                else:
++                    for group_idx, grad_weight in enumerate(w_list):
++                        grad_weight[..., folded_bias_column].copy_(
++                            folded_bias_grad[group_idx]
++                        )
++            if os.environ.get("NVFP4_DEBUG_FUSED_MOE_FINITE", "0") == "1":
++                if fc_op.single_grouped_weight:
++                    debug_wgrads = [
++                        grouped_wgrad.rowwise_data.view(num_groups, *weight_shape)
++                    ]
++                else:
++                    debug_wgrads = w_list
++                for debug_wgrad in debug_wgrads:
++                    if not torch.isfinite(debug_wgrad).all().item():
++                        raise RuntimeError(f"{op_label} first non-finite tensor: wgrad")
+ 
+         # Need to return dummy wgrads for Megatron-LM wgrad fusion if grad is already added
+         if fc_op._accumulate_into_main_grad:
+@@ -713,8 +1055,13 @@ def fuse_grouped_mlp_ops(
+         return ops
+     if recipe is None or not (recipe.mxfp8() or recipe.nvfp4()):
+         return ops
+-    # NVFP4 fused grouped MLP uses graph-safe grouped quantize, which currently requires RHT.
+-    if recipe.nvfp4() and recipe.disable_rht:
++    # The CuDNN grouped FC1/activation/FC2 path does not itself require RHT.
++    # Permit a native-width experiment that bypasses TE's graph-safe grouped
++    # RHT kernel (which rejects GPT-OSS K=2880). This keeps the high-precision
++    # input at 2880 and determines whether the fused GEMMs are tail-safe before
++    # implementing the optimized 64-wide RHT tail.
++    allow_native_nvfp4 = bool(int(os.environ.get("NVTE_NVFP4_ALLOW_FUSED_WITHOUT_RHT", "0")))
++    if recipe.nvfp4() and recipe.disable_rht and not allow_native_nvfp4:
+         return ops
+     if activation_op_types is None:
+         activation_op_types = (ScaledSwiGLU, ScaledClampedQGeGLU)
+@@ -987,16 +1334,18 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                     None,
+                 )
+         else:
+-            fc1_weights = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
+-            quantized_fc1_weights = []
+-            for idx, weight in enumerate(fc1_weights):
+-                quantizer = fc1_op.get_quantizer("forward", 2 * idx + 1)
+-                if not is_quantized_tensor(weight):
+-                    quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
+-                    quantized_fc1_weights.append(quantizer(weight))
+-                else:
+-                    quantized_fc1_weights.append(weight)
+-            grouped_fc1_weight = quantized_fc1_weights
++            grouped_fc1_weight = _take_prequant(fc1_op, input_requires_grad)
++            if grouped_fc1_weight is None:
++                fc1_weights = [getattr(fc1_op, f"weight{idx}") for idx in range(num_groups)]
++                grouped_fc1_weight = _quantize_expert_weights(
++                    fc1_op, fc1_weights, input_requires_grad
++                )
++            if (
++                os.environ.get("NVFP4_OVERLAP_WEIGHT_QUANT", "0") == "1"
++                and not fc2_op.single_grouped_weight
++                and not torch.cuda.is_current_stream_capturing()
++            ):
++                fc1_op.__dict__[_PREQUANT_PEER] = (fc2_op, num_groups)
+ 
+         # Prepare FC2 grouped weight tensor for fused kernels.
+         if fc2_op.single_grouped_weight:
+@@ -1019,16 +1368,12 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                     None,
+                 )
+         else:
+-            fc2_weights = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
+-            quantized_fc2_weights = []
+-            for idx, weight in enumerate(fc2_weights):
+-                quantizer = fc2_op.get_quantizer("forward", 2 * idx + 1)
+-                if not is_quantized_tensor(weight):
+-                    quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
+-                    quantized_fc2_weights.append(quantizer(weight))
+-                else:
+-                    quantized_fc2_weights.append(weight)
+-            grouped_fc2_weight = quantized_fc2_weights
++            grouped_fc2_weight = _take_prequant(fc2_op, input_requires_grad)
++            if grouped_fc2_weight is None:
++                fc2_weights = [getattr(fc2_op, f"weight{idx}") for idx in range(num_groups)]
++                grouped_fc2_weight = _quantize_expert_weights(
++                    fc2_op, fc2_weights, input_requires_grad
++                )
+ 
+         # Some wrapper-copy paths may drop grouped storage metadata; enforce defaults.
+         if isinstance(grouped_fc1_weight, GroupedTensor) and not hasattr(
+@@ -1151,7 +1496,15 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         norm_const_tensor = get_cached_ones_tensor(1, torch.float32, device)
+         current_stream = torch.cuda.current_stream().cuda_stream
+ 
+-        fc1_bias_packed = _pack_grouped_linear_bias_for_cudnn(fc1_op)
++        # The padded expert path folds FC1 bias into the constant-one input
++        # channel. Passing the now-zero bias tensor to cuDNN's NVFP4 grouped
++        # GLU kernel still selects its defective bias epilogue and produces
++        # NaNs, so omit that argument entirely when folding is active.
++        fc1_bias_packed = (
++            None
++            if os.environ.get("NVFP4_FOLD_FC1_BIAS", "0") == "1"
++            else _pack_grouped_linear_bias_for_cudnn(fc1_op)
++        )
+         fc2_bias_packed = _pack_grouped_linear_bias_for_cudnn(fc2_op)
+ 
+         fc1_d_dtype = torch.bfloat16 if use_nvfp4 else torch.float8_e4m3fn
+@@ -1166,14 +1519,53 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             # cuDNN receives NVFP4 block-scaled inputs without TE's per-group
+             # global scale factors, so alpha supplies the product of the two
+             # operand global scales.
++            fc1_x_amax = _nvfp4_amax(grouped_fc1_x, columnwise=False)
++            fc1_weight_amax = _nvfp4_amax(grouped_fc1_weight, columnwise=False)
+             fc1_alpha_tensor = (
+-                _nvfp4_amax(grouped_fc1_x, columnwise=False)
+-                * _nvfp4_amax(grouped_fc1_weight, columnwise=False)
++                fc1_x_amax
++                * fc1_weight_amax
+                 / (nvfp4_global_scale_denom**2)
+             ).to(torch.float32)
++            if os.environ.get("NVFP4_DEBUG_FUSED_MOE_FINITE", "0") == "1":
++                if not torch.isfinite(fc1_alpha_tensor).all().item():
++                    raise RuntimeError("NVFP4 fused MoE non-finite FC1 alpha")
++                print(
++                    "NVFP4_FC1_SCALE_METADATA",
++                    float(fc1_x_amax.min().item()),
++                    float(fc1_x_amax.max().item()),
++                    float(fc1_weight_amax.min().item()),
++                    float(fc1_weight_amax.max().item()),
++                    float(fc1_alpha_tensor.min().item()),
++                    float(fc1_alpha_tensor.max().item()),
++                    flush=True,
++                )
++            alpha_override = os.environ.get("NVFP4_CUDNN_ALPHA_OVERRIDE")
++            if alpha_override is not None:
++                fc1_alpha_tensor = torch.full_like(fc1_alpha_tensor, float(alpha_override))
++            elif os.environ.get("NVFP4_CUDNN_ALPHA_ONE", "0") == "1":
++                fc1_alpha_tensor = torch.ones_like(fc1_alpha_tensor)
+         else:
+             fc1_alpha_tensor = alpha_tensor
+ 
++        if os.environ.get("NVFP4_DEBUG_FUSED_MOE_DISPATCH", "0") == "1":
++            split_snapshot = split_points.detach().cpu().tolist()
++            print(
++                "NVFP4_FC1_DISPATCH",
++                {
++                    "in_rows": int(in_shape[0]),
++                    "active_rows": int(split_snapshot[-1]) if split_snapshot else 0,
++                    "split_points": split_snapshot,
++                    "x_amax": fc1_x_amax.detach().cpu().tolist()
++                    if use_nvfp4
++                    else None,
++                    "weight_amax": fc1_weight_amax.detach().cpu().tolist()
++                    if use_nvfp4
++                    else None,
++                    "alpha": fc1_alpha_tensor.detach().cpu().tolist(),
++                },
++                flush=True,
++            )
++
+         use_tmem_post_rht_amax = _use_tmem_post_rht_amax()
+         use_fc1_act_hadamard = False
+         use_fc1_act_hadamard_srelu = False
+@@ -1184,7 +1576,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             and fc2_input_quantizer.with_post_rht_amax
+         )
+         activation_is_srelu = isinstance(activation_op, ScaledSReLU)
+-        activation_supports_hadamard = self._cudnn_act_func == "swiglu" or (
++        activation_supports_hadamard = self._cudnn_act_func in ("swiglu", "geglu") or (
+             activation_is_srelu and _cudnn_frontend_supports_grouped_gemm_srelu_hadamard()
+         )
+         if use_nvfp4_rht_amax and activation_supports_hadamard:
+@@ -1217,13 +1609,21 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         else:
+             fc1_activation_kwargs["norm_const_tensor"] = fc1_norm_const_tensor
+             fc1_activation_kwargs["discrete_col_sfd"] = not use_nvfp4
+-        if self._pass_geglu_runtime_params:
++        if self._pass_geglu_runtime_params and not use_fc1_act_hadamard:
+             fc1_activation_kwargs.update(
+                 linear_offset=self._cudnn_linear_offset,
+                 geglu_alpha=self._cudnn_geglu_alpha,
+                 glu_clamp_max=self._cudnn_glu_clamp_max,
+                 glu_clamp_min=self._cudnn_glu_clamp_min,
+             )
++        elif self._pass_geglu_runtime_params:
++            # cuDNN Frontend 1.26's Hadamard kernel contains the GPT-OSS
++            # QGeGLU contract in generated device code and does not expose
++            # runtime parameters. Never silently use it for another contract.
++            assert abs(self._cudnn_linear_offset - 1.0) <= 1e-6
++            assert abs(self._cudnn_geglu_alpha - 1.702) <= 1e-6
++            assert abs(self._cudnn_glu_clamp_max - 7.0) <= 1e-6
++            assert abs(self._cudnn_glu_clamp_min + 7.0) <= 1e-6
+ 
+         if fc1_op.single_grouped_weight:
+             # Clone and swizzle scales for GEMM.
+@@ -1266,10 +1666,30 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             fc1_activation_kwargs["b_dtype"] = data_dtype
+             fc1_activation_kwargs["b_major"] = "k"
+ 
++        if use_nvfp4:
++            fc1_activation_kwargs.update(_tile_kwargs("GLUH" if use_fc1_act_hadamard else "GLU"))
+         if use_fc1_act_hadamard:
+             fc1_kernel_out = self.grouped_gemm_act_hadamard_kernel()(**fc1_activation_kwargs)
+         else:
+             fc1_kernel_out = self.grouped_gemm_activation_kernel()(**fc1_activation_kwargs)
++        if os.environ.get("NVFP4_DEBUG_FUSED_MOE_FINITE", "0") == "1":
++            active_rows = int(split_points[-1].item()) if split_points.numel() else 0
++            for key in ("c_tensor", "d_tensor"):
++                value = fc1_kernel_out.get(key)
++                if (
++                    isinstance(value, torch.Tensor)
++                    and active_rows > 0
++                    and not torch.isfinite(value[:active_rows]).all().item()
++                ):
++                    raise RuntimeError(
++                        f"NVFP4 fused MoE first non-finite active tensor: FC1 {key}"
++                    )
++            for key in ("amax_tensor", "post_rht_amax_tensor"):
++                value = fc1_kernel_out.get(key)
++                if isinstance(value, torch.Tensor) and not torch.isfinite(value).all().item():
++                    raise RuntimeError(
++                        f"NVFP4 fused MoE first non-finite tensor: FC1 {key}"
++                    )
+ 
+         # Unpack kernel outputs
+         # Note: Fused kernel outputs tensors with non-contiguous
+@@ -1352,6 +1772,11 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                     else:
+                         fc2_out_buf += token_bias
+             else:
++                # Per-group beta is a device tensor, so cuBLAS still reads C (= out)
++                # and 0 * stale NaN poisons the output; C must be finite.
++                fc2_out_buf = _finite_grouped_gemm_out(
++                    "fc2_fprop", output_buffer, fc2_out_shape, dtype, device
++                )
+                 fc2_out_grouped = GroupedTensorStorage(
+                     shape=(in_shape[0], fc2_weight_shape[0]),
+                     dtype=dtype,
+@@ -1361,15 +1786,35 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                     first_dims=split_sizes,
+                     tensor_offsets=fc2_out_tensor_offsets,
+                 )
++                defer_bias = (
++                    _DEFER_FC2_BIAS
++                    and fc2_bias_for_gemm is not None
++                    and fc2_bias_scale is not None
++                )
+                 general_grouped_gemm_for_grouped_tensor(
+                     grouped_fc2_weight,
+                     grouped_fc2_x,
+                     fc2_out_grouped,
+                     layout="TN",
+-                    bias=fc2_bias_for_gemm,
+-                    bias_scale=fc2_bias_scale,
++                    bias=None if defer_bias else fc2_bias_for_gemm,
++                    bias_scale=None if defer_bias else fc2_bias_scale,
+                 )
++                if defer_bias:
++                    from transformer_engine.pytorch.triton.permutation import (
++                        defer_expert_bias,
++                    )
++
++                    defer_expert_bias(
++                        fc2_out_buf,
++                        torch.stack(fc2_op._get_bias_tensors(dtype)),
++                        fc2_bias_scale,
++                    )
+             fc2_out = fc2_out_buf
++            if (
++                os.environ.get("NVFP4_DEBUG_FUSED_MOE_FINITE", "0") == "1"
++                and not torch.isfinite(fc2_out).all().item()
++            ):
++                raise RuntimeError("NVFP4 fused MoE first non-finite tensor: FC2 output")
+         else:
+             fc2_in_row_data = fc1_kernel_out["d_tensor"]
+             fc2_in_row_data = fc2_in_row_data.view(in_shape[0], fc2_weight_shape[1])
+@@ -1597,6 +2042,26 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+         # Group splits
+         if int(split_sizes.numel()) != num_groups:
+             raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
++        debug_finite = os.environ.get("NVFP4_DEBUG_FUSED_MOE_FINITE", "0") == "1"
++        debug_active_rows = (
++            int(split_points[-1].item()) if debug_finite and split_points.numel() else 0
++        )
++        if debug_finite:
++            debug_grad_output = maybe_dequantize(grad_output, dtype)
++            if (
++                debug_active_rows > 0
++                and not torch.isfinite(debug_grad_output[:debug_active_rows]).all().item()
++            ):
++                raise RuntimeError(
++                    "NVFP4 fused MoE first non-finite active tensor: FC2 grad_output input"
++                )
++            if (
++                debug_active_rows > 0
++                and not torch.isfinite(activation_in[:debug_active_rows]).all().item()
++            ):
++                raise RuntimeError(
++                    "NVFP4 fused MoE first non-finite active tensor: saved activation_in"
++                )
+ 
+         if not fc1_ctx.weight_requires_grad:
+             grouped_fc1_x = None
+@@ -1716,6 +2181,31 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             nvfp4_global_scale_denom = nvfp4_fp4_max * nvfp4_fp8_max
+             fc2_dy_amax = _nvfp4_amax(grouped_fc2_dy, columnwise=False)
+             fc2_weight_col_amax = _nvfp4_amax(grouped_fc2_weight, columnwise=True)
++            if debug_finite:
++                if not torch.isfinite(fc2_dy_scales.float()).all().item():
++                    raise RuntimeError(
++                        "NVFP4 fused MoE first non-finite tensor: FC2 grad_output scales"
++                    )
++                debug_fc2_weights = (
++                    [grouped_fc2_weight]
++                    if fc2_op.single_grouped_weight
++                    else grouped_fc2_weight
++                )
++                for debug_weight in debug_fc2_weights:
++                    if not torch.isfinite(
++                        debug_weight._columnwise_scale_inv.float()
++                    ).all().item():
++                        raise RuntimeError(
++                            "NVFP4 fused MoE first non-finite tensor: FC2 weight scales"
++                        )
++                if not torch.isfinite(fc2_dy_amax).all().item():
++                    raise RuntimeError(
++                        "NVFP4 fused MoE first non-finite tensor: FC2 grad_output amax"
++                    )
++                if not torch.isfinite(fc2_weight_col_amax).all().item():
++                    raise RuntimeError(
++                        "NVFP4 fused MoE first non-finite tensor: FC2 weight amax"
++                    )
+             if activation_is_srelu:
+                 # DSReLU applies alpha once, so pass the full product of the
+                 # two operand global scales.
+@@ -1754,6 +2244,22 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             "discrete_col_sfd": not use_nvfp4,
+             "use_dynamic_sched": True,
+         }
++        use_fused_dqgeglu_nvfp4 = (
++            use_nvfp4
++            and os.environ.get("NVTE_CUTEDSL_FUSED_DQGEGLU_NVFP4", "0") == "1"
++        )
++        if use_fused_dqgeglu_nvfp4:
++            fc2_dactivation_kwargs["generate_nvfp4_output"] = True
++        # The epilogue dbias (bf16 atomics per 128-row tile) costs ~26% of the dGLU; the BF16
++        # d_row is summed afterwards in fp32 instead. MXFP8 layers emit FP8 d, so keep theirs.
++        triton_fc1_dbias = (
++            _DGLU_TRITON_DBIAS
++            and fc1_op.has_bias
++            and use_nvfp4
++            and not use_fused_dqgeglu_nvfp4
++        )
++        if triton_fc1_dbias:
++            fc2_dactivation_kwargs["generate_dbias"] = False
+         if self._cudnn_dact_func is not None:
+             fc2_dactivation_kwargs["beta_tensor"] = fc2_beta_tensor
+             fc2_dactivation_kwargs["act_func"] = self._cudnn_dact_func
+@@ -1810,11 +2316,32 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             fc2_dactivation_kwargs["b_dtype"] = data_dtype
+             fc2_dactivation_kwargs["b_major"] = "k" if use_nvfp4 else "n"
+ 
++        if use_nvfp4:
++            fc2_dactivation_kwargs.update(_tile_kwargs("DGLU"))
++        _maybe_dump_dglu(
++            fc2_dactivation_kwargs, None if fc2_op.single_grouped_weight else grouped_fc2_weight
++        )
+         fc2_dgrad_kernel_out = self.grouped_gemm_dactivation_kernel()(**fc2_dactivation_kwargs)
+-
+         if use_nvfp4:
+             fc1_dy_bf16 = fc2_dgrad_kernel_out["d_row_tensor"]
+             fc1_dy_bf16 = fc1_dy_bf16.view(out_shape[0], fc1_weight_shape[0]).contiguous()
++            if debug_finite:
++                for key in ("d_row_tensor", "dprob_tensor"):
++                    value = fc2_dgrad_kernel_out.get(key)
++                    if (
++                        isinstance(value, torch.Tensor)
++                        and debug_active_rows > 0
++                        and not torch.isfinite(value[:debug_active_rows]).all().item()
++                    ):
++                        raise RuntimeError(
++                            f"NVFP4 fused MoE first non-finite active tensor: dQGeGLU {key}"
++                        )
++                for key in ("amax_tensor", "dbias_tensor"):
++                    value = fc2_dgrad_kernel_out.get(key)
++                    if isinstance(value, torch.Tensor) and not torch.isfinite(value).all().item():
++                        raise RuntimeError(
++                            f"NVFP4 fused MoE first non-finite tensor: dQGeGLU {key}"
++                        )
+             fc1_dy_row_data = None
+             fc1_dy_row_scale = None
+             fc1_dy_col_data = None
+@@ -1911,8 +2438,24 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+ 
+         fc1_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
+         fc1_bias_grad_packed: Optional[torch.Tensor] = None
++        dbias_2d = None
++        fc1_dbias_side = None
+         if fc1_op.has_bias:
+-            dbias_t = fc2_dgrad_kernel_out["dbias_tensor"]
++            if triton_fc1_dbias and _DGLU_TRITON_DBIAS_SIDE:
++                # Memory-bound; overlaps the FC1 dgrad GEMM and is joined before FC1 wgrad.
++                main = torch.cuda.current_stream()
++                fc1_dbias_side = _dbias_stream(main.device)
++                fc1_dbias_side.wait_stream(main)
++                with torch.cuda.stream(fc1_dbias_side):
++                    dbias_t = compute_grouped_dbias(fc1_dy_bf16, base_split_offsets, num_groups)
++                    dbias_t = dbias_t.to(dtype=dtype)
++                fc1_dy_bf16.record_stream(fc1_dbias_side)
++                base_split_offsets.record_stream(fc1_dbias_side)
++                dbias_t.record_stream(main)
++            elif triton_fc1_dbias:
++                dbias_t = compute_grouped_dbias(fc1_dy_bf16, base_split_offsets, num_groups)
++            else:
++                dbias_t = fc2_dgrad_kernel_out["dbias_tensor"]
+             if dbias_t is not None:
+                 dbias_2d = dbias_t.squeeze(-1).to(dtype=dtype)
+                 if fc1_op.single_grouped_bias:
+@@ -1929,13 +2472,161 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                 columnwise=fc1_ctx.weight_requires_grad,
+             )
+             fc1_grad_output_quantizer.optimize_for_gemm = True
+-            grouped_fc1_dy = _group_quantize_for_grouped_mlp(
+-                fc1_dy_bf16,
+-                fc1_grad_output_quantizer,
+-                num_groups,
+-                split_sizes,
+-                tensor_offsets=fc1_dy_tensor_offsets,
++            use_fused_dqgeglu_rht_amax = (
++                os.environ.get("NVTE_CUTEDSL_FUSED_DQGEGLU_RHT_AMAX", "0") == "1"
+             )
++            if use_fused_dqgeglu_nvfp4:
++                direct_mode = os.environ.get(
++                    "NVFP4_DQGEGLU_DIRECT_MODE", "both"
++                ).lower()
++                if direct_mode not in ("both", "row", "column", "none"):
++                    raise ValueError(
++                        "NVFP4_DQGEGLU_DIRECT_MODE must be both, row, column, or none, "
++                        f"got {direct_mode!r}"
++                    )
++                row_data = fc2_dgrad_kernel_out.get("d_row_nvfp4_tensor")
++                row_scale = fc2_dgrad_kernel_out.get("d_row_nvfp4_scale_tensor")
++                col_data = fc2_dgrad_kernel_out.get("d_rht_nvfp4_tensor")
++                col_scale = fc2_dgrad_kernel_out.get("d_rht_nvfp4_scale_tensor")
++                if any(tensor is None for tensor in (row_data, row_scale, col_data, col_scale)):
++                    raise RuntimeError("Fused dQGeGLU NVFP4 kernel did not return all quantized outputs")
++                # Keep small dGLU block scales representable in E4M3 with a
++                # fixed power-of-two global encode scale. The fused kernel uses
++                # the same value when writing scales; advertise the paired
++                # amax so downstream GEMM alpha preserves TE's scale contract.
++                fixed_global_scale = float(
++                    os.environ.get("NVFP4_DQGEGLU_FIXED_GLOBAL_SCALE", "32768")
++                )
++                unit_scale_amax = _get_cached_full_tensor(
++                    num_groups,
++                    float(nvfp4_global_scale_denom) / fixed_global_scale,
++                    torch.float32,
++                    device,
++                )
++                generic_fc1_dy = None
++                if (
++                    direct_mode != "both"
++                    or os.environ.get("NVTE_CUTEDSL_DQGEGLU_DEBUG_COMPARE", "0") == "1"
++                ):
++                    generic_fc1_dy = _group_quantize_for_grouped_mlp(
++                        fc1_dy_bf16,
++                        fc1_grad_output_quantizer,
++                        num_groups,
++                        split_sizes,
++                        tensor_offsets=fc1_dy_tensor_offsets,
++                    )
++                use_direct_row = direct_mode in ("both", "row")
++                use_direct_column = direct_mode in ("both", "column")
++                grouped_fc1_dy = GroupedTensor(
++                    shape=(out_shape[0], fc1_weight_shape[0]),
++                    dtype=dtype,
++                    num_tensors=num_groups,
++                    quantizer=fc1_grad_output_quantizer,
++                    data=(
++                        row_data.reshape(-1)
++                        if use_direct_row
++                        else generic_fc1_dy.rowwise_data.reshape(-1)
++                    ),
++                    columnwise_data=(
++                        col_data.reshape(-1)
++                        if use_direct_column
++                        else generic_fc1_dy.columnwise_data.reshape(-1)
++                    ),
++                    # row_scale is a non-contiguous logical view over the
++                    # physically GEMM-swizzled scale buffer. reshape(-1) would
++                    # materialize logical order and silently destroy the ABI.
++                    scale_inv=(
++                        row_scale.as_strided((row_scale.numel(),), (1,))
++                        if use_direct_row
++                        else generic_fc1_dy.scale_inv
++                    ),
++                    columnwise_scale_inv=(
++                        col_scale.reshape(-1)
++                        if use_direct_column
++                        else generic_fc1_dy.columnwise_scale_inv
++                    ),
++                    amax=(
++                        unit_scale_amax
++                        if use_direct_row
++                        else _nvfp4_amax(generic_fc1_dy, columnwise=False)
++                    ),
++                    columnwise_amax=(
++                        unit_scale_amax
++                        if use_direct_column
++                        else _nvfp4_amax(generic_fc1_dy, columnwise=True)
++                    ),
++                    first_dims=split_sizes,
++                    tensor_offsets=fc1_dy_tensor_offsets,
++                    with_gemm_swizzled_scales=True,
++                )
++                if os.environ.get("NVTE_CUTEDSL_DQGEGLU_DEBUG_COMPARE", "0") == "1":
++                    direct_row_bytes = row_data.view(torch.uint8).reshape(-1)
++                    generic_row_bytes = generic_fc1_dy.rowwise_data.view(torch.uint8).reshape(-1)
++                    direct_col_bytes = col_data.view(torch.uint8).reshape(-1)
++                    generic_col_bytes = generic_fc1_dy.columnwise_data.view(torch.uint8).reshape(-1)
++                    direct_row_scales = row_scale.float().reshape(-1)
++                    generic_row_scales = generic_fc1_dy.scale_inv.float().reshape(-1)
++                    direct_col_scales = col_scale.float().reshape(-1)
++                    generic_col_scales = generic_fc1_dy.columnwise_scale_inv.float().reshape(-1)
++                    print(
++                        "DQGEGLU_NVFP4_DEBUG",
++                        {
++                            "row_byte_equal": (
++                                direct_row_bytes == generic_row_bytes
++                            ).float().mean().item(),
++                            "col_byte_equal": (
++                                direct_col_bytes == generic_col_bytes
++                            ).float().mean().item(),
++                            "direct_row_head": direct_row_bytes[:32].cpu().tolist(),
++                            "generic_row_head": generic_row_bytes[:32].cpu().tolist(),
++                            "direct_col_head": direct_col_bytes[:32].cpu().tolist(),
++                            "generic_col_head": generic_col_bytes[:32].cpu().tolist(),
++                            "direct_row_scale_head": direct_row_scales[:16].cpu().tolist(),
++                            "generic_row_scale_head": generic_row_scales[:16].cpu().tolist(),
++                            "direct_col_scale_head": direct_col_scales[:16].cpu().tolist(),
++                            "generic_col_scale_head": generic_col_scales[:16].cpu().tolist(),
++                            "generic_row_amax": _nvfp4_amax(
++                                generic_fc1_dy, columnwise=False
++                            ).reshape(-1).cpu().tolist(),
++                            "generic_col_amax": _nvfp4_amax(
++                                generic_fc1_dy, columnwise=True
++                            ).reshape(-1).cpu().tolist(),
++                        },
++                    )
++            elif use_fused_dqgeglu_rht_amax:
++                dglu_amaxes = fc2_dgrad_kernel_out.get("amax_tensor")
++                if dglu_amaxes is None or dglu_amaxes.shape != (num_groups, 2, 1):
++                    raise RuntimeError(
++                        "Fused dQGeGLU RHT amax requires cuDNN output "
++                        f"shape {(num_groups, 2, 1)}, got "
++                        f"{None if dglu_amaxes is None else tuple(dglu_amaxes.shape)}"
++                    )
++                # The regular grouped NVFP4 path does not synchronize activation
++                # amaxes across DP ranks. Match that contract here: the generic
++                # precomputed-amax extension otherwise inserts a blocking NCCL
++                # allreduce for every layer.
++                reduce_amax = fc1_grad_output_quantizer.with_amax_reduction
++                fc1_grad_output_quantizer.with_amax_reduction = False
++                try:
++                    grouped_fc1_dy = _group_quantize_with_amax_for_grouped_mlp(
++                        fc1_dy_bf16,
++                        fc1_grad_output_quantizer,
++                        num_groups,
++                        split_sizes,
++                        dglu_amaxes[:, 0, :].reshape(-1),
++                        dglu_amaxes[:, 1, :].reshape(-1),
++                        tensor_offsets=fc1_dy_tensor_offsets,
++                    )
++                finally:
++                    fc1_grad_output_quantizer.with_amax_reduction = reduce_amax
++            else:
++                grouped_fc1_dy = _group_quantize_for_grouped_mlp(
++                    fc1_dy_bf16,
++                    fc1_grad_output_quantizer,
++                    num_groups,
++                    split_sizes,
++                    tensor_offsets=fc1_dy_tensor_offsets,
++                )
+         else:
+             grouped_fc1_dy = GroupedTensor(
+                 shape=(out_shape[0], fc1_weight_shape[0]),
+@@ -2008,6 +2699,10 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                         layout="NN",
+                     )
+                 else:
++                    # See FC2 fprop: device-side beta=0 does not skip reading C.
++                    grad_input = _finite_grouped_gemm_out(
++                        "fc1_dgrad", grad_input_buffer, in_shape, dtype, device
++                    )
+                     fc1_x_tensor_offsets = base_split_offsets * fc1_weight_shape[1]
+                     grouped_grad_input = GroupedTensor(
+                         shape=(out_shape[0], fc1_weight_shape[1]),
+@@ -2095,14 +2790,31 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+                 grad_input_buffer = validate_or_alloc_output(
+                     grad_input_buffer, in_shape, dtype, device
+                 )
++                # Dynamic grouped scheduling does not launch FC1-dgrad CTAs
++                # for the fixed-buffer suffix beyond padded_offsets[-1].
++                # Clear that maximum suffix; active rows in the range are
++                # overwritten by the grouped GEMM.
++                if out_shape[0] > 0 and num_groups > 1:
++                    max_inactive_rows = min(out_shape[0], (num_groups - 1) * 256)
++                    grad_input_buffer[-max_inactive_rows:].zero_()
+                 fc1_dgrad_kwargs["d_tensor"] = grad_input_buffer.as_strided(
+                     (out_shape[0], fc1_weight_shape[1], 1),
+                     (fc1_weight_shape[1], 1, out_shape[0] * fc1_weight_shape[1]),
+                 )
+                 self.grouped_gemm_quant_kernel()(**fc1_dgrad_kwargs)
+                 grad_input = grad_input_buffer
++                if (
++                    debug_finite
++                    and debug_active_rows > 0
++                    and not torch.isfinite(grad_input[:debug_active_rows]).all().item()
++                ):
++                    raise RuntimeError(
++                        "NVFP4 fused MoE first non-finite active tensor: FC1 dgrad"
++                    )
+ 
+         # FC1 wgrad GEMM
++        if fc1_dbias_side is not None:
++            torch.cuda.current_stream().wait_stream(fc1_dbias_side)
+         fc1_grad_params = _compute_grad_params(
+             fc_op=fc1_op,
+             ctx=fc1_ctx,
+@@ -2121,6 +2833,18 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
+             scale_view_dtype=scale_view_dtype,
+             sf_vec_size=sf_vec_size,
+             offsets=split_points,
++            folded_bias_column=(
++                int(os.environ.get("NVFP4_FC1_FOLDED_BIAS_COLUMN", "2880"))
++                if use_fused_dqgeglu_nvfp4
++                and os.environ.get("NVFP4_FOLD_FC1_BIAS", "0") == "1"
++                else None
++            ),
++            folded_bias_grad=(
++                dbias_2d
++                if use_fused_dqgeglu_nvfp4
++                and os.environ.get("NVFP4_FOLD_FC1_BIAS", "0") == "1"
++                else None
++            ),
+         )
+ 
+         # Clear FC1 input tensor if possible
+@@ -2160,6 +2884,8 @@ class GroupedMLP_CuTeGEMMGLU(_GroupedMLP_CuTeGEMMBase):
+     @functools.lru_cache(maxsize=None)
+     def grouped_gemm_act_hadamard_kernel(cls) -> Optional[Callable]:
+         """Fused grouped GEMM activation kernel that also emits NVFP4 RHT amaxes."""
++        if os.environ.get("NVFP4_DISABLE_FUSED_ACT_HADAMARD", "0") == "1":
++            return None
+         try:
+             from cudnn import (
+                 grouped_gemm_glu_hadamard_wrapper_sm100,
+@@ -2175,6 +2901,12 @@ class GroupedMLP_CuTeGEMMGLU(_GroupedMLP_CuTeGEMMBase):
+         """Fused kernel for grouped GEMM, GLU activation backward, and scale grad."""
+         from cudnn import grouped_gemm_dglu_wrapper_sm100  # pylint: disable=no-name-in-module
+ 
++        kernel_file = os.environ.get("NVFP4_DGLU_KERNEL_FILE", "")
++        if not kernel_file:
++            raise RuntimeError(
++                "NVFP4_DGLU_KERNEL_FILE must name the dGLU kernel file (dglu_kernel_ep.py)"
++            )
++        _patch_dglu_kernel_class(kernel_file)
+         return grouped_gemm_dglu_wrapper_sm100
+ 
+ 
+@@ -2199,6 +2931,8 @@ class GroupedMLP_CuTeGEMMUnary(_GroupedMLP_CuTeGEMMBase):
+     @functools.lru_cache(maxsize=None)
+     def grouped_gemm_act_hadamard_kernel(cls) -> Optional[Callable]:
+         """Fused grouped GEMM activation kernel that also emits NVFP4 RHT amaxes."""
++        if os.environ.get("NVFP4_DISABLE_FUSED_ACT_HADAMARD", "0") == "1":
++            return None
+         if not _cudnn_frontend_supports_grouped_gemm_srelu_hadamard():
+             return None
+ 
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_group_weight_quant.py b/transformer_engine/pytorch/ops/fused/nvfp4_group_weight_quant.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce8d504939f300d59f865fcf43a21751fb3ada1b
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_group_weight_quant.py
+@@ -0,0 +1,293 @@
++# Classification: Internal
++"""Grouped NVFP4 2D (16x16) weight quantization for equally shaped expert weights.
++
++Replaces one zero-amax, amax and quantize launch per expert with two launches per group.
++Numerics follow TE ``quantize_transpose_nvfp4_2D_kernel`` (round-to-nearest, 448 E4M3 bound).
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer, NVFP4Tensor
++from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
++
++_AMAX_PROGRAMS = 64
++_AMAX_BLOCK = 8192
++_FLT_MAX = tl.constexpr(3.4028234663852886e38)
++_PTR_TABLES = {}
++
++
++@triton.jit
++def _expert_base(ptr_table, expert):
++    return tl.load(ptr_table + expert).to(tl.pointer_type(tl.bfloat16))
++
++
++@triton.jit
++def _group_amax_kernel(ptr_table, partial_ptr, numel, iters, BLOCK: tl.constexpr):
++    pid = tl.program_id(0)
++    expert = tl.program_id(1)
++    base = _expert_base(ptr_table, expert)
++    offs = tl.arange(0, BLOCK)
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    start = pid * iters * BLOCK
++    for i in range(iters):
++        idx = start + i * BLOCK + offs
++        x = tl.load(base + idx, mask=idx < numel, other=0.0)
++        acc = tl.maximum(acc, tl.abs(x.to(tl.float32)))
++    tl.store(partial_ptr + expert * tl.num_programs(0) + pid, tl.max(acc, axis=0))
++
++
++@triton.jit
++def _swizzled_scale_offset(r, c, col_length):
++    cbg_cnt = (col_length + 3) // 4
++    rb = r // 128
++    rem = r % 128
++    return ((rb * cbg_cnt + c // 4) * 32 + rem % 32) * 16 + (rem // 32) * 4 + c % 4
++
++
++@triton.jit
++def _cvt_e2m1x2(lo, hi):
++    # Same instruction as TE: the first source lands in the upper nibble.
++    return tl.inline_asm_elementwise(
++        """
++        {
++        .reg .b8 b0, b1, b2, b3;
++        cvt.rn.satfinite.e2m1x2.f32 b0, $5, $1;
++        cvt.rn.satfinite.e2m1x2.f32 b1, $6, $2;
++        cvt.rn.satfinite.e2m1x2.f32 b2, $7, $3;
++        cvt.rn.satfinite.e2m1x2.f32 b3, $8, $4;
++        mov.b32 $0, {b0, b1, b2, b3};
++        }
++        """,
++        "=r,r,r,r,r,r,r,r,r",
++        [lo, hi],
++        dtype=tl.uint8,
++        is_pure=True,
++        pack=4,
++    )
++
++
++@triton.jit
++def _group_quant_2d_kernel(
++    ptr_table,
++    partial_ptr,
++    amax_ptr,
++    row_data_ptr,
++    col_data_ptr,
++    row_scale_ptr,
++    col_scale_ptr,
++    M,
++    K,
++    row_scale_stride,
++    col_scale_stride,
++    row_scale_expert_stride,
++    col_scale_expert_stride,
++    NUM_PARTIALS: tl.constexpr,
++    MB: tl.constexpr,
++    KB: tl.constexpr,
++    COLUMNWISE: tl.constexpr,
++    SWIZZLED: tl.constexpr,
++):
++    # One program covers MB x KB 16x16 blocks, held as a [MB, 16, KB, 16] tensor so the
++    # block reductions and scale broadcasts need no layout conversion.
++    pid_k = tl.program_id(0)
++    pid_m = tl.program_id(1)
++    expert = tl.program_id(2)
++    e64 = expert.to(tl.int64)
++
++    amax = tl.max(tl.load(partial_ptr + expert * NUM_PARTIALS + tl.arange(0, NUM_PARTIALS)), axis=0)
++    s_enc = tl.minimum(tl.math.div_rn(2688.0, amax), _FLT_MAX)
++    s_enc = tl.where((amax == 0.0) | (s_enc == 0.0), 1.0, s_enc)
++    s_dec = tl.math.div_rn(1.0, s_enc)
++    if (pid_k == 0) & (pid_m == 0):
++        tl.store(amax_ptr + expert * 2, amax)
++        tl.store(amax_ptr + expert * 2 + 1, amax)
++
++    mb = tl.arange(0, MB)
++    kb = tl.arange(0, KB)
++    i16 = tl.arange(0, 16)
++    i8 = tl.arange(0, 8)
++    row0 = pid_m * (MB * 16)
++    col0 = pid_k * (KB * 16)
++    x_base = _expert_base(ptr_table, expert) + row0 * K + col0
++    x_off = (mb[:, None, None, None] * 16 + i16[None, :, None, None]) * K + (
++        kb[None, None, :, None] * 16 + i16[None, None, None, :]
++    )
++    x = tl.load(x_base + x_off).to(tl.float32)
++
++    blk = tl.max(tl.max(tl.abs(x), axis=3), axis=1)
++    sf = tl.minimum(blk * (s_enc * 0.16666666666666666), _FLT_MAX).to(tl.float8e4nv)
++    inv = tl.minimum(tl.math.div_rn(1.0, sf.to(tl.float32) * s_dec), _FLT_MAX)
++    y = x * inv[:, None, :, None]
++    sf_bits = sf.to(tl.uint8, bitcast=True)
++    half = e64 * (M * K // 2)
++
++    lo, hi = tl.split(tl.reshape(y, [MB, 16, KB, 8, 2]))
++    packed = _cvt_e2m1x2(lo, hi)
++    r_base = row_data_ptr + half + row0 * (K // 2) + col0 // 2
++    r_off = (mb[:, None, None, None] * 16 + i16[None, :, None, None]) * (K // 2) + (
++        kb[None, None, :, None] * 8 + i8[None, None, None, :]
++    )
++    tl.store(r_base + r_off, packed)
++    # Rowwise scale matrix is [M, K/16]: one entry per row per 16-column block.
++    srow = row0 + mb[:, None, None] * 16 + i16[None, :, None]
++    scol = pid_k * KB + kb[None, None, :]
++    rs = tl.broadcast_to(sf_bits[:, None, :], [MB, 16, KB])
++    if SWIZZLED:
++        off = _swizzled_scale_offset(srow, scol, K // 16)
++    else:
++        off = srow * row_scale_stride + scol
++    tl.store(row_scale_ptr + e64 * row_scale_expert_stride + off, rs)
++
++    if COLUMNWISE:
++        lo, hi = tl.split(tl.permute(tl.reshape(y, [MB, 8, 2, KB, 16]), (0, 1, 3, 4, 2)))
++        packed = _cvt_e2m1x2(lo, hi)
++        c_base = col_data_ptr + half + col0 * (M // 2) + row0 // 2
++        c_off = (kb[None, None, :, None] * 16 + i16[None, None, None, :]) * (M // 2) + (
++            mb[:, None, None, None] * 8 + i8[None, :, None, None]
++        )
++        tl.store(c_base + c_off, packed)
++        # Columnwise scale matrix is [K, M/16]: one entry per column per 16-row block.
++        crow = col0 + kb[None, :, None] * 16 + i16[None, None, :]
++        ccol = pid_m * MB + mb[:, None, None]
++        cs = tl.broadcast_to(sf_bits[:, :, None], [MB, KB, 16])
++        if SWIZZLED:
++            off = _swizzled_scale_offset(crow, ccol, M // 16)
++        else:
++            off = crow * col_scale_stride + ccol
++        tl.store(col_scale_ptr + e64 * col_scale_expert_stride + off, cs)
++
++
++def unsupported_reason(weights, quantizers):
++    """Return why the grouped path cannot run, or None."""
++    if len(weights) < 2 or len(quantizers) != len(weights):
++        return "group size"
++    w0, q0 = weights[0], quantizers[0]
++    if w0.dtype != torch.bfloat16 or w0.dim() != 2 or not w0.is_cuda:
++        return f"weight {w0.dtype} dim={w0.dim()}"
++    M, K = w0.shape
++    if M % 128 or K % 128 or (M // 16) % 4 or (K // 16) % 4 or M * K >= 2**31:
++        return f"shape {tuple(w0.shape)}"
++    for w in weights:
++        if w.shape != w0.shape or w.dtype != w0.dtype or not w.is_contiguous():
++            return "weights differ or are not contiguous"
++    for q in quantizers:
++        if not isinstance(q, NVFP4Quantizer):
++            return f"quantizer {type(q).__name__}"
++        flags = dict(
++            with_2d_quantization=q.with_2d_quantization,
++            with_rht=q.with_rht,
++            stochastic_rounding=q.stochastic_rounding,
++            row_scaled_nvfp4=q.row_scaled_nvfp4,
++            nvfp4_use_4over6=q.nvfp4_use_4over6,
++            with_amax_reduction=q.with_amax_reduction,
++            rowwise_usage=q.rowwise_usage,
++        )
++        wanted = dict(
++            with_2d_quantization=True,
++            with_rht=False,
++            stochastic_rounding=False,
++            row_scaled_nvfp4=False,
++            nvfp4_use_4over6=False,
++            with_amax_reduction=False,
++            rowwise_usage=True,
++        )
++        if flags != wanted:
++            return f"quantizer flags {flags}"
++        if (
++            q.columnwise_usage != q0.columnwise_usage
++            or q.optimize_for_gemm != q0.optimize_for_gemm
++            or q.internal != q0.internal
++            or q.dtype != q0.dtype
++        ):
++            return "quantizers differ"
++    if torch.cuda.is_current_stream_capturing() and _ptr_key(weights) not in _PTR_TABLES:
++        return "pointer table not built before capture"
++    return None
++
++
++def _ptr_key(weights):
++    return tuple(w.data_ptr() for w in weights)
++
++
++def _ptr_table(weights):
++    key = _ptr_key(weights)
++    table = _PTR_TABLES.get(key)
++    if table is None:
++        table = torch.tensor(key, dtype=torch.int64, device=weights[0].device)
++        _PTR_TABLES[key] = table
++    return table
++
++
++def group_quantize_weights(weights, quantizers, bm=64, bk=128, num_warps=4):
++    """Quantize equally shaped BF16 expert weights; returns None when not applicable."""
++    if unsupported_reason(weights, quantizers) is not None:
++        return None
++    table = _ptr_table(weights)
++
++    q0 = quantizers[0]
++    E = len(weights)
++    M, K = weights[0].shape
++    device = weights[0].device
++    columnwise = q0.columnwise_usage
++    swizzled = bool(q0.optimize_for_gemm)
++    numel = M * K
++
++    rs_shape = q0.get_scale_shape((M, K), False)
++    cs_shape = q0.get_scale_shape((M, K), True)
++    row_data = torch.empty((E, M, K // 2), dtype=torch.uint8, device=device)
++    row_scale = torch.empty((E, *rs_shape), dtype=torch.uint8, device=device)
++    col_data = col_scale = None
++    if columnwise:
++        col_data = torch.empty((E, K, M // 2), dtype=torch.uint8, device=device)
++        col_scale = torch.empty((E, *cs_shape), dtype=torch.uint8, device=device)
++    amax = torch.empty((E, 2), dtype=torch.float32, device=device)
++    partial = torch.empty((E, _AMAX_PROGRAMS), dtype=torch.float32, device=device)
++
++    iters = triton.cdiv(numel, _AMAX_PROGRAMS * _AMAX_BLOCK)
++    _group_amax_kernel[(_AMAX_PROGRAMS, E)](
++        table, partial, numel, iters, BLOCK=_AMAX_BLOCK, num_warps=8
++    )
++    _group_quant_2d_kernel[(K // bk, M // bm, E)](
++        table,
++        partial,
++        amax,
++        row_data,
++        col_data if columnwise else row_data,
++        row_scale,
++        col_scale if columnwise else row_scale,
++        M,
++        K,
++        rs_shape[1],
++        cs_shape[1],
++        rs_shape[0] * rs_shape[1],
++        cs_shape[0] * cs_shape[1],
++        NUM_PARTIALS=_AMAX_PROGRAMS,
++        MB=bm // 16,
++        KB=bk // 16,
++        COLUMNWISE=columnwise,
++        SWIZZLED=swizzled,
++        num_warps=num_warps,
++    )
++
++    out = []
++    for e, q in enumerate(quantizers):
++        kwargs = dict(
++            rowwise_data=row_data[e],
++            rowwise_scale_inv=row_scale[e],
++            columnwise_data=col_data[e] if columnwise else None,
++            columnwise_scale_inv=col_scale[e] if columnwise else None,
++            amax_rowwise=amax[e, 0:1],
++            amax_columnwise=amax[e, 1:2] if columnwise else None,
++            fp4_dtype=q.dtype,
++            quantizer=q,
++            with_gemm_swizzled_scales=swizzled,
++        )
++        if q.internal:
++            out.append(NVFP4TensorStorage(**kwargs, fake_dtype=weights[e].dtype))
++        else:
++            out.append(
++                NVFP4Tensor(shape=(M, K), dtype=weights[e].dtype, requires_grad=False, **kwargs)
++            )
++    return out
+diff --git a/transformer_engine/pytorch/ops/fused/nvfp4_shard_weight_amax.py b/transformer_engine/pytorch/ops/fused/nvfp4_shard_weight_amax.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91bae683baa8e3ff2ba092fe24a747c42f3b80d9
+--- /dev/null
++++ b/transformer_engine/pytorch/ops/fused/nvfp4_shard_weight_amax.py
+@@ -0,0 +1,338 @@
++"""Per-expert-weight NVFP4 amax computed from the distributed-optimizer shards.
++
++Quantizing an expert weight normally runs zero_amax + amax over the full gathered
++weight before the cast. Here each rank reduces |w| over only its own param-buffer
++shard (the bytes the optimizer just wrote), one MAX all-reduce combines the shards,
++and the cast reads the result via ``tex.nvfp4_quantize_with_amax``. max is exact, so
++the quantized weights are bit-identical to ``quantizer(weight)``.
++
++Protocol:
++  * ``register(param)`` on the first quantization of each expert weight (eager, before
++    graph capture) allocates a persistent fp32 slot and seeds it from the full weight.
++  * ``mark_dirty()`` after every optimizer step.
++  * ``refresh(bucket_groups)`` before the first param all-gather after a step
++    recomputes every slot from the local shards.
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++_CAPACITY = 8192
++_CHUNK_BLOCK = 4096
++_CHUNK_ITERS = 8
++_CHUNK = _CHUNK_BLOCK * _CHUNK_ITERS
++
++_amax_buf = None
++_slots = {}
++# Slot views handed to quantization are built with set_() so they get their own autograd
++# version counter; every in-place write goes through _amax_buf, whose counter is separate,
++# so saved quantized weights are not flagged as modified by the per-step refresh.
++_views = {}
++_dirty = False
++_disabled_reason = None
++_plan = None
++_plan_nslots = -1
++counters = {"dirty": 0, "refresh": 0}
++
++
++@triton.jit
++def _segment_amax_kernel(
++    base_ptr,
++    chunk_start_ptr,
++    chunk_len_ptr,
++    chunk_slot_ptr,
++    out_ptr,
++    BLOCK: tl.constexpr,
++    ITERS: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    start = tl.load(chunk_start_ptr + pid)
++    n = tl.load(chunk_len_ptr + pid)
++    slot = tl.load(chunk_slot_ptr + pid)
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for i in tl.static_range(ITERS):
++        offs = i * BLOCK + tl.arange(0, BLOCK)
++        x = tl.load(base_ptr + start + offs, mask=offs < n, other=0.0).to(tl.float32)
++        acc = tl.maximum(acc, tl.abs(x))
++    tl.atomic_max(out_ptr + slot, tl.max(acc, axis=0))
++
++
++def disabled_reason():
++    return _disabled_reason
++
++
++def disable(reason):
++    global _disabled_reason
++    if _disabled_reason is None:
++        _disabled_reason = reason
++        print(f"NVFP4_SHARD_WEIGHT_AMAX disabled: {reason}", flush=True)
++
++
++def slot_for(param):
++    """Return the 1-element amax view for ``param`` or None if unavailable."""
++    if _disabled_reason is not None:
++        return None
++    return _views.get(param)
++
++
++def register(param):
++    """Allocate a slot for ``param`` and seed it from the full weight (eager only)."""
++    global _amax_buf
++    if _disabled_reason is not None:
++        return None
++    if param in _slots:
++        return slot_for(param)
++    if torch.cuda.is_current_stream_capturing():
++        return None
++    if param.dtype != torch.bfloat16 or not param.is_contiguous():
++        disable(f"unsupported weight {param.dtype} contiguous={param.is_contiguous()}")
++        return None
++    if _amax_buf is None:
++        _amax_buf = torch.zeros(_CAPACITY, dtype=torch.float32, device=param.device)
++    slot = len(_slots)
++    if slot >= _CAPACITY:
++        disable("slot capacity exceeded")
++        return None
++    _slots[param] = slot
++    _amax_buf[slot : slot + 1].copy_(param.detach().abs().amax().float().view(1))
++    view = torch.empty(0, dtype=torch.float32, device=_amax_buf.device)
++    view.set_(_amax_buf.untyped_storage(), slot, (1,), (1,))
++    _views[param] = view
++    return view
++
++
++def mark_dirty():
++    global _dirty
++    _dirty = True
++    counters["dirty"] += 1
++
++
++def _build_plan(bucket_groups, only=None):
++    """Map each registered param's local-shard segment into chunk tables per DP group.
++
++    ``only`` restricts the plan to a subset of the registered params."""
++    owner = {}
++    for group in bucket_groups:
++        for bucket in group.buckets:
++            if bucket.param_data is None:
++                continue
++            for p in bucket.params:
++                if p in _slots:
++                    owner[p] = (group, bucket)
++    missing = [p for p in _slots if p not in owner]
++    if missing:
++        disable(f"{len(missing)} registered weights not in any DDP bucket")
++        return None
++
++    selected = {p: s for p, s in _slots.items() if only is None or p in only}
++    per_pg = {}
++    for p, slot in selected.items():
++        group, bucket = owner[p]
++        buf = bucket.param_data
++        if buf.dtype != torch.bfloat16:
++            disable(f"param buffer dtype {buf.dtype}")
++            return None
++        esize = buf.element_size()
++        off_bytes = p.data_ptr() - buf.data_ptr()
++        if off_bytes < 0 or off_bytes % esize or off_bytes // esize + p.numel() > buf.numel():
++            disable("weight storage is not a view into its bucket param buffer")
++            return None
++        off = off_bytes // esize
++        size = group.intra_distributed_optimizer_instance_size
++        rank = group.intra_distributed_optimizer_instance_rank
++        shard = buf.numel() // size
++        lo = max(off, rank * shard)
++        hi = min(off + p.numel(), (rank + 1) * shard)
++        pg = group.intra_distributed_optimizer_instance_group
++        entry = per_pg.setdefault(id(pg), {"pg": pg, "segs": []})
++        if hi > lo:
++            entry["segs"].append((buf, lo, hi - lo, slot))
++
++    plans = []
++    for entry in per_pg.values():
++        segs = entry["segs"]
++        slots = sorted({s for _, _, _, s in segs} | {
++            selected[p] for p in selected
++            if id(owner[p][0].intra_distributed_optimizer_instance_group) == id(entry["pg"])
++        })
++        base = min((b.data_ptr() for b, _, _, _ in segs), default=None)
++        starts, lens, chunk_slots = [], [], []
++        base_tensor = None
++        for buf, lo, n, slot in segs:
++            if buf.data_ptr() == base:
++                base_tensor = buf
++            rel = (buf.data_ptr() - base) // 2 + lo
++            for c in range(0, n, _CHUNK):
++                starts.append(rel + c)
++                lens.append(min(_CHUNK, n - c))
++                chunk_slots.append(slot)
++        dev = _amax_buf.device
++        slot_idx = torch.tensor(slots, dtype=torch.int64, device=dev)
++        plans.append(
++            {
++                "pg": entry["pg"],
++                "base": base_tensor,
++                "starts": torch.tensor(starts, dtype=torch.int64, device=dev),
++                "lens": torch.tensor(lens, dtype=torch.int64, device=dev),
++                "slots": torch.tensor(chunk_slots, dtype=torch.int64, device=dev),
++                "nchunks": len(starts),
++                "slot_idx": slot_idx,
++                "seg_slots": {s for _, _, _, s in segs},
++                "contig": (slots == list(range(slots[0], slots[0] + len(slots)))) if slots else True,
++                "lo": slots[0] if slots else 0,
++                "hi": slots[-1] + 1 if slots else 0,
++            }
++        )
++    return plans
++
++
++_side_pgs = {}
++
++
++def _reduce_group(pg):
++    """A duplicate of ``pg`` on its own communicator when side_group is enabled, so the
++    amax all-reduce is not queued behind param all-gathers already in flight on ``pg``."""
++    if not use_side_group:
++        return pg
++    side = _side_pgs.get(id(pg))
++    if side is None:
++        ranks = torch.distributed.get_process_group_ranks(pg)
++        side = torch.distributed.new_group(ranks=ranks)
++        _side_pgs[id(pg)] = side
++    return side
++
++
++use_side_group = False
++
++
++def refresh(bucket_groups):
++    """Recompute every slot from the local shards if an optimizer step happened."""
++    global _dirty, _plan, _plan_nslots
++    if not _dirty or _disabled_reason is not None or not _slots:
++        return
++    if torch.cuda.is_current_stream_capturing():
++        return
++    _dirty = False
++    counters["refresh"] += 1
++    if _plan is None or _plan_nslots != len(_slots):
++        _plan = _build_plan(bucket_groups)
++        _plan_nslots = len(_slots)
++        if _plan is None:
++            return
++    _run_plans(_plan)
++
++
++_subset_plans = {}
++
++
++def refresh_subset(bucket_groups, groups):
++    """Recompute the slots of the weights owned by ``groups`` now, independent of the dirty
++    flag. ``bucket_groups`` is every bucket group, as passed to ``refresh``."""
++    if _disabled_reason is not None or not _slots or torch.cuda.is_current_stream_capturing():
++        return
++    key = tuple(id(g) for g in groups)
++    hit = _subset_plans.get(key)
++    if hit is None or hit[0] != len(_slots):
++        owned = {p for g in groups for b in g.buckets for p in b.params if p in _slots}
++        plans = _build_plan(bucket_groups, only=owned) if owned else []
++        if plans is None:
++            return
++        hit = _subset_plans[key] = (len(_slots), plans)
++    if hit[1]:
++        counters["subset_refresh"] = counters.get("subset_refresh", 0) + 1
++        _run_plans(hit[1])
++
++
++_lookup = {"n": -1, "fn": None}
++
++
++def slot_lookup():
++    """f(tensor) -> slot of the registered weight whose storage holds ``tensor``, or -1."""
++    import bisect
++
++    if _lookup["n"] != len(_slots):
++        ranges = sorted(
++            (p.data_ptr(), p.data_ptr() + p.numel() * p.element_size(), s) for p, s in _slots.items()
++        )
++        starts = [r[0] for r in ranges]
++
++        def fn(t):
++            ptr = t.data_ptr()
++            i = bisect.bisect_right(starts, ptr) - 1
++            if i >= 0 and ptr + t.numel() * t.element_size() <= ranges[i][1]:
++                return ranges[i][2]
++            return -1
++
++        _lookup.update(n=len(_slots), fn=fn)
++    return _lookup["fn"]
++
++
++def begin_fold(bucket_groups):
++    """Zero every slot so the optimizer step can max its updated shards into them.
++
++    Returns False (nothing changed) if the shard amax is unavailable."""
++    global _plan, _plan_nslots
++    if _disabled_reason is not None or not _slots or torch.cuda.is_current_stream_capturing():
++        return False
++    if _plan is None or _plan_nslots != len(_slots):
++        _plan = _build_plan(bucket_groups)
++        _plan_nslots = len(_slots)
++        if _plan is None:
++            return False
++    _zero_plans(_plan)
++    return True
++
++
++def finish_fold(covered):
++    """Combine the folded slots across ranks. ``covered`` holds the slots the step folded;
++    if any local shard was missed, every slot is recomputed from the shards instead."""
++    global _dirty
++    _dirty = False
++    if all(plan["seg_slots"] <= covered for plan in _plan):
++        counters["fold"] = counters.get("fold", 0) + 1
++        _run_plans(_plan, local=False)
++    else:
++        counters["fold_fallback"] = counters.get("fold_fallback", 0) + 1
++        _run_plans(_plan)
++
++
++def _zero_plans(plans):
++    for plan in plans:
++        if not len(plan["slot_idx"]):
++            continue
++        if plan["contig"]:
++            _amax_buf[plan["lo"] : plan["hi"]].zero_()
++        else:
++            _amax_buf.index_fill_(0, plan["slot_idx"], 0.0)
++
++
++def _run_plans(plans, local=True):
++    """Zero and recompute the slots from the local shards (unless ``local`` is False, when
++    they already hold the local maxima), then MAX-reduce them across the shard group."""
++    if local:
++        _zero_plans(plans)
++    for plan in plans:
++        if not len(plan["slot_idx"]):
++            continue
++        if plan["contig"]:
++            region = _amax_buf[plan["lo"] : plan["hi"]]
++        if local and plan["nchunks"]:
++            _segment_amax_kernel[(plan["nchunks"],)](
++                plan["base"],
++                plan["starts"],
++                plan["lens"],
++                plan["slots"],
++                _amax_buf,
++                BLOCK=_CHUNK_BLOCK,
++                ITERS=_CHUNK_ITERS,
++            )
++        pg = _reduce_group(plan["pg"])
++        if plan["contig"]:
++            torch.distributed.all_reduce(region, op=torch.distributed.ReduceOp.MAX, group=pg)
++        else:
++            vals = _amax_buf.index_select(0, plan["slot_idx"])
++            torch.distributed.all_reduce(vals, op=torch.distributed.ReduceOp.MAX, group=pg)
++            _amax_buf.index_copy_(0, plan["slot_idx"], vals)
+diff --git a/transformer_engine/pytorch/optimizers/nvfp4_triton_adam.py b/transformer_engine/pytorch/optimizers/nvfp4_triton_adam.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd0d1ad44e68e5c13621005df66a6043db0eecc1
+--- /dev/null
++++ b/transformer_engine/pytorch/optimizers/nvfp4_triton_adam.py
+@@ -0,0 +1,268 @@
++# Classification: Internal
++"""Single-launch AdamW for TE FusedAdam's BF16 param + int16 remainder path.
++
++Replaces ``tex.multi_tensor_adam_param_remainder`` (about 4.9 TB/s with 320 CTAs per
++launch) and folds Megatron's gradient-clip scale into the update, so the separate
++``multi_tensor_scale`` pass over the FP32 main gradients disappears. Per-element math
++follows ``AdamFunctorMasterParamRemainder``: FP32 master = BF16 param and int16
++remainder, IEEE division and square root, bias corrections computed on the host.
++"""
++import math
++
++import numpy as np
++import torch
++import triton
++import triton.language as tl
++
++_BLOCK = 4096
++_NUM_WARPS = 8
++_TABLES = {}
++_PENDING_CLIP = {}
++_TE_FALLBACK = None
++
++
++@triton.jit
++def _aligned_base(table, idx, n_tensors, ALIGNED: tl.constexpr):
++    base = tl.load(table + idx * n_tensors)
++    if ALIGNED:
++        base = (base // 16) * 16
++    return base
++
++
++@triton.jit
++def _adam_remainder_kernel(
++    ptrs,
++    sizes,
++    block_tensor,
++    block_index,
++    coeff_ptr,
++    n_tensors,
++    lr,
++    beta1,
++    beta2,
++    bc1,
++    bc2,
++    eps,
++    decay,
++    ADAMW: tl.constexpr,
++    HAS_COEFF: tl.constexpr,
++    G_BF16: tl.constexpr,
++    ALIGNED: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    t = tl.load(block_tensor + pid)
++    start = tl.load(block_index + pid).to(tl.int64) * BLOCK
++    n = tl.load(sizes + t)
++    offs = start + tl.arange(0, BLOCK)
++    offs = tl.max_contiguous(tl.multiple_of(offs, BLOCK), BLOCK)
++    mask = offs < n
++
++    g_type = tl.bfloat16 if G_BF16 else tl.float32
++    g_ptr = _aligned_base(ptrs + t, 0, n_tensors, ALIGNED).to(tl.pointer_type(g_type))
++    p_ptr = _aligned_base(ptrs + t, 1, n_tensors, ALIGNED).to(tl.pointer_type(tl.int16))
++    m_ptr = _aligned_base(ptrs + t, 2, n_tensors, ALIGNED).to(tl.pointer_type(tl.float32))
++    v_ptr = _aligned_base(ptrs + t, 3, n_tensors, ALIGNED).to(tl.pointer_type(tl.float32))
++    r_ptr = _aligned_base(ptrs + t, 4, n_tensors, ALIGNED).to(tl.pointer_type(tl.int16))
++
++    g = tl.load(g_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++    if HAS_COEFF:
++        g = g * tl.load(coeff_ptr)
++    m = tl.load(m_ptr + offs, mask=mask, other=0.0)
++    v = tl.load(v_ptr + offs, mask=mask, other=0.0)
++    p = tl.load(p_ptr + offs, mask=mask, other=0).to(tl.int32)
++    r = tl.load(r_ptr + offs, mask=mask, other=0).to(tl.int32)
++
++    p = p - (r < 0).to(tl.int32)
++    master = ((p << 16) | (r & 0xFFFF)).to(tl.float32, bitcast=True)
++
++    if ADAMW:
++        m = beta1 * m + (1 - beta1) * g
++        v = beta2 * v + (1 - beta2) * g * g
++        denom = tl.sqrt_rn(tl.div_rn(v, bc2)) + eps
++        update = tl.div_rn(tl.div_rn(m, bc1), denom) + decay * master
++    else:
++        g = g + decay * master
++        m = beta1 * m + (1 - beta1) * g
++        v = beta2 * v + (1 - beta2) * g * g
++        denom = tl.sqrt_rn(tl.div_rn(v, bc2)) + eps
++        update = tl.div_rn(tl.div_rn(m, bc1), denom)
++    master = master - lr * update
++
++    bits = master.to(tl.int32, bitcast=True)
++    r_new = (bits << 16) >> 16
++    p_new = (bits >> 16) + (r_new < 0).to(tl.int32)
++
++    tl.store(m_ptr + offs, m, mask=mask)
++    tl.store(v_ptr + offs, v, mask=mask)
++    tl.store(p_ptr + offs, p_new.to(tl.int16), mask=mask)
++    tl.store(r_ptr + offs, r_new.to(tl.int16), mask=mask)
++
++
++def _table(lists):
++    key = tuple(t.data_ptr() for lst in lists for t in lst)
++    entry = _TABLES.get(key)
++    if entry is None:
++        device = lists[0][0].device
++        numels = [t.numel() for t in lists[0]]
++        blocks = [(n + _BLOCK - 1) // _BLOCK for n in numels]
++        counts = torch.tensor(blocks, dtype=torch.int64)
++        block_tensor = torch.repeat_interleave(torch.arange(len(blocks), dtype=torch.int32), counts)
++        first = torch.cumsum(counts, 0) - counts
++        block_index = torch.arange(int(counts.sum()), dtype=torch.int64) - first.repeat_interleave(counts)
++        entry = (
++            torch.tensor(key, dtype=torch.int64, device=device),
++            torch.tensor(numels, dtype=torch.int64, device=device),
++            block_tensor.to(device),
++            block_index.to(torch.int32).to(device),
++            all(k % 16 == 0 for k in key),
++        )
++        _TABLES[key] = entry
++    return entry
++
++
++def unsupported_reason(tensor_lists):
++    if len(tensor_lists) != 5 or not tensor_lists[0]:
++        return "expected 5 non-empty tensor lists"
++    g, p, m, v, r = tensor_lists
++    if g[0].dtype not in (torch.float32, torch.bfloat16):
++        return f"grad dtype {g[0].dtype}"
++    for lst, dtype in ((g, g[0].dtype), (p, torch.bfloat16), (m, torch.float32),
++                       (v, torch.float32), (r, torch.int16)):
++        if any(t.dtype != dtype or not t.is_contiguous() for t in lst):
++            return f"dtype or layout mismatch (want {dtype})"
++    for i in range(len(g)):
++        n = g[i].numel()
++        if p[i].numel() != n or m[i].numel() != n or v[i].numel() != n or r[i].numel() != n:
++            return "numel mismatch"
++    if max(t.numel() for t in g) >= 2**31:
++        return "tensor too large"
++    return None
++
++
++def adam_param_remainder(tensor_lists, lr, beta1, beta2, eps, step, mode, bias_correction,
++                         weight_decay, coeff=None):
++    """AdamW step over [grads, bf16 params, exp_avg, exp_avg_sq, int16 remainders]."""
++    if bias_correction == 1:
++        b1 = float(np.float32(beta1))
++        b2 = float(np.float32(beta2))
++        bc1 = float(np.float32(1.0 - math.pow(b1, step)))
++        bc2 = float(np.float32(1.0 - math.pow(b2, step)))
++    else:
++        bc1 = bc2 = 1.0
++    ptrs, sizes, block_tensor, block_index, aligned = _table(tensor_lists)
++    _adam_remainder_kernel[(block_tensor.numel(),)](
++        ptrs,
++        sizes,
++        block_tensor,
++        block_index,
++        coeff if coeff is not None else sizes,
++        len(tensor_lists[0]),
++        lr,
++        beta1,
++        beta2,
++        bc1,
++        bc2,
++        eps,
++        weight_decay,
++        ADAMW=mode != 0,
++        HAS_COEFF=coeff is not None,
++        G_BF16=tensor_lists[0][0].dtype == torch.bfloat16,
++        ALIGNED=aligned,
++        BLOCK=_BLOCK,
++        num_warps=_NUM_WARPS,
++    )
++
++
++def defer_clip(grads, coeff):
++    """Record a clip coefficient to be applied by the next Adam step over ``grads``."""
++    for grad in grads:
++        _PENDING_CLIP[grad.data_ptr()] = coeff
++
++
++def _take_clip(grads):
++    coeffs = [_PENDING_CLIP.pop(g.data_ptr(), None) for g in grads]
++    return coeffs
++
++
++def multi_tensor_adam_param_remainder(chunk_size, noop_flag, tensor_lists, lr, beta1, beta2,
++                                      eps, step, mode, bias_correction, weight_decay):
++    """Drop-in for ``tex.multi_tensor_adam_param_remainder`` that consumes deferred clips."""
++    coeffs = _take_clip(tensor_lists[0])
++    reason = unsupported_reason(tensor_lists)
++    if reason is not None:
++        _apply_clips(tensor_lists[0], coeffs)
++        return _TE_FALLBACK(chunk_size, noop_flag, tensor_lists, lr, beta1, beta2, eps, step,
++                            mode, bias_correction, weight_decay)
++    groups = {}
++    for i, c in enumerate(coeffs):
++        groups.setdefault(id(c) if c is not None else None, (c, []))[1].append(i)
++    for coeff, idx in groups.values():
++        if len(idx) == len(coeffs):
++            lists = tensor_lists
++        else:
++            lists = [[lst[i] for i in idx] for lst in tensor_lists]
++        adam_param_remainder(lists, lr, beta1, beta2, eps, step, mode, bias_correction,
++                             weight_decay, coeff)
++
++
++def _apply_clips(grads, coeffs):
++    groups = {}
++    for g, c in zip(grads, coeffs):
++        if c is not None:
++            groups.setdefault(id(c), (c, []))[1].append(g)
++    for coeff, gs in groups.values():
++        torch._foreach_mul_(gs, coeff)
++
++
++def install():
++    """Patch Megatron's clip and TE FusedAdam; call before the optimizer is built."""
++    global _TE_FALLBACK
++    import megatron.core.optimizer.clip_grads as mc_clip
++    import megatron.core.optimizer.optimizer as mc_opt
++    import transformer_engine_torch as tex
++    from megatron.core.utils import to_local_if_dtensor
++    from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
++
++    _TE_FALLBACK = tex.multi_tensor_adam_param_remainder
++    orig_clip = mc_clip.clip_grad_by_total_norm_fp32
++
++    def clip_grad_by_total_norm_fp32(parameters, max_norm, total_norm, use_decoupled_grad=False):
++        if isinstance(parameters, torch.Tensor) or not isinstance(total_norm, torch.Tensor):
++            return orig_clip(parameters, max_norm, total_norm, use_decoupled_grad)
++        deferred, immediate = [], []
++        for param in parameters:
++            grad = param.decoupled_grad if use_decoupled_grad else param.grad
++            if grad is None:
++                continue
++            grad = to_local_if_dtensor(grad).detach()
++            (deferred if param.dtype == torch.bfloat16 else immediate).append(grad)
++        coeff = (max_norm / (total_norm + 1.0e-6)).float().clamp_max_(1.0).reshape(1)
++        if immediate:
++            torch._foreach_mul_(immediate, coeff)
++        defer_clip(deferred, coeff)
++
++    mc_clip.clip_grad_by_total_norm_fp32 = clip_grad_by_total_norm_fp32
++    mc_opt.clip_grad_by_total_norm_fp32 = clip_grad_by_total_norm_fp32
++
++    orig_init = FusedAdam.__init__
++
++    def init(self, *args, **kwargs):
++        orig_init(self, *args, **kwargs)
++        self.multi_tensor_adam_param_remainder = multi_tensor_adam_param_remainder
++
++    FusedAdam.__init__ = init
++
++    orig_step = FusedAdam.step
++
++    def step(self, closure=None, grad_scaler=None):
++        loss = orig_step(self, closure, grad_scaler)
++        if _PENDING_CLIP:
++            for group in self.param_groups:
++                for p in group["params"]:
++                    grad = getattr(p, "decoupled_grad", None) if self.use_decoupled_grad else p.grad
++                    if grad is not None and grad.data_ptr() in _PENDING_CLIP:
++                        raise RuntimeError("deferred gradient clip was not applied by FusedAdam")
++        return loss
++
++    FusedAdam.step = step
+diff --git a/transformer_engine/pytorch/triton/cross_entropy.py b/transformer_engine/pytorch/triton/cross_entropy.py
+index 7ca7cfed2f6534e91b1e4247a6e8049f57862fc3..818a6666161259ee3975d497f9cd834bebb8d725 100644
+--- a/transformer_engine/pytorch/triton/cross_entropy.py
++++ b/transformer_engine/pytorch/triton/cross_entropy.py
+@@ -4,6 +4,7 @@
+ 
+ """PyTorch wrapper functions for Cross Entropy Triton kernels."""
+ 
++import os
+ from typing import Union
+ from functools import reduce
+ from operator import mul
+@@ -22,6 +23,8 @@ from transformer_engine.common.triton.cross_entropy import (
+ # The optimal maximum block size depends on your hardware, your kernel, and your dtype
+ MAX_FUSED_SIZE = 65536 // 2
+ 
++_INPLACE_GRAD = os.environ.get("NVFP4_CE_BF16_INPLACE", "0") == "1"
++
+ 
+ def cross_entropy_forward(
+     _input: torch.Tensor,
+@@ -54,8 +57,14 @@ def cross_entropy_forward(
+     if target.stride(-1) != 1:
+         target = target.contiguous()
+ 
+-    # Store the input gradient in FP32 so it is not quantized before backward.
+-    grad_input = torch.empty_like(_input, dtype=torch.float32)
++    if _INPLACE_GRAD:
++        # Each row block of X is read before its gradient is written and the loss uses
++        # the precomputed X_y, so the gradient can overwrite the logits. This drops the
++        # FP32 buffer (tokens x vocab x 4 B) and the cast before the output layer.
++        grad_input = _input
++    else:
++        # Store the input gradient in FP32 so it is not quantized before backward.
++        grad_input = torch.empty_like(_input, dtype=torch.float32)
+ 
+     rank = 0 if dist_process_group is None else dist.get_rank(dist_process_group)
+ 
+@@ -122,9 +131,12 @@ def cross_entropy_backward(
+     """Backward implementation of cross entropy loss kernel"""
+ 
+     # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
+-    # Only check torch.equal when not in CUDA graph capturable mode
+-    if not is_cg_capturable and torch.equal(
+-        grad_output, torch.tensor(1.0, device=grad_output.device)
++    # Only check torch.equal when not in CUDA graph capturable mode. A per-token
++    # grad_output cannot be the scalar 1.0; building the scalar would sync the stream.
++    if (
++        not is_cg_capturable
++        and grad_output.numel() == 1
++        and torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device))
+     ):
+         pass
+     else:
+diff --git a/transformer_engine/pytorch/triton/grouped_dbias_dscales.py b/transformer_engine/pytorch/triton/grouped_dbias_dscales.py
+index 836510007439c4142a4de64eb8f3d71541b36b47..84c25f4a166070e80046947df60dd67400e424b7 100644
+--- a/transformer_engine/pytorch/triton/grouped_dbias_dscales.py
++++ b/transformer_engine/pytorch/triton/grouped_dbias_dscales.py
+@@ -40,9 +40,11 @@ def _launch_grouped_dbias(
+             "Disable determinism or use a deterministic fallback."
+         )
+ 
+-    BLOCK_M = 128
+-    BLOCK_H = 128
+-    N_ROW_SPLITS = 4
++    # Tuned on GB300 for the MoE FC2 shape (106240 x 2944, 32 groups): the
++    # 128 x 128 fp32 tile limits occupancy (250 us vs 175 us in isolation).
++    BLOCK_M = int(os.getenv("NVFP4_DBIAS_BLOCK_M", "32"))
++    BLOCK_H = int(os.getenv("NVFP4_DBIAS_BLOCK_H", "256"))
++    N_ROW_SPLITS = int(os.getenv("NVFP4_DBIAS_ROW_SPLITS", "32"))
+     has_scales = scales is not None
+     assert (
+         has_scales == (bias is not None) == (dscales is not None)
+diff --git a/transformer_engine/pytorch/triton/permutation.py b/transformer_engine/pytorch/triton/permutation.py
+index c155d73e1e37e616b97b15851324c64585a7128d..8ad607ef1df7d118400d983698fb4766e31415e7 100644
+--- a/transformer_engine/pytorch/triton/permutation.py
++++ b/transformer_engine/pytorch/triton/permutation.py
+@@ -4,10 +4,12 @@
+ 
+ """PyTorch wrapper functions for Permutation Triton kernels."""
+ 
++import os
+ from typing import Union
+ 
+ import torch
+ import triton
++import triton.language as tl
+ 
+ from transformer_engine.common.triton.permutation import (
+     _row_id_map_pass_1_kernel,
+@@ -20,6 +22,140 @@ from transformer_engine.common.triton.permutation import (
+     _sort_chunks_by_map_kernel,
+ )
+ 
++# MoE experts run at a padded physical hidden size. With fused padding the
++# dispatcher keeps logical-width tokens: permute writes physical-width rows
++# (pad columns filled here) and unpermute reads only the logical columns
++# through the row stride, so no separate pad/crop copies are needed.
++_FUSED_PAD = os.environ.get("NVFP4_FUSED_PERMUTE_PAD", "0") == "1"
++_PHYSICAL_HIDDEN = int(os.environ.get("NVFP4_PADDED_EXPERT_HIDDEN", "0"))
++_FOLD_BIAS = os.environ.get("NVFP4_FOLD_FC1_BIAS", "0") == "1"
++_PAD_ROWS = {}
++_PENDING_EXPERT_BIAS = {}
++
++
++def defer_expert_bias(out: torch.Tensor, bias: torch.Tensor, scale: torch.Tensor):
++    """Let the next unpermute of ``out`` apply the grouped GEMM's scaled expert bias.
++
++    Row ``r`` of expert ``e`` becomes ``bf16(fma(bias[e], scale[r], out[r]))``, as in TE's
++    ``grouped_bias_add_kernel``, so the result matches bias add followed by unpermute.
++    """
++    if _PENDING_EXPERT_BIAS:
++        raise RuntimeError("deferred FC2 bias was not consumed by an unpermute")
++    _PENDING_EXPERT_BIAS[out.data_ptr()] = (bias, scale)
++
++
++@triton.jit
++def _unpermute_expert_bias_kernel(
++    input_ptr,
++    row_id_map_ptr,
++    bias_ptr,
++    scale_ptr,
++    output_ptr,
++    stride_row_id_map_token,
++    stride_row_id_map_expert,
++    stride_input_token,
++    stride_output_token,
++    stride_bias_expert,
++    num_experts: tl.constexpr,
++    hidden_size: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    pid_t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    offs = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = offs < hidden_size
++    map_row = row_id_map_ptr + pid_t * stride_row_id_map_token
++    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
++    n_routed = tl.load(map_row + num_experts * 2 * stride_row_id_map_expert)
++    for idx in tl.range(n_routed):
++        src_row = tl.load(map_row + idx * stride_row_id_map_expert).to(tl.int64)
++        expert = tl.load(map_row + (num_experts + idx) * stride_row_id_map_expert)
++        x = tl.load(input_ptr + src_row * stride_input_token + offs, mask=mask).to(tl.float32)
++        b = tl.load(bias_ptr + expert * stride_bias_expert + offs, mask=mask).to(tl.float32)
++        s = tl.load(scale_ptr + src_row)
++        accumulator += tl.fma(b, s, x).to(input_ptr.dtype.element_ty).to(tl.float32)
++    out = accumulator.to(output_ptr.dtype.element_ty)
++    tl.store(output_ptr + pid_t.to(tl.int64) * stride_output_token + offs, out, mask=mask)
++
++
++@triton.jit
++def _unpermute_expert_bias_unrolled_kernel(
++    input_ptr,
++    row_id_map_ptr,
++    bias_ptr,
++    scale_ptr,
++    output_ptr,
++    stride_row_id_map_token,
++    stride_row_id_map_expert,
++    stride_input_token,
++    stride_output_token,
++    stride_bias_expert,
++    num_experts: tl.constexpr,
++    hidden_size: tl.constexpr,
++    UNROLL: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    # Same sum as _unpermute_expert_bias_kernel, in the same order. The first UNROLL
++    # routed rows are loaded independently so their reads overlap; skipped slots add
++    # +0.0, which leaves the accumulator unchanged because it can never be -0.0.
++    pid_t = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    offs = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = offs < hidden_size
++    map_row = row_id_map_ptr + pid_t * stride_row_id_map_token
++    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
++    n_routed = tl.load(map_row + num_experts * 2 * stride_row_id_map_expert)
++    for idx in tl.static_range(UNROLL):
++        valid = idx < n_routed
++        src_row = tl.load(map_row + idx * stride_row_id_map_expert, mask=valid, other=0).to(
++            tl.int64
++        )
++        expert = tl.load(
++            map_row + (num_experts + idx) * stride_row_id_map_expert, mask=valid, other=0
++        )
++        x = tl.load(
++            input_ptr + src_row * stride_input_token + offs, mask=mask & valid, other=0.0
++        ).to(tl.float32)
++        b = tl.load(
++            bias_ptr + expert * stride_bias_expert + offs, mask=mask & valid, other=0.0
++        ).to(tl.float32)
++        s = tl.load(scale_ptr + src_row, mask=valid, other=0.0)
++        v = tl.fma(b, s, x).to(input_ptr.dtype.element_ty).to(tl.float32)
++        accumulator += tl.where(valid, v, 0.0)
++    for idx in tl.range(UNROLL, n_routed):
++        src_row = tl.load(map_row + idx * stride_row_id_map_expert).to(tl.int64)
++        expert = tl.load(map_row + (num_experts + idx) * stride_row_id_map_expert)
++        x = tl.load(input_ptr + src_row * stride_input_token + offs, mask=mask).to(tl.float32)
++        b = tl.load(bias_ptr + expert * stride_bias_expert + offs, mask=mask).to(tl.float32)
++        s = tl.load(scale_ptr + src_row)
++        accumulator += tl.fma(b, s, x).to(input_ptr.dtype.element_ty).to(tl.float32)
++    out = accumulator.to(output_ptr.dtype.element_ty)
++    tl.store(output_ptr + pid_t.to(tl.int64) * stride_output_token + offs, out, mask=mask)
++
++
++# Autotuning inside a busy training step picks 256-wide blocks (about 3x slower than one
++# program per row for hidden 2880), so unpermute launches use the full row.
++_UNPERMUTE_FULL_ROW = os.environ.get("NVFP4_UNPERMUTE_FULL_ROW", "1") == "1"
++# The permute has the same autotune problem; these launch it with one program per row.
++_PERMUTE_FULL_ROW = os.environ.get("NVFP4_PERMUTE_FULL_ROW", "0") == "1"
++_PERMUTE_WARPS = int(os.environ.get("NVFP4_PERMUTE_WARPS", "8"))
++_UNPERMUTE_WARPS = int(os.environ.get("NVFP4_UNPERMUTE_WARPS", "4"))
++# 0 keeps the original expert-bias unpermute; N > 0 unrolls the first N routed rows.
++_EXPERT_BIAS_UNROLL = int(os.environ.get("NVFP4_UNPERMUTE_BIAS_UNROLL", "0"))
++_EXPERT_BIAS_WARPS = int(os.environ.get("NVFP4_UNPERMUTE_BIAS_WARPS", "4"))
++
++
++def _pad_row(logical: int, dtype: torch.dtype, one_column: bool) -> torch.Tensor:
++    # Built on first (eager) use so graph capture only replays the copy.
++    key = (logical, dtype, one_column, torch.cuda.current_device())
++    row = _PAD_ROWS.get(key)
++    if row is None:
++        row = torch.zeros(_PHYSICAL_HIDDEN - logical, dtype=dtype, device="cuda")
++        if one_column:
++            row[0] = 1
++        _PAD_ROWS[key] = row
++    return row
++
+ 
+ def make_row_id_map(
+     routing_map: torch.Tensor,
+@@ -160,7 +296,19 @@ def permute_with_mask_map(
+     # Use torch.zeros when pad_offsets is provided to ensure padding regions are zeroed.
+     # The kernel writes only to valid positions, leaving padding positions at zero.
+     alloc = torch.zeros if pad_offsets is not None else torch.empty
+-    output = alloc((num_out_tokens, hidden_size), dtype=inp.dtype, device="cuda")
++    fused_pad = (
++        _FUSED_PAD
++        and hidden_size < _PHYSICAL_HIDDEN
++        and pad_offsets is None
++        and scale is None
++    )
++    out_hidden = _PHYSICAL_HIDDEN if fused_pad else hidden_size
++    output = alloc((num_out_tokens, out_hidden), dtype=inp.dtype, device="cuda")
++    if fused_pad:
++        # probs are only passed by the dispatch permute; the unpermute backward
++        # (probs=None) produces gradients whose pad columns must stay zero.
++        pad = _pad_row(hidden_size, inp.dtype, _FOLD_BIAS and probs is not None)
++        output[:, hidden_size:].copy_(pad.expand(num_out_tokens, pad.numel()))
+     permuted_probs = (
+         alloc((num_out_tokens,), dtype=probs.dtype, device="cuda") if probs is not None else None
+     )
+@@ -171,7 +319,11 @@ def permute_with_mask_map(
+     )
+     # pylint: disable=unnecessary-lambda-assignment
+     grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
+-    _permute_kernel[grid](
++    kernel, launch = _permute_kernel, {}
++    if _PERMUTE_FULL_ROW and hasattr(_permute_kernel, "fn"):
++        kernel = _permute_kernel.fn
++        launch = {"BLOCK_SIZE": triton.next_power_of_2(hidden_size), "num_warps": _PERMUTE_WARPS}
++    kernel[grid](
+         inp,
+         row_id_map,
+         probs,
+@@ -205,6 +357,7 @@ def permute_with_mask_map(
+         PERMUTE_PROBS=probs is not None,
+         PERMUTE_SCALE=scale is not None,
+         FUSION_PAD=pad_offsets is not None,
++        **launch,
+     )
+     return output, permuted_scale, permuted_probs
+ 
+@@ -244,6 +397,39 @@ def unpermute_with_mask_map(
+         Hidden size of the permuted tensor.
+     """
+     output = torch.empty((num_tokens, hidden_size), dtype=inp.dtype, device="cuda")
++    pending_bias = _PENDING_EXPERT_BIAS.pop(inp.data_ptr(), None)
++    if pending_bias is not None:
++        if merging_probs is not None or permuted_probs is not None or pad_offsets is not None:
++            raise RuntimeError("deferred FC2 bias needs a plain unpermute")
++        assert inp.stride(1) == 1
++        bias, scale = pending_bias
++        args = (
++            inp,
++            row_id_map,
++            bias,
++            scale,
++            output,
++            row_id_map.stride(0),
++            row_id_map.stride(1),
++            inp.stride(0),
++            output.stride(0),
++            bias.stride(0),
++            num_experts,
++            hidden_size,
++        )
++        block = triton.next_power_of_2(hidden_size)
++        if _EXPERT_BIAS_UNROLL > 0:
++            _unpermute_expert_bias_unrolled_kernel[(num_tokens, 1)](
++                *args,
++                UNROLL=_EXPERT_BIAS_UNROLL,
++                BLOCK_SIZE=block,
++                num_warps=_EXPERT_BIAS_WARPS,
++            )
++        else:
++            _unpermute_expert_bias_kernel[(num_tokens, 1)](
++                *args, BLOCK_SIZE=block, num_warps=_EXPERT_BIAS_WARPS
++            )
++        return output, None
+     if permuted_probs is not None:
+         unpermuted_probs = torch.empty(
+             (num_tokens, num_experts), dtype=permuted_probs.dtype, device="cuda"
+@@ -252,7 +438,11 @@ def unpermute_with_mask_map(
+         unpermuted_probs = None
+     # pylint: disable=unnecessary-lambda-assignment
+     grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
+-    _unpermute_kernel[grid](
++    kernel, launch = _unpermute_kernel, {}
++    if _UNPERMUTE_FULL_ROW and hasattr(_unpermute_kernel, "fn"):
++        kernel = _unpermute_kernel.fn
++        launch = {"BLOCK_SIZE": triton.next_power_of_2(hidden_size), "num_warps": _UNPERMUTE_WARPS}
++    kernel[grid](
+         inp,
+         row_id_map,
+         merging_probs,
+@@ -281,6 +471,7 @@ def unpermute_with_mask_map(
+         WITH_MERGING_PROBS=merging_probs is not None,
+         PERMUTE_PROBS=permuted_probs is not None,
+         FUSION_UNPAD=pad_offsets is not None,
++        **launch,
+     )
+     return output, unpermuted_probs
+ 

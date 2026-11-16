@@ -1,0 +1,380 @@
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -72,6 +72,77 @@
+ from .optimizer_config import OptimizerConfig
+ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
+ 
++# --- auto_kernel X9-E0 overlay (2026-09-19) --------------------------------------------------
++# One fused AdamW-master pass (harness/tier2/x9_adamw/fused_adamw_master.py, Triton) replaces, for
++# the bf16-parameter groups, the shipped chain of: 418 bf16->fp32 grad copies, multi_tensor_l2norm
++# on the fp32 copies, multi_tensor_scale (clip), multi_tensor_adam on the fp32 params, 418
++# fp32->bf16 param copies (EXPERIMENT_LOG block 10 sec 3: 31.4 ms of the serial tail per step).
++# Byte-identical to that chain on every output (master, m, v, bf16 param) and on the grad norm and
++# clip coefficient (x9_e0_test.py, 8 cases incl. clipping on/off, step 1..8704, NaN/inf):
++# the norm is TE's own multi_tensor_l2norm read off the bf16 shards, the clip coefficient is the
++# same FP32 tensor arithmetic, and the kernel is TE's AdamFunctor op order with the clip folded
++# into the one FP32 product the scale pass computed.  AK_X9_E0=1 arms it; the module is loaded
++# from AK_X9_KERNEL_DIR (default /opt/firmus/ak/x9, the directory the Dockerfile builds).
++# (sec 168: ported to the 20260929 image -- the norm list now goes through 0929's collector
++# (get_grads_for_grad_norm -> _filter_grads_for_norm, same filters, the bf16 view in place of the
++# fp32 .grad copy), and the fused step runs only after a grad bind of the same step, so 0929's new
++# out-of-step callers of _copy_main_params_to_model_params get the shipped copy.)
++import os as _ak_os
++import sys as _ak_sys
++from .clip_grads import clip_grad_by_total_norm_fp32 as _ak_clip_by_norm, get_grad_norm_fp32 as _ak_grad_norm
++from ..transformer.module import param_is_not_shared as _ak_not_shared
++
++_AK_X9_E0 = _ak_os.environ.get("AK_X9_E0", "0") == "1"
++_ak_fused_cls = None
++if _AK_X9_E0:
++    _ak_root = _ak_os.environ.get("AK_X9_KERNEL_DIR", "/opt/firmus/ak/x9")
++    if _ak_root not in _ak_sys.path:
++        _ak_sys.path.insert(0, _ak_root)
++    from harness.tier2.x9_adamw import fused_adamw_master as _ak_fused_mod
++    from harness.tier2.x9_adamw.fused_adamw_master import FusedAdamWMaster as _ak_fused_cls
++# ---------------------------------------------------------------------------------------------
++# --- auto_kernel X9-STEP (2026-10-07, Llama 3.1 8B; version 3): the first gather inside the optimizer step ---
++# With AK_X9_EARLY_AG=1 (needs AK_X9_E0=1) the fused step runs in two phases: first the shards of the
++# bucket group the forward gathers first (the last one built, holding the embedding), then every other
++# shard.  Between the phases that bucket group's parameter all-gather is dispatched (asynchronous; NCCL's
++# stream follows phase 1), so it runs under phase 2 and the weight-amax pass instead of opening the next
++# step; step_with_ready_grads waits for it at the end of the step (a stream wait, no host sync).  The
++# forward's first pre-hook then finds the bucket group gathered and only dispatches the next group's
++# all-gather, so the captured full-iteration graph starts with the second gather.  Nothing in the
++# arithmetic changes: the same per-element AdamW on the same shards (the kernel treats each shard on its
++# own, with the same host scalars) and the same all-gather of the same bytes -- only the order of
++# independent work.  A forced (synchronous) param sync, e.g. around evaluation, clears the mark.
++_AK_X9_EARLY_AG = _AK_X9_E0 and _ak_os.environ.get("AK_X9_EARLY_AG", "0") == "1"
++# x9step3 (2026-10-07): with AK_X9_WAMAX=1 the fused step also produces the NVFP4P weight amaxes (the max |bf16 param| of
++# this rank's shard of every 2D weight, the nvfp4p overlay's buffer and slots), so nvfp4p10 skips its multi_amax pass over
++# the shards and only all-reduces.  From the second step on (the first builds nvfp4p's table); checked once against the
++# shard pass (nvfp4p10's proof line).
++_AK_X9_WAMAX = _AK_X9_E0 and _ak_os.environ.get("AK_X9_WAMAX", "0") == "1"
++if _AK_X9_EARLY_AG:
++    from ..distributed import param_and_grad_buffer as _ak_pgb
++
++    _ak_orig_finish_param_sync = _ak_pgb._ParamAndGradBucketGroup.finish_param_sync
++    _ak_orig_start_param_sync = _ak_pgb._ParamAndGradBucketGroup.start_param_sync
++
++    def _ak_finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
++        if getattr(self, "_ak_pregathered", False):
++            # gathered and waited for in the optimizer step: only keep the gather chain going
++            self._ak_pregathered = False
++            nxt = self.next_param_gather_bucket_group
++            if nxt is not None and not skip_next_bucket_dispatch and not nxt.param_gather_dispatched:
++                nxt.start_param_sync()
++            return
++        return _ak_orig_finish_param_sync(self, skip_next_bucket_dispatch=skip_next_bucket_dispatch)
++
++    def _ak_start_param_sync(self, force_sync: bool = False):
++        if force_sync:
++            self._ak_pregathered = False
++        return _ak_orig_start_param_sync(self, force_sync=force_sync)
++
++    _ak_pgb._ParamAndGradBucketGroup.finish_param_sync = _ak_finish_param_sync
++    _ak_pgb._ParamAndGradBucketGroup.start_param_sync = _ak_start_param_sync
++# ---------------------------------------------------------------------------------------------
++
+ logger = getLogger(__name__)
+ 
+ 
+@@ -2806,6 +2877,11 @@
+         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+             copy_group_grads(self.model_float16_groups, self.shard_float16_groups)
+             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
++        elif self._ak_x9_armed():
++            # auto_kernel X9-E0: the bf16 grad shard VIEWS are bound (no fp32 copy); .grad stays
++            # None so TE's step skips these params.  fp32 model params keep the shipped path.
++            self._ak_x9_bind_grads()
++            copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+         else:
+             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+@@ -2833,6 +2909,20 @@
+         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+             return
+ 
++        if self._ak_x9_armed() and getattr(self, "_ak_x9_pending", False):
++            # auto_kernel X9-E0: TE's step has just run (fp32 model params only; the bf16-master
++            # params had .grad None).  The fused kernel now updates master / m / v and WRITES the
++            # bf16 param shards into the param buffer -- what the copy below would have done.
++            # (Outside a step -- no grads bound since the last fused step, e.g. 0929's
++            # quantize_and_sync_model_params_from_main_params -- the shipped copy below runs.)
++            self._ak_x9_pending = False
++            self._ak_x9_fused_step()
++            self._ak_x9_copy_fp32_groups_only()
++            self._ak_clip_coeff = None
++            from . import clip_grads as _ak_cg
++            _ak_cg._AK_X9_CLIP_COEFF = None
++            return
++
+         if self.ddp_config.fp8_param_gather:
+             # Grouped quantized tensors expose one logical parameter backed by multiple TE
+             # quantized members. Expand them so quantize_param_shard receives member-aligned
+@@ -2900,6 +2990,256 @@
+         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+ 
++    # --- auto_kernel X9-E0 helpers ----------------------------------------------------------
++    def _ak_x9_armed(self):
++        return (_AK_X9_E0 and _ak_fused_cls is not None and not self.is_stub_optimizer
++                and not self.ddp_config.use_megatron_fsdp
++                and not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
++                and not self.config.reuse_grad_buf_for_mxfp8_param_ag)
++
++    def _ak_x9_bind_grads(self):
++        """Bind each fp32 master shard to its bf16 grad shard view (static views, cached)."""
++        if getattr(self, "_ak_grad_views", None) is None:
++            views = []
++            for model_group, shard_main_group in zip(self.model_float16_groups, self.shard_fp32_from_float16_groups):
++                for model_param, shard_main_param in zip(model_group, shard_main_group):
++                    param_range = self._get_model_param_range_map(model_param)["param"]
++                    assert param_range.size == shard_main_param.nelement()
++                    g = model_param.main_grad.view(-1)[param_range.start : param_range.end]
++                    assert g.dtype == torch.bfloat16, "X9-E0 expects a bf16 grad buffer, got %s" % g.dtype
++                    views.append((shard_main_param, g))
++            self._ak_grad_views = views
++        for shard_main_param, g in self._ak_grad_views:
++            shard_main_param._ak_grad = g
++            shard_main_param.grad = None
++        # sec 168: the fused step below runs only after a bind of the same step
++        self._ak_x9_pending = True
++
++    def _filter_grads_for_norm(self, params, param_filter=None):
++        """auto_kernel X9-E0 (sec 168: 0929's norm collector, behind get_grads_for_grad_norm and
++        so behind get_grad_norm and a multi-optimizer ChainedOptimizer's shared-group norm): the
++        shipped filters, with the bound bf16 grad shard view in place of the fp32 .grad copy."""
++        if not self._ak_x9_armed() or getattr(self, "_ak_grad_views", None) is None:
++            return super()._filter_grads_for_norm(params, param_filter=param_filter)
++        grads_for_norm = []
++        for param in params:
++            if param_filter is not None and not param_filter(param):
++                continue
++            grad = param.grad if param.grad is not None else getattr(param, "_ak_grad", None)
++            if (grad is not None and _ak_not_shared(param)
++                    and tensor_parallel.param_is_not_tensor_parallel_duplicate(
++                        param,
++                        tp_group=getattr(self, 'tp_group', None),
++                        expert_tp_group=getattr(self, 'expert_tp_group', None),
++                    )
++                    and tensor_parallel.param_is_not_gtp_duplicate(param)):
++                grads_for_norm.append(grad)
++        return grads_for_norm
++
++    def get_grad_norm(self):
++        """auto_kernel X9-E0: the norm over the bf16 grad shards (the ChainedOptimizer calls this
++        and then clip_grad_by_total_norm_fp32 itself; the patched clip_grads stashes the
++        coefficient and skips the scale kernel for the grad-less bf16-master params)."""
++        if not self._ak_x9_armed():
++            return super().get_grad_norm()
++        if any(p.grad is not None for p in self.get_parameters()):
++            raise RuntimeError("X9-E0: fp32 model params exist; the fused path is bf16-only")
++        # 0929's MegatronOptimizer.get_grad_norm: get_grads_for_grad_norm() (-> the bf16 views,
++        # _filter_grads_for_norm above) and get_grad_norm_fp32 over the grad-stats group.
++        return super().get_grad_norm()
++
++    def clip_grad_norm(self, clip_grad: float) -> float:
++        """auto_kernel X9-E0: the norm over the bf16 grad shards (bit-identical to the norm over
++        their fp32 copies, x9_e0_test.py), the clip coefficient computed exactly as
++        clip_grad_by_total_norm_fp32 computes it and STASHED for the fused kernel instead of
++        being applied by a scale pass; fp32 model params are refused (get_grad_norm)."""
++        if not self._ak_x9_armed():
++            return super().clip_grad_norm(clip_grad)
++        self.grad_norms_by_group = {}
++        grad_norm = self.get_grad_norm()
++        clip_coeff = clip_grad / (grad_norm + 1.0e-6)
++        clip_coeff.clamp_max_(1.0)
++        self._ak_clip_coeff = clip_coeff
++        return grad_norm
++
++    def _ak_x9_fused_step(self):
++        if getattr(self, "_ak_fused", None) is None:
++            self._ak_fused = _ak_fused_cls(device=torch.cuda.current_device())
++            self._ak_groups = None
++        if self._ak_groups is None:
++            # static per-group lists: (grads, masters, m, v, bf16 param shards in the param buffer)
++            groups = []
++            grad_of = {id(p): g for p, g in self._ak_grad_views}
++            shard_view = {}
++            model_of = {}
++            for shard_main_group, model_group in zip(self.shard_fp32_from_float16_groups, self.model_float16_groups):
++                for shard_main_param, model_param in zip(shard_main_group, model_group):
++                    param_range_map = self._get_model_param_range_map(model_param)
++                    world_range = param_range_map["gbuf_world_in_bucket"]
++                    assert world_range.size == shard_main_param.nelement()
++                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
++                    buf = self.buffers[gbuf_index].buckets[bucket_id].param_data
++                    assert not (self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param))
++                    shard_view[id(shard_main_param)] = buf.view(-1)[world_range.start : world_range.end]
++                    model_of[id(shard_main_param)] = model_param
++            # sec 168: 0929 can clip a tagged grad-norm group (e.g. MTP) with its own norm; the
++            # fused kernel applies ONE coefficient, so refuse such a model rather than mis-clip.
++            from .optimizer import GRAD_NORM_GROUP_ATTR as _ak_gn_attr
++            assert not any(getattr(p, _ak_gn_attr, None) is not None for p in self.get_parameters()), \
++                "X9-E0: a separate grad-norm group exists; the fused step applies one clip coefficient"
++            n_total = 0
++            # X9-STEP: phase 1 = the shards of the first-gathered bucket group, phase 2 = the rest
++            early_bg = self._ak_first_gather_bucket_group() if _AK_X9_EARLY_AG else None
++            if _AK_X9_EARLY_AG and early_bg is None and torch.distributed.get_rank() == 0:
++                print("[auto_kernel x9step] early all-gather NOT armed: the bucket layout is not the plain one "
++                      "(overlap_param_gather %s, %d model chunks)" % (self.ddp_config.overlap_param_gather,
++                                                                     len(self.model_chunks)), flush=True)
++            early_ids = set()
++            if early_bg is not None:
++                early_ids = {id(mp) for b in early_bg.buckets for mp in b.params_list}
++            phases = (1, 2) if early_bg is not None else (2,)
++            n_phase = {1: 0, 2: 0}
++            for group in self.optimizer.param_groups:
++                for phase in phases:
++                    lists = ([], [], [], [], [])
++                    mps = []
++                    for p in group["params"]:
++                        if id(p) not in grad_of:
++                            continue
++                        if early_bg is not None and ((id(model_of[id(p)]) in early_ids) != (phase == 1)):
++                            continue
++                        state = self.optimizer.state[p]
++                        assert "exp_avg" in state and "exp_avg_sq" in state, "TE's step initialises the state before we run"
++                        assert state["exp_avg"].dtype == torch.float32 and state["exp_avg_sq"].dtype == torch.float32
++                        lists[0].append(grad_of[id(p)]); lists[1].append(p.data)
++                        lists[2].append(state["exp_avg"]); lists[3].append(state["exp_avg_sq"])
++                        lists[4].append(shard_view[id(p)])
++                        mps.append(model_of[id(p)])
++                    n_total += len(lists[0])
++                    n_phase[phase] += len(lists[0])
++                    # ONE FUSED INSTANCE PER GROUP (and phase): the kernel module caches its address
++                    # tables for the last list set it saw, so a single instance stepping
++                    # two groups in turn would rebuild the tables (418 data_ptr reads, six
++                    # host->device uploads) on every call, on the serial tail.
++                    groups.append((group, lists, _ak_fused_cls(device=torch.cuda.current_device()), phase, mps))
++            self._ak_groups = groups
++            self._ak_early_bg = early_bg
++            self._ak_n_phase = n_phase
++            if torch.distributed.get_rank() == 0:
++                import hashlib as _ak_hashlib
++                _ak_sha = _ak_hashlib.sha256(open(_ak_fused_mod.__file__, "rb").read()).hexdigest()[:16]
++                print("[auto_kernel x9e0] fused AdamW-master step ARMED: %d bf16-master shards in %d groups; fp32 model params %d; kernel %s sha256=%s"
++                      % (n_total, len(groups), sum(len(g) for g in self.model_fp32_groups), _ak_fused_mod.__file__, _ak_sha), flush=True)
++        clip = getattr(self, "_ak_clip_coeff", None)
++        if clip is None:
++            from . import clip_grads as _ak_cg
++            clip = _ak_cg._AK_X9_CLIP_COEFF
++        assert clip is not None, "X9-E0: no clip coefficient was stashed before the fused step"
++        wm = self._ak_x9_wamax_prepare() if _AK_X9_WAMAX else None
++        if wm is not None:
++            wm[0].zero_()
++        for want in (1, 2):
++            if want == 2 and self._ak_early_bg is not None:
++                # X9-STEP: phase 1 has written the first-gathered bucket group's bf16 shards; its
++                # all-gather now runs on NCCL's stream (behind phase 1) while phase 2 runs here
++                self._ak_early_bg.start_param_sync()
++                self._ak_early_pending = True
++            for k, (group, (grads, masters, ms, vs, params), fused, phase, mps) in enumerate(self._ak_groups):
++                if phase != want or not grads:
++                    continue
++                beta1, beta2 = group["betas"]
++                fused.step(grads, masters, ms, vs, params, clip, group["lr"], beta1, beta2,
++                           group["eps"], group["weight_decay"], group["step"],
++                           bias_correction=bool(group.get("bias_correction", True)),
++                           amax_buf=wm[0] if wm is not None else None,
++                           slots=wm[1][k] if wm is not None else None)
++        self._ak_x9_wamax_done = wm is not None
++
++    def _ak_x9_wamax_prepare(self):
++        """x9step3: (nvfp4p's weight-amax buffer, per-entry slot lists) once nvfp4p has built its table, else None."""
++        cached = getattr(self, "_ak_wm", None)
++        if cached is not None:
++            return cached
++        P = _ak_sys.modules.get("ak_l8b_nvfp4p_patch")
++        st = getattr(P, "_STATE", None) if P is not None else None
++        if not st or st.get("wamax_table") is None or st.get("wamax_buf") is None:
++            return None
++        if st.get("wamax_opt") is not self:
++            raise RuntimeError("[auto_kernel x9step] the weight-amax buffer belongs to another optimizer")
++        index = {id(p): i for i, p in enumerate(st["wamax_params"])}
++        slots = [[index.get(id(mp), -1) for mp in mps] for (_g, _l, _f, _ph, mps) in self._ak_groups]
++        self._ak_wm = (st["wamax_buf"], slots)
++        if torch.distributed.get_rank() == 0:
++            print("[auto_kernel x9step] weight amaxes in the fused AdamW epilogue: %d of %d shards carry a weight slot "
++                  "(%d weights)" % (sum(1 for sl in slots for x in sl if x >= 0), sum(len(sl) for sl in slots),
++                                    len(st["wamax_params"])), flush=True)
++        return self._ak_wm
++
++    def _ak_first_gather_bucket_group(self):
++        """X9-STEP: the bucket group whose all-gather the forward issues first -- the last one built
++        (the group chain runs bucket_groups[-1] -> ... -> bucket_groups[0]); None if the layout is not
++        the plain one this was written for (one model chunk, no expert-parallel groups, overlapped gather)."""
++        if not self.ddp_config.overlap_param_gather or len(self.model_chunks) != 1:
++            return None
++        chunk = self.model_chunks[0]
++        bgs = getattr(chunk, "bucket_groups", None)
++        if not bgs or getattr(chunk, "expert_parallel_bucket_groups", None):
++            return None
++        bg = bgs[-1]
++        if any(other.next_param_gather_bucket_group is bg for other in bgs):
++            return None
++        # (x9step2: no check that the group's params are this optimizer's -- each rank's model_float16_groups holds
++        # only the params that overlap its own shard; phase 1 is simply this rank's shards inside the group)
++        return bg
++
++    def _ak_x9_finish_early_gather(self):
++        """X9-STEP: the stream waits for the first-gathered bucket group's all-gather (after phase 2
++        and the weight-amax pass); the forward's pre-hook will find it gathered.  Once, eagerly: the
++        gathered buffer against a synchronous re-gather of the same shards, byte for byte."""
++        bg = self._ak_early_bg
++        bg.param_gather_handle.wait()
++        bg.param_gather_handle = None
++        bg._post_param_sync()
++        bg._ak_pregathered = True
++        self._ak_early_pending = False
++        if getattr(self, "_ak_early_checked", False):
++            return
++        self._ak_early_checked = True
++        from ..distributed.param_and_grad_buffer import shard_buffer as _ak_shard_buffer
++        g = bg.intra_distributed_optimizer_instance_group
++        r = bg.intra_distributed_optimizer_instance_rank
++        n_bad = 0
++        n_el = 0
++        for b in bg.buckets:
++            ref = torch.empty_like(b.param_data)
++            local = _ak_shard_buffer(b.param_data, bg.intra_distributed_optimizer_instance_size)[r]
++            torch.distributed.all_gather_into_tensor(ref, local, group=g)
++            n_bad += int((ref.view(torch.int16) != b.param_data.view(torch.int16)).sum().item())
++            n_el += ref.numel()
++            del ref
++        bgs = self.model_chunks[0].bucket_groups
++        idx = next(i for i, x in enumerate(bgs) if x is bg)
++        ok = n_bad == 0
++        if torch.distributed.get_rank() == 0:
++            print("[auto_kernel x9step] early all-gather ARMED: bucket group %d of %d (%d params, %d elements) "
++                  "gathered inside the optimizer step between phase 1 (%d shards) and phase 2 (%d shards); "
++                  "the gathered buffer against a synchronous re-gather: %d of %d elements differ: %s"
++                  % (idx, len(bgs), sum(len(b.params_list) for b in bg.buckets), n_el,
++                     self._ak_n_phase[1], self._ak_n_phase[2], n_bad, n_el, ok), flush=True)
++        if not ok:
++            raise RuntimeError("[auto_kernel x9step] E0 self-check FAILED: the early-gathered bucket group "
++                               "differs from a synchronous re-gather in %d of %d elements" % (n_bad, n_el))
++
++    def _ak_x9_copy_fp32_groups_only(self):
++        for shard_main_group, model_group in zip(self.shard_fp32_groups, self.model_fp32_groups):
++            for shard_main_param, model_param in zip(shard_main_group, model_group):
++                param_range_map = self._get_model_param_range_map(model_param)
++                world_range = param_range_map["gbuf_world_in_bucket"]
++                gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
++                buf = self.buffers[gbuf_index].buckets[bucket_id].param_data
++                buf.view(-1)[world_range.start : world_range.end].data.copy_(shard_main_param)
++    # -----------------------------------------------------------------------------------------
++
+     @torch.no_grad()
+     def prepare_model_params_for_param_sync(self) -> None:
+         """Stage FP32 master shards into DDP param buffers before explicit param sync."""
+@@ -3205,6 +3545,9 @@
+         asynchorous all-gathers that get overlapped with the next forward pass.
+         """
+         update_successful = super().step_with_ready_grads()
++        if _AK_X9_EARLY_AG and getattr(self, "_ak_early_pending", False):
++            # X9-STEP: after phase 2 and the weight-amax pass (both launched inside the copy above)
++            self._ak_x9_finish_early_gather()
+ 
+         should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
+             self, '_defer_param_sync', False

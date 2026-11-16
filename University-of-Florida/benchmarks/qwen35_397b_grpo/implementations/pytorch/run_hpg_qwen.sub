@@ -1,0 +1,852 @@
+#!/bin/bash
+# Apptainer port of NVIDIA's v6.1 Qwen3.5-397B GRPO run.sub (20261006 image) for HiPerGator B200.
+# Original: Copyright (c) 2026, NVIDIA CORPORATION. Apache License 2.0.
+# Port: Yang Hong's run_apptainer.sub (older NVIDIA drop), merged onto the 20261006 run.sub.
+#
+# Submit with run_hpg_qwen.sh (it sources the paths and the config, then calls sbatch).
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --no-requeue
+#
+# What changed vs. the Pyxis version:
+#  - every `srun --container-*` became `srun ... bash $CEXEC [--mounts M] [--workdir W] -- cmd`
+#    ($CEXEC = node-side `apptainer exec --nv` wrapper generated below)
+#  - per-node writable state that Pyxis kept in a named container now lives in a
+#    node-local scratch dir bound as /tmp and $HOME (NODE_SCRATCH_BASE, default /raid/mlperf)
+#  - host modules (PYTHONHOME, LD_LIBRARY_PATH, ...) are stripped before entering the image
+#  - --container-env forwarding -> APPTAINERENV_<VAR> (forces host value over image ENV)
+#  - container create/remove checks are no-ops; requeue-on-failure removed (--no-requeue)
+set -eux
+module purge >/dev/null 2>&1 || true
+[[ -n "${CUDA_DEVICE_MAX_CONNECTIONS:-}" ]] && export CUDA_DEVICE_MAX_CONNECTIONS
+[[ -n "${NCCL_LAUNCH_ORDER_IMPLICIT:-}" ]] && export NCCL_LAUNCH_ORDER_IMPLICIT
+# Vars without defaults
+: "${CONT:?CONT (path to the .sif) not set}"
+: "${DGXSYSTEM:?DGXSYSTEM not set}"
+: "${WALLTIME_RUNANDTIME:?WALLTIME_RUNANDTIME not set}"
+: "${TRAIN_NODES:?TRAIN_NODES not set}"
+: "${GEN_NODES:?GEN_NODES not set}"
+# Vars with defaults
+: "${MLPERF_RULESET:=6.1.0}"
+: "${MLPERF_SCALE:='unknown'}"
+: "${MLPERF_CLUSTER_NAME:='unknown'}"
+: "${MILESTONE_YML:=unknown}"
+: "${NEXP:=1}"
+: "${CHECK_COMPLIANCE:=$(( ! ${FORCE_SUCCESS_STATUS:-0} ))}"
+: "${SEED:=$RANDOM}"
+: "${CLEAR_CACHES:=1}"
+: "${SET_PEAK_MEM_CLK:=0}"
+: "${DATESTAMP:=$(date +'%y%m%d%H%M%S%N')}"
+: "${LOGDIR:=./results}"
+: "${NCCL_TEST:=0}"
+: "${NCCL_TEST_WALLTIME:=10}"
+: "${RUN_ONLY_NCCL:=0}"
+: "${WORK_DIR:=/opt/nemo-rl}"
+: "${BENCHMARK_DIR:=/workspace/optimized/qwen35_397b_grpo_trtllm/pytorch}"
+export BENCHMARK_DIR
+: "${RUN_AND_TIME_SCRIPT:=${BENCHMARK_DIR}/run_and_time.sh}"
+# Apptainer --nv puts the host driver libs in /.singularity.d/libs; keep them ahead
+# of any CUDA compat libs in the image (replaces /usr/lib/aarch64-linux-gnu).
+: "${CONTAINER_LD_LIBRARY_PATH_PREPEND:=/.singularity.d/libs}"
+export CONTAINER_LD_LIBRARY_PATH_PREPEND
+: "${CLEAN_MPI_ENV_BEFORE_RAY:=1}"
+: "${DGXNGPU:=8}"
+: "${DROPCACHE_CMD:="sudo -n /sbin/sysctl vm.drop_caches=3"}"
+: "${USER_DROPCACHE:=}"
+: "${EXTRA_ASSETS:=}"
+: "${SRUN_KILL_ON_BAD_EXIT:=0}"
+: "${OFFLINE_EVAL:=0}"
+: "${WALLTIME_OFFLINE_EVAL:=60}"
+# Apptainer-specific
+: "${NODE_SCRATCH_BASE:=/raid/mlperf/${USER}/scratch}"   # node-local: /tmp, $HOME, Ray session dirs
+: "${CONTAINER_WRITABLE_TMPFS:=0}"                         # HiPerGator: overlay disabled by admins
+: "${RAY_SRUN_MPI:=none}"                                  # Ray steps don't need PMIx (env is scrubbed anyway)
+export NODE_SCRATCH_BASE CONTAINER_WRITABLE_TMPFS
+export SIF="${CONT}"
+export OFFLINE_EVAL
+case "${OFFLINE_EVAL}" in
+    0|1) ;;
+    *) echo "ERROR: OFFLINE_EVAL must be 0 or 1" >&2; exit 1 ;;
+esac
+: "${TLLM_LOG_LEVEL:=info}"
+export TLLM_LOG_LEVEL
+: "${NRL_CONTAINER_ENV_FORWARD:=UCX_TLS,UCX_NET_DEVICES,UCX_TCP_AF_PRIO,NCCL_NVLS_ENABLE,TRTLLM_HYBRID_DISAGG_REUSE,TLLM_MAMBA_FOLD_SAVE_LAST,TLLM_ADP_PACKED_SYNC}"
+: "${OMP_NUM_THREADS:=16}"
+export OMP_NUM_THREADS
+NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
+OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-1303}
+RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-1305}
+DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-1307}
+METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-1309}
+PORT=${PORT:-1200}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-1201}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-1311}
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
+RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-120}
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+num_retries=3
+if [[ "${DGXNNODES}" -ne "${SLURM_JOB_NUM_NODES}" ]]; then
+    echo "ERROR: DGXNNODES (${DGXNNODES}) != SLURM_JOB_NUM_NODES (${SLURM_JOB_NUM_NODES})" >&2
+    exit 1
+fi
+if [[ "${COLOCATED_GENERATION:-0}" == "1" ]]; then
+    if [[ "${TRAIN_NODES}" -ne "${DGXNNODES}" ]]; then
+        echo "ERROR: colocated TRAIN_NODES (${TRAIN_NODES}) != DGXNNODES (${DGXNNODES})" >&2; exit 1
+    fi
+    if [[ "${GEN_NODES}" -ne "${TRAIN_NODES}" ]]; then
+        echo "ERROR: colocated GEN_NODES (${GEN_NODES}) must equal TRAIN_NODES (${TRAIN_NODES})" >&2; exit 1
+    fi
+else
+    if [[ "$((TRAIN_NODES + GEN_NODES))" -ne "${DGXNNODES}" ]]; then
+        echo "ERROR: TRAIN_NODES (${TRAIN_NODES}) + GEN_NODES (${GEN_NODES}) != DGXNNODES (${DGXNNODES})" >&2; exit 1
+    fi
+fi
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+fi
+unset UV_CACHE_DIR
+if [[ -n "${SLURM_JOB_ID:-}" && ( -z "${RUNSUB_DIR:-}" || "${OFFLINE_EVAL}" == "1" ) ]]; then
+    _slurm_job_info="$(SLURM_TIME_FORMAT=standard scontrol show job "${SLURM_JOB_ID}")" || {
+        _slurm_query_status=$?
+        echo "ERROR: scontrol could not read Slurm job ${SLURM_JOB_ID}" >&2
+        exit "${_slurm_query_status}"
+    }
+fi
+if [[ -z "${RUNSUB_DIR:-}" ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+        export RUNSUB_DIR=$(dirname $(awk -F= '/Command=/{print $2}' <<< "${_slurm_job_info}"))
+    else
+        export RUNSUB_DIR=$(dirname "${BASH_SOURCE[0]}")
+    fi
+fi
+GRPO_SUPPORT_DIR="$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+if [[ ! -r "${GRPO_SUPPORT_DIR}/cleanup_grpo_scratch.sh" ||
+      ! -r "${GRPO_SUPPORT_DIR}/grpo_teardown.sh" ]]; then
+    GRPO_SUPPORT_DIR="${RUNSUB_DIR}"
+fi
+readonly GRPO_SUPPORT_DIR
+source "${GRPO_SUPPORT_DIR}/utility/slurm_helpers.sh"
+configure_cpus_per_worker || exit 1
+initialize_gpu_cpu_affinity_settings || exit 1
+source "${GRPO_SUPPORT_DIR}/cleanup_grpo_scratch.sh"
+source "${GRPO_SUPPORT_DIR}/grpo_teardown.sh"
+source "${GRPO_SUPPORT_DIR}/experiment_isolation.sh"
+initialize_grpo_teardown_settings
+export RETAIN_GRPO_SCRATCH RETAIN_GRPO_CHECKPOINTS
+
+########################################################
+# Apptainer replacements for Pyxis container lifecycle
+########################################################
+[[ -z "${NRL_RUNTIME_PATCH:-}" ]] || { echo "ERROR: NRL_RUNTIME_PATCH is not supported with the read-only SIF" >&2; exit 1; }
+[[ -r "${SIF}" ]] || { echo "ERROR: image ${SIF} not readable" >&2; exit 1; }
+( umask 0002; mkdir -p "${LOGDIR}" )
+export CEXEC_DIR="$(realpath -e -- "${LOGDIR}")/apptainer_${SLURM_JOB_ID}"
+mkdir -p "${CEXEC_DIR}"
+export CEXEC="${CEXEC_DIR}/cexec.sh"
+cat > "${CEXEC}" <<'CEXEC_EOF'
+#!/bin/bash
+# Node-side wrapper: cexec.sh [--mounts LIST] [--workdir DIR] [--] cmd args...
+set -e
+mounts=""; workdir=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mounts)  mounts="$2"; shift 2 ;;
+        --workdir) workdir="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+node_dir="${NODE_SCRATCH_BASE}/${SLURM_JOB_ID}/$(hostname -s)"
+mkdir -p "${node_dir}/tmp" "${node_dir}/home"
+args=(exec --nv --home "${node_dir}/home:/nrl_home")
+[[ "${CONTAINER_WRITABLE_TMPFS:-1}" == 1 ]] && args+=(--writable-tmpfs)
+# Node-local /tmp (Ray sessions, launch scripts) unless the mount list already maps /tmp.
+if [[ ",${mounts}," != *":/tmp,"* && ",${mounts}," != *":/tmp:"* ]]; then
+    args+=(--no-mount tmp -B "${node_dir}/tmp:/tmp")
+fi
+# Drop /dev/fuse binds (NVIDIA's mount list adds /dev/fuse:/dev/fuse for Pyxis). An Apptainer
+# bind is nosuid,nodev, so a bound /dev/fuse cannot be opened (EACCES) and the inner SWE
+# sandboxes fail with "squashfuse_ll: failed to open /dev/fuse". /dev already has it.
+if [[ -n "${mounts}" ]]; then
+    _keep=(); IFS=, read -ra _mm <<< "${mounts}"
+    for _m in "${_mm[@]}"; do [[ "${_m}" == /dev/fuse || "${_m}" == /dev/fuse:* ]] || _keep+=("${_m}"); done
+    mounts=$(IFS=,; echo "${_keep[*]}")
+fi
+[[ -n "${mounts}" ]] && args+=(-B "${mounts}")
+# Writable node-local copies of image dirs that NeMo-Gym writes into (lock files, setup dirs).
+for _d in ${WRITABLE_COPY_DIRS:-}; do
+    _c="${WRITABLE_CACHE}/$(echo "${_d#/}" | tr / _)"
+    [[ -f "${_c}/.sif_id" ]] && args+=(-B "${_c}:${_d}")
+done
+# Patched single files from the image (comma-separated src:dst list, see MOE_MASK_PACKED_PADDING).
+[[ -n "${PATCH_BINDS:-}" ]] && args+=(-B "${PATCH_BINDS}")
+[[ -n "${workdir}" ]] && args+=(--pwd "${workdir}")
+# Host modules must not leak into the image.
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE LD_LIBRARY_PATH LD_PRELOAD \
+      CUDA_HOME CUDA_PATH CPATH LIBRARY_PATH MANPATH
+exec apptainer "${args[@]}" "${SIF}" "$@"
+CEXEC_EOF
+chmod +x "${CEXEC}"
+
+# MoE padding fix (two files; patched copies are bind-mounted over the image's originals):
+#  1) NeMo-RL data.py builds the packed-sequence padding mask only for the HybridEP "flex"
+#     dispatcher; we must use "alltoall" (the image's HybridEP is intra-node only) -> enable it.
+#  2) Megatron router.py only uses that mask for aux-loss/z-loss/bias statistics, NOT for dispatch,
+#     so padding tokens are still routed. They all tie (or are NaN) in the router -> top-k picks the
+#     lowest-index experts -> EP rank 0 of every stage receives most routed tokens -> OOM on ranks
+#     0/32/64/96. Drop padding rows from routing_map/probs after top-k. Real tokens are unaffected
+#     (padding sits at the end of each packed sequence; attention and GDN are causal; loss masks it).
+# Needed only with the alltoall dispatcher (EP across nodes). NVIDIA's HybridEP path
+# (EP inside one node) builds the padding mask itself, so the default is off.
+: "${MOE_MASK_PACKED_PADDING:=0}"
+export PATCH_BINDS=""
+if [[ "${MOE_MASK_PACKED_PADDING}" == 1 ]]; then
+    _pdir="${CEXEC_DIR}/patches"; mkdir -p "${_pdir}"
+    _d1=/opt/nemo-rl/nemo_rl/models/megatron/data.py
+    _d2=/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/transformer/moe/router.py
+    apptainer exec --cleanenv "${SIF}" cat "${_d1}" > "${_pdir}/data.py.orig" 2>/dev/null || true
+    apptainer exec --cleanenv "${SIF}" cat "${_d2}" > "${_pdir}/router.py.orig" 2>/dev/null || true
+    if python3 - "${_pdir}" <<'PY'
+import sys, os
+d = sys.argv[1]
+def patch(name, old, new):
+    s = open(os.path.join(d, name + ".orig")).read()
+    if s.count(old) != 1:
+        sys.exit(name + ": patch anchor not found (image changed?)")
+    open(os.path.join(d, name), "w").write(s.replace(old, new))
+patch("data.py",
+      "        create_packed_seq_padding_mask = uses_hybridep_flex_dispatcher(\n"
+      "            cfg[\"megatron_cfg\"]\n"
+      "        )\n"
+      "        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[",
+      "        create_packed_seq_padding_mask = True  # B200 port: mask packed padding from MoE routing (any dispatcher)\n"
+      "        prepad_packed_seq_for_hybridep = uses_hybridep_flex_dispatcher(cfg[\"megatron_cfg\"]) and cfg[")
+patch("router.py",
+      "        # Apply token dropping to probs and routing_map.\n"
+      "        if self.config.moe_expert_capacity_factor is not None:",
+      "        # B200 port: do not dispatch packed-sequence padding tokens to any expert.\n"
+      "        if padding_mask is not None:\n"
+      "            routing_map = routing_map & (~padding_mask).unsqueeze(-1)\n"
+      "            probs = probs.masked_fill(padding_mask.unsqueeze(-1), 0)\n"
+      "\n"
+      "        # Apply token dropping to probs and routing_map.\n"
+      "        if self.config.moe_expert_capacity_factor is not None:")
+PY
+    then
+        export PATCH_BINDS="${_pdir}/data.py:${_d1},${_pdir}/router.py:${_d2}"
+        echo "MoE padding-mask patch: ${PATCH_BINDS}"
+    else
+        echo "WARNING: MoE padding-mask patch not applied" >&2
+    fi
+fi
+
+# A SIF is read-only and overlays are disabled here, but NeMo-Gym writes into a few image
+# dirs (venv *.setup.lock, swe_agents/.swe_openhands_setup.lockdir, ...). Copy those dirs once
+# per node to node-local disk (re-copied only when the SIF changes) and bind each copy back
+# over the same path, so absolute paths inside venvs / the OpenHands setup stay valid.
+: "${WRITABLE_COPY_DIRS:=/opt/gym_venvs /opt/nemo-rl/3rdparty/Gym-workspace/Gym}"
+: "${WRITABLE_CACHE:=/raid/mlperf/${USER}/writable}"
+export WRITABLE_COPY_DIRS WRITABLE_CACHE
+export GYM_SIF_ID="$(stat -L -c '%s-%Y' "${SIF}")"
+srun --overlap --ntasks-per-node=1 --nodes="${SLURM_JOB_NUM_NODES}" bash -c '
+    set -e
+    # Old single-dir cache from earlier versions of this script (no-op once gone).
+    chmod -R u+w "${WRITABLE_CACHE}"/*.tmp.* 2>/dev/null || true
+    rm -rf "/raid/mlperf/${USER}/gym_venvs" "/raid/mlperf/${USER}"/gym_venvs.tmp.* "${WRITABLE_CACHE}"/*.tmp.*
+    # mkdir-style locks (e.g. swe_agents/.swe_openhands_setup.lockdir) left in the persistent
+    # writable copies by killed/cancelled jobs would block NeMo-Gym forever; nothing holds them now.
+    find "${WRITABLE_CACHE}" -maxdepth 8 -type d -name "*.lockdir" -prune -print -exec rm -rf {} + 2>/dev/null \
+        | sed "s|^|$(hostname -s): removed stale lock |" || true
+    # The OpenHands venv in the Gym copy must match the image. In jobs 45463796 and 45468526
+    # something removed Pillow from it on 2 of 16 nodes; every sandbox there then died
+    # ("No module named PIL"), which gave 1/8 empty rollouts in every later job.
+    SPREL=responses_api_agents/swe_agents/swe_openhands_setup/OpenHands/.venv/lib/python3.12/site-packages
+    for d in ${WRITABLE_COPY_DIRS}; do
+        c="${WRITABLE_CACHE}/$(echo "${d#/}" | tr / _)"
+        if [[ "${d}" == */Gym-workspace/Gym && -f "${c}/.sif_id" ]]; then
+            n_node=$(ls "${c}/${SPREL}" 2>/dev/null | wc -l)
+            n_img=$(apptainer exec --cleanenv "${SIF}" ls "${d}/${SPREL}" 2>/dev/null | wc -l)
+            if [[ "${n_node}" != "${n_img}" ]]; then
+                echo "$(hostname -s): OpenHands site-packages has ${n_node} entries, image ${n_img}: copy again"
+                rm -f "${c}/.sif_id"
+            fi
+        fi
+        if [[ "$(cat "${c}/.sif_id" 2>/dev/null)" == "${GYM_SIF_ID}" ]]; then
+            echo "$(hostname -s): ${d} cache up to date"; continue
+        fi
+        tmp="${c}.tmp.$$"
+        chmod -R u+w "${c}" 2>/dev/null || true
+        rm -rf "${tmp}" "${c}"; mkdir -p "${tmp}"
+        apptainer exec --cleanenv -B "${tmp}:/copy_out" "${SIF}" rsync -a --no-owner --no-group "${d}/" /copy_out/ 2>&1 \
+            | grep -v "compat/lib" || true
+        [[ -n "$(ls -A "${tmp}")" ]] || { echo "$(hostname -s): copy of ${d} failed" >&2; exit 1; }
+        echo "${GYM_SIF_ID}" > "${tmp}/.sif_id"
+        mv "${tmp}" "${c}"
+        echo "$(hostname -s): ${d} copied ($(du -sh "${c}" | cut -f1))"
+    done
+' || { echo "ERROR: staging writable copies failed" >&2; exit 1; }
+
+# Inner-apptainer wrapper for NeMo-Gym SWE sandboxes: on a transient FUSE mount failure
+# ("squashfuse_ll ... failed to open /dev/fuse") the sandbox never started, so retry it with
+# backoff, and log node diagnostics into the sandbox log the first time it happens.
+# Installed into the node-local writable Gym copy; app.py is patched to call it. Idempotent.
+: "${SWE_APPTAINER_RETRIES:=20}" "${SWE_APPTAINER_STAGGER:=2}"
+export SWE_APPTAINER_RETRIES SWE_APPTAINER_STAGGER
+srun --overlap --ntasks-per-node=1 --nodes="${SLURM_JOB_NUM_NODES}" bash -c '
+    set -e
+    G="${WRITABLE_CACHE}/opt_nemo-rl_3rdparty_Gym-workspace_Gym"
+    [[ -d "${G}" ]] || { echo "$(hostname -s): no Gym copy at ${G}" >&2; exit 1; }
+    cat > "${G}/apptainer_retry.sh" <<"WRAP"
+#!/bin/bash
+# apptainer_retry.sh exec ... : launches an SWE sandbox, (1) staggering container start-up per
+# node (one launch every SWE_APPTAINER_STAGGER s, via a node-local flock) and (2) retrying when
+# the container never started because of a FUSE mount failure.
+max=${SWE_APPTAINER_RETRIES:-20}
+stagger=${SWE_APPTAINER_STAGGER:-2}
+# Do not leak the outer container bind list into the sandboxes.
+unset APPTAINER_BIND SINGULARITY_BIND APPTAINER_BINDPATH SINGULARITY_BINDPATH
+# OpenHands LocalRuntime takes the agent user from $USER. --cleanenv drops it, so it falls back to
+# "root" and opens its tmux bash pane with "su root -", which (as uid != 0) waits for a password
+# forever -> action server never answers /alive. Pass the real user name into the sandbox.
+# libtmux rejects session names with a period ("openhands-<user>-<id>"), so a user name like
+# "vanminh.nguyen" kills the action server at start (BadSessionName). Replace "." with "_".
+export APPTAINERENV_USER="$(id -un | tr . _)" APPTAINERENV_LOGNAME="$(id -un | tr . _)"
+# HOME would be the outer container home (/nrl_home), which does not exist in the sandbox
+# (--no-mount home); OpenHands then fails writing ~/.bashrc. Root sandboxes got /root via su.
+if [[ "${1:-}" == exec ]]; then shift; set -- exec --home "${SWE_SANDBOX_HOME:-/root}" "$@"; fi
+# --writable-tmpfs is capped at "sessiondir max size = 64" MB in the image apptainer.conf; as non-root
+# git rewrites the whole /testbed tree and fills it. Use a disk-backed overlay dir on node-local /tmp.
+ovl=""
+if [[ " $* " == *" --writable-tmpfs "* ]]; then
+    ovl=$(mktemp -d /tmp/sbx_ovl.XXXXXX)
+    a=(); for x in "$@"; do if [[ "$x" == --writable-tmpfs ]]; then a+=(--overlay "${ovl}"); else a+=("$x"); fi; done
+    set -- "${a[@]}"
+    trap "chmod -R u+rwX \"\${ovl}\" 2>/dev/null; rm -rf \"\${ovl}\"" EXIT
+    trap "exit 143" TERM INT
+fi
+lock=/tmp/.apptainer_launch.lock
+tmp=$(mktemp /tmp/apptainer_retry.XXXXXX)
+for ((i = 1; i <= max; i++)); do
+    exec 9>>"${lock}"; flock 9
+    apptainer "$@" <&0 2>"${tmp}" &
+    pid=$!
+    for ((k = 0; k < stagger * 10; k++)); do kill -0 ${pid} 2>/dev/null || break; sleep 0.1; done
+    flock -u 9; exec 9>&-
+    wait ${pid}; rc=$?
+    cat "${tmp}" >&2
+    if [[ ${rc} -ne 0 ]] && grep -q "failed to open /dev/fuse\|image driver mount failure" "${tmp}"; then
+        if [[ ${i} -eq 1 ]]; then
+            {
+                echo "=== apptainer_retry diag $(date +%T.%N) host=$(hostname -s) pid=$$"
+                ls -l /dev/fuse; id
+                grep -E "^(NoNewPrivs|Seccomp|CapEff|CapBnd):" /proc/self/status
+                head -3 /proc/self/cgroup
+                echo "fuse mounts: $(grep -c fuse /proc/mounts)  squashfuse procs: $(pgrep -c -u "$(id -u)" squashfuse_ll)  overlay procs: $(pgrep -c -u "$(id -u)" fuse-overlayfs)  fds: $(ls /proc/$$/fd | wc -l)/$(ulimit -n)"
+                echo "args: $*"
+                grep -E " /dev( |/fuse )" /proc/self/mountinfo | head -3
+                # Debug replay (first 3 failures per node): same options + image, command "true".
+                n=$(cat /tmp/.apptainer_dbg_count 2>/dev/null || echo 0)
+                if (( n < 3 )); then
+                    echo $((n + 1)) > /tmp/.apptainer_dbg_count
+                    dbg=(); for a in "$@"; do dbg+=("$a"); [[ "$a" == *.sif ]] && break; done
+                    echo "--- apptainer -d replay (${#dbg[@]} args + true)"
+                    apptainer -d "${dbg[@]}" true 2>&1 | grep -iE "fuse|squash|denied|permission|error|fatal|userns|namespace|starter|mount\(\)" | tail -40
+                    echo "--- replay rc=${PIPESTATUS[0]}"
+                fi
+            } >&2
+        fi
+        echo "apptainer_retry: FUSE mount failure, attempt ${i}/${max}" >&2
+        sleep $(( (i < 5 ? i : 5) * 2 + RANDOM % 5 ))
+        continue
+    fi
+    rm -f "${tmp}"; exit ${rc}
+done
+rm -f "${tmp}"; exit ${rc}
+WRAP
+    chmod 755 "${G}/apptainer_retry.sh"
+    W=/opt/nemo-rl/3rdparty/Gym-workspace/Gym/apptainer_retry.sh
+    for f in "${G}/responses_api_agents/swe_agents/app.py" \
+             $(ls "${G}"/responses_api_agents/swe_agents/swe_openhands_setup/OpenHands/.venv/lib/python3*/site-packages/responses_api_agents/swe_agents/run_openhands.py 2>/dev/null); do
+        [[ -f "${f}" ]] || continue
+        chmod u+w "$(dirname "${f}")"   # sed -i writes a temp file next to it
+        grep -q "${W}" "${f}" || sed -i "s#\"apptainer exec --writable-tmpfs#\"${W} exec --writable-tmpfs#g" "${f}"
+        echo "$(hostname -s): $(grep -c "${W}" "${f}") sandbox launch(es) wrapped in $(basename "${f}")"
+    done
+    # Read-only package dirs (after the patch above): nothing can delete a package from the
+    # OpenHands venv during a run (see the site-packages check in the staging step).
+    find "${G}/responses_api_agents/swe_agents/swe_openhands_setup/OpenHands/.venv/lib/python3.12/site-packages" \
+        -type d -exec chmod a-w {} +
+' || { echo "ERROR: installing apptainer_retry.sh failed" >&2; exit 1; }
+
+# Keep the original cleanup routines but run them tolerant of missing Pyxis/Enroot.
+if declare -F cleanup_containers >/dev/null; then
+    eval "$(declare -f cleanup_containers | sed '1s/^cleanup_containers/_orig_cleanup_containers/')"
+fi
+if declare -F _run_grpo_teardown >/dev/null; then
+    eval "$(declare -f _run_grpo_teardown | sed '1s/^_run_grpo_teardown/_orig_run_grpo_teardown/')"
+fi
+# NVIDIA's helpers call `enroot list/remove` (experiment_isolation.sh, grpo_teardown.sh
+# cleanup_pyxis), also inside `srun bash -c` on the nodes. There are no Enroot containers
+# here, so make enroot a no-op everywhere (exported functions travel through srun's env).
+enroot() { return 0; }
+export -f enroot
+cleanup_pyxis() { return 0; }
+require_fresh_grpo_container()   { :; }
+require_created_grpo_container() { :; }
+cleanup_for_requeue()            { :; }
+_kill_ray_steps() {
+    [[ -n "${RAY_CLUSTER_LOG_DIR:-}" && -d "${RAY_CLUSTER_LOG_DIR}" ]] && touch "${RAY_CLUSTER_LOG_DIR}/ENDED" || true
+    for _p in "${SRUN_PIDS[@]:-}"; do [[ -n "${_p}" ]] && kill "${_p}" 2>/dev/null || true; done
+    sleep 5
+}
+_cleanup_node_scratch() {
+    [[ "${RETAIN_GRPO_SCRATCH:-0}" == 1 ]] && return 0
+    srun --overlap --ntasks-per-node=1 --nodes="${SLURM_JOB_NUM_NODES}" bash -c \
+        'rm -rf "${NODE_SCRATCH_BASE}/${SLURM_JOB_ID}/$(hostname -s)"' || true
+}
+cleanup_containers() {
+    set +e
+    _kill_ray_steps
+    declare -F _orig_cleanup_containers >/dev/null && ( _orig_cleanup_containers ) 2>&1 | sed 's/^/[orig-cleanup] /'
+    _cleanup_node_scratch
+    set -e
+}
+_run_grpo_teardown() {
+    set +e
+    _kill_ray_steps
+    if declare -F _orig_run_grpo_teardown >/dev/null; then
+        ( _orig_run_grpo_teardown ) 2>&1 | sed 's/^/[orig-teardown] /'
+        [[ ${PIPESTATUS[0]} -eq 0 ]] || echo "WARNING: original teardown reported errors (expected for Enroot-specific steps)"
+    fi
+    _cleanup_node_scratch
+    set -e
+    return 0
+}
+
+# Never inherit another cluster's address or temporary directory.
+export RAY_ADDRESS=auto RAY_TMPDIR=/tmp TMPDIR=/tmp
+NRL_CONTAINER_ENV_FORWARD="${NRL_CONTAINER_ENV_FORWARD:+${NRL_CONTAINER_ENV_FORWARD},}RAY_ADDRESS,RAY_TMPDIR,TMPDIR"
+# Force these host values over the image ENV (Pyxis --container-env equivalent).
+_apply_env_forward() {
+    local _n
+    IFS=',' read -ra _fwd_names <<< "${NRL_CONTAINER_ENV_FORWARD}"
+    for _n in "${_fwd_names[@]}"; do
+        [[ -n "${_n}" && -n "${!_n:-}" ]] && export "APPTAINERENV_${_n}=${!_n}"
+    done
+    return 0
+}
+_apply_env_forward
+
+run_grpo_experiment() (
+echo "PROLOG_START $(date +%s) experiment=${_experiment_index}"
+readonly _archive_logdir="$(realpath -m -- "${LOGDIR}")"
+prepare_grpo_experiment_paths
+export MODEL_NAME="${MODEL_NAME:-qwen35_397b_grpo_trtllm}"
+export MODEL_FRAMEWORK="pytorch"
+LOGBASE="${DATESTAMP}"
+export DATESTAMP LOGBASE DGXSYSTEM CONT MLPERF_SCALE MLPERF_CLUSTER_NAME MILESTONE_YML EXTRA_ASSETS
+export SPREFIX="${MODEL_NAME}_${MODEL_FRAMEWORK}_${DGXNNODES}x${DGXNGPU}_${DATESTAMP}"
+
+# Keep benchmark-facing artifacts in the configured log directory. LOGDIR
+# below is private runtime storage for this job/experiment.
+readonly LOG_FILE_BASE="${_archive_logdir}/${LOGBASE}"
+readonly _cont_name="${MODEL_NAME}_${SLURM_JOB_ID}_exp${_experiment_index}"
+require_fresh_grpo_container
+( umask 0002; mkdir -p "${LOGDIR}" )
+export LOGDIR="$(realpath -e -- "${LOGDIR}")"
+export RAY_CLUSTER_LOG_DIR="${LOGDIR}/ray-${SLURM_JOB_ID}.${SLURM_RESTART_COUNT:-0}"
+mkdir -p "${RAY_CLUSTER_LOG_DIR}"
+declare -A SRUN_PIDS=()
+unset _checkpoint_dir
+trap cleanup_containers EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [[ "${OFFLINE_EVAL}" == "1" ]]; then
+    [[ "${SLURM_RESTART_COUNT:-0}" == "0" ]] || _experiment_index=1
+    validate_deferred_launch "${_slurm_job_info}"
+fi
+source "${RUNSUB_DIR}/config_mounts.sh"
+echo _cont_mounts="${_cont_mounts}"
+_apply_env_forward   # RAY_ADDRESS etc. may have changed
+
+if [[ "${SET_PEAK_MEM_CLK:-0}" == "1" ]]; then
+    srun --ntasks-per-node=1 bash -c 'for idx in $(seq 0 $((DGXNGPU-1))); do sudo nvidia-smi -lmc 4752,4752 -i "${idx}"; done'
+fi
+
+# "Container setup": verify the image starts on every node (replaces pyxis pull).
+srun --ntasks-per-node=1 bash "${CEXEC}" -- bash -c 'echo "$(hostname): $(nvidia-smi -L | wc -l) GPUs, $(python -c "import torch;print(torch.__version__)")"'
+require_created_grpo_container
+srun -N1 -n1 bash "${CEXEC}" -- ibv_devinfo --list || true
+srun -N1 -n1 bash "${CEXEC}" -- nvidia-smi topo -m
+nvidia-smi
+if [[ "${INIT_EXPECTED_MOUNTS:-0}" -eq 1 ]]; then
+    srun -N1 -n1 bash "${CEXEC}" --mounts "${_cont_mounts}" -- \
+        python3 -m mlperf_common.mountcheck --expected_mounts_csv "${LOGDIR}/${SPREFIX}_expected-mounts.csv" \
+            --mounts_to_verify $mounts_to_verify --initialize
+fi
+if [[ "${VERIFY_MOUNTS:-1}" -eq 1 ]]; then
+    # Each fresh experiment checks its mounts; retain all checks in the job report.
+    (srun --ntasks-per-node=1 bash "${CEXEC}" --mounts "${_cont_mounts}" --workdir "${BENCHMARK_DIR}" -- \
+        python3 -m mlperf_common.mountcheck --expected_mounts_csv expected-mounts.csv --mounts_to_verify $mounts_to_verify
+    ) |& tee -a "${_archive_logdir}/${SPREFIX}_mountcheck.log"
+fi
+nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sort)
+nodes_array=($nodes)
+head_node=${nodes_array[0]}
+head_node_ip=$(getent ahostsv4 $head_node 2>/dev/null | awk '{ print $1; exit }' || true)
+if [[ -z "$head_node_ip" ]]; then
+    head_node_ip=$(host $head_node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || true)
+fi
+if [[ -z "$head_node_ip" ]]; then
+    head_node_ip=$head_node
+fi
+ip_head=$head_node_ip:$PORT
+export RAY_ADDRESS="${ip_head}"
+_apply_env_forward
+export MASTER_ADDR=$head_node
+echo "using MASTER_ADDR \"${MASTER_ADDR}\" of list \"${SLURM_JOB_NODELIST}\""
+echo "NCCL_TEST = ${NCCL_TEST}"
+if [[ ${NCCL_TEST} -eq 1 ]]; then
+    set +e
+    echo "NCCL_TEST_START $(date +%s)"
+    (srun --mpi="${SLURM_MPI_TYPE:-pmix}" --ntasks-per-node="${DGXNGPU}" --time="${NCCL_TEST_WALLTIME}" \
+          bash "${CEXEC}" --mounts "${_cont_mounts}" -- all_reduce_perf_mpi -b 16M -e 4G -f 2)
+    echo "NCCL_TEST_STOP $(date +%s)"
+    set -e
+fi
+if [ ${RUN_ONLY_NCCL} -gt 0 ]; then
+    exit 0
+fi
+########################################################
+# Ray cluster bringup (ported from nemo-rl ray.sub)
+########################################################
+GRES_ARG=""
+if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
+    GRES_ARG="--gres=gpu:${DGXNGPU}"
+fi
+COMMON_SRUN_ARGS="$GRES_ARG"
+COMMON_SRUN_ARGS+=" --mpi=${RAY_SRUN_MPI}"
+COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
+COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+check_srun_processes() {
+  for name in "${!SRUN_PIDS[@]}"; do
+    pid="${SRUN_PIDS[$name]}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      _grpo_scratch_log "ERROR: background srun '${name}' died (pid=${pid}); exiting"
+      exit 1
+    fi
+  done
+}
+TOPO_PROBE_SCRIPT="$RAY_CLUSTER_LOG_DIR/topology_probe.sh"
+printf 'export NRL_ENABLE_GPU_CPU_AFFINITY=%q\n' "$NRL_ENABLE_GPU_CPU_AFFINITY" > "$TOPO_PROBE_SCRIPT"
+printf 'export NRL_GPU_CPU_AFFINITY_FILE=%q\n' "${NRL_GPU_CPU_AFFINITY_FILE:-}" >> "$TOPO_PROBE_SCRIPT"
+cat >> "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
+CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
+if [[ -z "\$CLUSTER_UUID" ]]; then
+  CLUSTER_UUID=""
+fi
+TOPO_RANK=""
+if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
+  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
+  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
+  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
+  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
+  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+  fi
+elif [[ -n "\${RAY_NODE_RANK:-}" ]]; then
+  TOPO_RANK=\$(( 10#\$RAY_NODE_RANK ))
+else
+  _hostname_digits=\$(hostname | tr -dc '0-9')
+  if [[ -n "\$_hostname_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_hostname_digits ))
+  fi
+fi
+source "${BENCHMARK_DIR}/utility/slurm_helpers.sh"
+configure_gpu_cpu_affinity "$DGXNGPU" || exit 1
+RAY_RESOURCES='{\"worker_units\": '"$DGXNGPU"', \"slurm_managed_ray_cluster\": 1'
+if [[ -n "\$CLUSTER_UUID" ]]; then
+  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
+fi
+if [[ -n "\$TOPO_RANK" ]]; then
+  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+fi
+RAY_RESOURCES+='}'
+export RAY_RESOURCES
+TOPO_PROBE_EOF
+ray_node_body=$(cat <<EOF
+if [[ -n "${CONTAINER_LD_LIBRARY_PATH_PREPEND}" ]]; then
+    export LD_LIBRARY_PATH=${CONTAINER_LD_LIBRARY_PATH_PREPEND}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}
+fi
+exit-dramatically() {
+    pkill -P \$\$ || true
+    kill -TERM 0 || true
+    exit 1
+}
+export -f exit-dramatically
+monitor-sidecar() {
+  set +x
+  while true; do
+    sleep 60
+    if [[ -f "$RAY_CLUSTER_LOG_DIR/ENDED" ]]; then
+      echo "Detected ENDED file, terminating..."
+      exit-dramatically
+    fi
+  done
+}
+monitor-sidecar &
+log-sync-sidecar() {
+  set +x
+  mkdir -p $RAY_CLUSTER_LOG_DIR/ray/\$(hostname)
+  while true; do
+    sleep $RAY_LOG_SYNC_FREQUENCY
+    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in /tmp/ray/session_[0-9]*/; do
+        if [[ -d "\$session_dir/logs" ]]; then
+          session_name=\$(basename "\$session_dir")
+          mkdir -p "$RAY_CLUSTER_LOG_DIR/ray/\$(hostname)/\$session_name"
+          rsync -ahP "\$session_dir/logs/" "$RAY_CLUSTER_LOG_DIR/ray/\$(hostname)/\$session_name/logs/" 2>/dev/null || true
+        fi
+      done
+    fi
+    if [[ -f "$RAY_CLUSTER_LOG_DIR/ENDED" ]]; then
+      echo "Log sync sidecar terminating..."
+      break
+    fi
+  done
+}
+log-sync-sidecar &
+# nsys helper patch (needs the writable tmpfs layer; harmless if it fails)
+sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib/python*/site-packages/ray/_private/runtime_env/nsight.py 2>/dev/null || true
+source $RAY_CLUSTER_LOG_DIR/topology_probe.sh
+if [[ "${CLEAN_MPI_ENV_BEFORE_RAY}" == "1" ]]; then
+    for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/ && !/^OMPI_ALLOW_RUN_AS_ROOT/{print \$1}'); do
+        unset "\$v"
+    done
+fi
+EOF
+)
+head_cmd=$(cat <<EOF
+RAY_NODE_RANK=0
+touch $RAY_CLUSTER_LOG_DIR/STARTED_RAY_HEAD
+$ray_node_body
+cat <<EOFINNER | tee /tmp/launch-head.sh
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
+ray start --head \
+    --disable-usage-stats \
+    --resources="\$RAY_RESOURCES" \
+    --node-ip-address="$head_node_ip" \
+    --port=${PORT} \
+    --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
+    --dashboard-port=${DASHBOARD_PORT} \
+    --dashboard-host="$head_node_ip" \
+    --include-dashboard=True \
+    --min-worker-port=${MIN_WORKER_PORT} \
+    --max-worker-port=${MAX_WORKER_PORT} \
+    --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
+    --object-manager-port=$((${OBJECT_MANAGER_PORT} + 1)) \
+    --runtime-env-agent-port=$((${RUNTIME_ENV_AGENT_PORT} + 1)) \
+    --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
+    --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
+    --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
+    --block
+EOFINNER
+chmod +x /tmp/launch-head.sh
+count=0
+while [[ \$count -lt $num_retries ]]; do
+  bash /tmp/launch-head.sh
+  count=\$((count+1))
+  echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
+  sleep 5
+done
+touch $RAY_CLUSTER_LOG_DIR/ENDED
+exit 1
+EOF
+)
+srun $COMMON_SRUN_ARGS --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" \
+     -o $RAY_CLUSTER_LOG_DIR/ray-head.log \
+     bash "${CEXEC}" --mounts "${_cont_mounts}" --workdir "${WORK_DIR}" -- bash -x -c "$head_cmd" &
+SRUN_PIDS["ray-head"]=$!
+NUM_ACTORS=$((DGXNGPU * SLURM_JOB_NUM_NODES))
+while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $RAY_CLUSTER_LOG_DIR/STARTED_RAY_HEAD; do
+  echo "[INFO][$(date)] Waiting for head node container to start..."
+  sleep 2
+done
+extract_worker_units() {
+  status_output=$(srun --overlap --nodes=1 --ntasks=1 -w "$head_node" bash "${CEXEC}" -- ray status) || status_output=
+  if echo "$status_output" | grep -q "worker_units"; then
+    worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
+    echo $worker_units
+  else
+    echo 0
+  fi
+}
+while true; do
+  check_srun_processes
+  worker_units=$(extract_worker_units)
+  if [[ "$worker_units" -ge "$DGXNGPU" ]]; then
+    break
+  fi
+  echo "[INFO] Waiting for Ray on the head node..."
+  sleep 2
+done
+worker_nodes=$((SLURM_JOB_NUM_NODES - 1))
+if [[ "$worker_nodes" -gt 0 ]]; then
+  worker_cmd=$(cat <<EOF
+RAY_NODE_RANK=\$((SLURM_PROCID + 1))
+$ray_node_body
+cat <<EOFINNER | tee /tmp/launch-worker.sh
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
+ray start --address "$ip_head" \
+          --disable-usage-stats \
+          --resources="\$RAY_RESOURCES" \
+          --min-worker-port=${MIN_WORKER_PORT} \
+          --max-worker-port=${MAX_WORKER_PORT} \
+          --node-manager-port=${NODE_MANAGER_PORT} \
+          --object-manager-port=${OBJECT_MANAGER_PORT} \
+          --runtime-env-agent-port=${RUNTIME_ENV_AGENT_PORT} \
+          --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \
+          --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
+          --metrics-export-port=${METRICS_EXPORT_PORT} \
+          --block
+EOFINNER
+count=0
+while [[ \$count -lt $num_retries ]]; do
+  bash /tmp/launch-worker.sh
+  count=\$((count+1))
+  echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
+  sleep 5
+done
+touch $RAY_CLUSTER_LOG_DIR/ENDED
+exit 1
+EOF
+)
+  srun $COMMON_SRUN_ARGS --exact \
+       --nodes="$worker_nodes" --ntasks="$worker_nodes" --ntasks-per-node=1 \
+       --cpus-per-task="$CPUS_PER_WORKER" --exclude="$head_node" \
+       --kill-on-bad-exit=1 -o "$RAY_CLUSTER_LOG_DIR/ray-worker-%N.log" \
+       bash "${CEXEC}" --mounts "${_cont_mounts}" --workdir "${WORK_DIR}" -- bash -x -c "$worker_cmd" &
+  SRUN_PIDS["ray-workers"]=$!
+fi
+while true; do
+  worker_units=$(extract_worker_units)
+  echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+  if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+    break
+  fi
+  check_srun_processes
+  sleep 2
+done
+echo "All Ray workers connected!"
+echo "PROLOG_STOP $(date +%s)"
+if [[ "${USER_DROPCACHE:-}" ]]; then
+    DROPCACHE_CMD="${USER_DROPCACHE}"
+fi
+_checkpoint_base="${CHECKPOINT_DIR:-/checkpoint}"
+    echo "EXPERIMENT_START $(date +%s)"
+    export _experiment_index
+    if [[ "${OFFLINE_EVAL}" == 1 && "${NEXP}" -gt 1 ]]; then
+        export CHECKPOINT_DIR="${_checkpoint_base%/}/${_experiment_index}"
+    fi
+    (
+        echo "Beginning trial ${_experiment_index} of ${NEXP}"
+
+        # Save environment vars
+        export -p > "${_archive_logdir}/${SLURM_JOB_ID}_${_experiment_index}.env"
+
+        echo ":::DLPAL ${CONT} ${SLURM_JOB_ID} ${SLURM_JOB_NUM_NODES} ${SLURM_JOB_NODELIST} ${MLPERF_CLUSTER_NAME} ${DGXSYSTEM}"
+        echo ":::SYSJSON $(srun -N1 -n1 --overlap bash "${CEXEC}" -- mlperf-sysjson.sh || echo '{}')"
+        srun -N1 -n1 --overlap bash "${CEXEC}" -- bash -c 'echo ":::GITCOMMITID ${GIT_COMMIT_ID} ${LAUNCHER_GIT_COMMIT_ID:-}"'
+
+        # Clear caches (host-side, needs sudo). --overlap is required on every srun while the
+        # Ray job steps are alive (they hold the allocation's CPUs) or it deadlocks.
+        if [ "${CLEAR_CACHES}" -eq 1 ]; then
+            srun --overlap --exact --nodes="${SLURM_JOB_NUM_NODES}" \
+                 --ntasks="${SLURM_JOB_NUM_NODES}" --ntasks-per-node=1 \
+                 --cpus-per-task=1 --kill-on-bad-exit=1 bash -euc '
+                 host=$(hostname)
+                 echo "$host sync_start"
+                 sync
+                 echo "$host sync_done"
+                 cache_before=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 '"${DROPCACHE_CMD}"'
+                 cache_after=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 echo "$host cache_cleared ${cache_before}kB to ${cache_after}kB"
+            '
+            srun -N1 -n1 --overlap bash "${CEXEC}" --mounts "${_cont_mounts}" --workdir "${BENCHMARK_DIR}" -- \
+                python -c "
+from callback_logging import mllogger
+mllogger.event(key=mllogger.constants.CACHE_CLEAR, value=True)"
+        fi
+        if [[ "${OFFLINE_EVAL}" == "1" ]]; then
+            _slurm_job_info="$(SLURM_TIME_FORMAT=standard scontrol show job "${SLURM_JOB_ID}")" || {
+                _slurm_query_status=$?
+                echo "ERROR: scontrol could not read Slurm job ${SLURM_JOB_ID}" >&2
+                exit "${_slurm_query_status}"
+            }
+            validate_deferred_launch "${_slurm_job_info}"
+        fi
+        # Run the driver ONCE on the Ray head node
+        set +e
+        echo "RUNANDTIME_START $(date +%s)"
+        srun -N1 -n1 --overlap --time="${WALLTIME_RUNANDTIME}" -w "$head_node" \
+             bash "${CEXEC}" --mounts "${_cont_mounts}" --workdir "${WORK_DIR}" -- \
+             bash -c '[[ -z "${CONTAINER_LD_LIBRARY_PATH_PREPEND:-}" ]] || export LD_LIBRARY_PATH="${CONTAINER_LD_LIBRARY_PATH_PREPEND}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"; exec bash "$@"' _ "${RUN_AND_TIME_SCRIPT}"
+        RUN_AND_TIME_EXIT_STATUS=$?
+        echo "RUNANDTIME_STOP $(date +%s)"
+        if [[ "${OFFLINE_EVAL}" == "1" && "${RUN_AND_TIME_EXIT_STATUS}" -eq 0 ]]; then
+            export RAY_ADDRESS="${ip_head}"
+            echo "DEFERRED_EVAL_START $(date +%s)"
+            srun -N1 -n1 --overlap --time="${WALLTIME_OFFLINE_EVAL}" -w "$head_node" \
+                 bash "${CEXEC}" --mounts "${_cont_mounts}" --workdir "${WORK_DIR}" -- \
+                 bash -c '[[ -z "${CONTAINER_LD_LIBRARY_PATH_PREPEND:-}" ]] || export LD_LIBRARY_PATH="${CONTAINER_LD_LIBRARY_PATH_PREPEND}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"; exec bash "$@"' _ "${RUN_AND_TIME_SCRIPT}" --deferred-eval
+            RUN_AND_TIME_EXIT_STATUS=$?
+            echo "DEFERRED_EVAL_STOP status=${RUN_AND_TIME_EXIT_STATUS} $(date +%s)"
+        fi
+        echo "${RUN_AND_TIME_EXIT_STATUS}" > "${LOGDIR}/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt"
+        set -e
+    ) |& tee "${LOG_FILE_BASE}_${_experiment_index}.log"
+    RUN_AND_TIME_EXIT_STATUS=$(cat "${LOGDIR}/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt" 2>/dev/null || echo "255")
+    if [[ "${CHECK_COMPLIANCE}" -eq 1 ]]; then
+      _compliance_report="/results/compliance_${DATESTAMP}.out"
+      if [[ "${OFFLINE_EVAL}" == 1 && "${NEXP}" -gt 1 ]]; then
+        _compliance_report="/results/compliance_${DATESTAMP}_${_experiment_index}.out"
+      fi
+      srun -N1 -n1 --overlap bash "${CEXEC}" --mounts "${_archive_logdir}:/results" --workdir "/results" -- \
+           python3 -m mlperf_logging.compliance_checker --usage training \
+           --ruleset "${MLPERF_RULESET}" \
+           --log_output "${_compliance_report}" \
+           "/results/${LOGBASE}_${_experiment_index}.log" \
+      || true
+      EXTRA_ASSETS="${EXTRA_ASSETS} --asset ${_compliance_report}"
+    fi
+    echo "EXPERIMENT_STOP $(date +%s)"
+    if [[ "${RUN_AND_TIME_EXIT_STATUS}" -ne 0 ]]; then
+        exit "${RUN_AND_TIME_EXIT_STATUS}"
+    fi
+# Teardown fails only when a drain cannot confirm that the Ray and application
+# steps are gone; that must prevent the next EXP, unlike best-effort EXIT cleanup
+# after an already failed workload. Cleanup phases warn instead of failing.
+# Do not hide it behind tee or FORCE_SUCCESS.
+_teardown_status=0
+_run_grpo_teardown || _teardown_status=$?
+trap - EXIT
+exit "${_teardown_status}"
+)
+if [[ ! "${NEXP}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NEXP must be a positive integer without leading zeroes" >&2
+    exit 1
+fi
+export SEED
+for _experiment_index in $(seq -w 1 "${NEXP}"); do
+    export _experiment_index
+    run_grpo_experiment
+    SEED=$RANDOM     # choose a new seed for the next experiment
+done

@@ -1,0 +1,43 @@
+--- a/tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py
++++ b/tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py
+@@ -313,7 +313,7 @@
+                     continue
+                 pidx = ptxt.index(">")
+                 pname = ptxt[:pidx].strip()
+-                pval = ptxt[pidx + 1 :].lstrip("\n").rstrip("\n")
++                pval = ptxt[pidx + 1 :]
+                 # Convert parameter value to the correct type.
+                 param_config = self._get_arguments_config(fname, tools)
+                 params[pname] = self._convert_param_value(pval, pname, param_config, fname)
+@@ -360,9 +360,8 @@
+     ) -> Any:
+         """Convert parameter value based on its type in the schema."""
+         # Copy and modify from `vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py`.
+-        param_value = html.unescape(param_value.strip())
+-        if param_value.lower() == "null":
+-            return None
++        param_value = param_value.replace("\r\n", "\n").replace("\r", "\n")
++        param_value = param_value.removeprefix("\n").removesuffix("\n")
+
+         if param_name not in param_config:
+             if param_config != {}:
+@@ -370,7 +369,7 @@
+                     f"Parsed parameter '{param_name}' is not defined in the tool "
+                     f"parameters for tool '{func_name}', directly returning the string value."
+                 )
+-            return param_value
++            return "" if param_value.lower() == "null" else param_value
+
+         if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
+             param_type = str(param_config[param_name]["type"]).strip().lower()
+@@ -381,7 +380,9 @@
+             param_type = "string"
+
+         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+-            return param_value
++            return "" if param_value.lower() == "null" else param_value
++        elif param_value.lower() == "null":
++            return None
+         elif (
+             param_type.startswith("int")
+             or param_type.startswith("uint")

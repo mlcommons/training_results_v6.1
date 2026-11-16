@@ -1,0 +1,158 @@
+--- a/ak_l8b_fp4g_patch.py (validated 92666d1133668b79)
++++ b/ak_l8b_fp4g_patch.py (L4 v3)
+@@ -36,22 +36,45 @@
+ row-wise data, row-wise scales, column-wise data, column-wise scales and both amaxes, every byte; the norms against the
+ re-gathered values.  Rank 0 prints the result, a mismatch on any rank raises.
+ 
+-Armed by AK_FP4G=1 in the training entry point; AK_FP4G_EXT_DIR holds ak_l8b_fp4g.so; AK_FP4G_CBPC (16) is shard_quant2's
+-256-column blocks per CTA.  Loaded by zz-ak-l8b-fp4g.pth; it wraps _ParamAndGradBucketGroup.start_param_sync when
++Armed by AK_FP4G=1 alone; AK_FP4G_EXT_DIR holds ak_l8b_fp4g.so; AK_FP4G_CBPC (16) is shard_quant2's
++256-column blocks per CTA.  Loaded by `import firmus_ak`; it wraps _ParamAndGradBucketGroup.start_param_sync when
+ megatron.core.distributed.param_and_grad_buffer is imported (x9step3 then wraps this wrapper).  Needs NVFP4P 13g.
++
++L4 v3, AK_FP4G_NOOVERLAP=1 (needs AK_FP4G=1): no parameter gather of the forward overlaps compute.  A pure group's
++gather is finished right after its dispatch -- the handle's wait (the side stream's all-gather wait, post_ag3, the norm
++unpack, the current stream's join) runs at once, and finish_param_sync gets a handle with nothing left to wait for (it
++still dispatches the next group) -- and bucket group 0's stock bf16 all-gather (the one group with no next gather) is
++waited for on the current stream right after its dispatch.  The same kernels on the same buffers in the same order; only
++the waits move, so the arithmetic is unchanged.  Probes E6 / E8 (2026-10-13): in L4 v2's layout one rank's fc1 GEMM of
++an FP4G group-first consumer layer occasionally returned a different output from identical inputs while the next group's
++gather ran beside it; with the gathers finished at dispatch that forward-side departure did not occur.
+ """
+ import os
+ import sys
+ 
+-_ARMED = os.environ.get("AK_FP4G", "0") == "1" and "pretrain" in os.path.basename(sys.argv[0] if sys.argv else "")
++_ARMED = os.environ.get("AK_FP4G", "0") == "1"
++# L4 (C5, fail early): the setup runs only inside NVFP4P's weight-amax update; without it an armed FP4G would
++# silently never gather in FP4
++if _ARMED and not (os.environ.get("AK_NVFP4P", "0") == "1" and os.environ.get("AK_NVFP4P_WAMAX", "0") == "1"
++                   and os.environ.get("AK_NVFP4P_WEIGHTS", "0") == "amax"):
++    raise RuntimeError("[auto_kernel fp4g] AK_FP4G=1 needs NVFP4P's weight-amax update (AK_NVFP4P=1, "
++                       "AK_NVFP4P_WAMAX=1, AK_NVFP4P_WEIGHTS=amax), which runs its setup")
+ _CHECK = os.environ.get("AK_FP4G_CHECK", "first")
+ _POISON = os.environ.get("AK_FP4G_POISON", "0") == "1"
+ _CBPC = int(os.environ.get("AK_FP4G_CBPC", "16"))
++# L4 v3 (C5, fail early): the no-overlap mode lives in this module's start_param_sync wrapper
++_NOOVERLAP_SW = os.environ.get("AK_FP4G_NOOVERLAP", "0")
++if _NOOVERLAP_SW not in ("0", "1"):
++    raise RuntimeError("[auto_kernel fp4g] AK_FP4G_NOOVERLAP=%r: must be 0 or 1" % _NOOVERLAP_SW)
++_NOOVERLAP = _NOOVERLAP_SW == "1"
++if _NOOVERLAP and not _ARMED:
++    raise RuntimeError("[auto_kernel fp4g] AK_FP4G_NOOVERLAP=1 needs AK_FP4G=1 (the no-overlap mode is FP4G's "
++                       "start_param_sync wrapper)")
+ _SUFFIXES = (".self_attention.linear_qkv.weight", ".self_attention.linear_proj.weight", ".mlp.linear_fc1.weight",
+              ".mlp.linear_fc2.weight")
+ _STATE = {"active": False, "setup_done": False, "ext": None, "groups": [], "by_ptr": {}, "fp4_ids": set(),
+           "k1": None, "n_params": 0, "slot_floats": 0, "checks": 0, "noop_calls": 0, "wrap_calls": 0, "gathers": 0,
+-          "side": None, "summary": None}
++          "side": None, "summary": None, "patched": False, "nooverlap_fp4g": 0, "nooverlap_g0": 0}
+ 
+ 
+ def _rank():
+@@ -67,7 +90,7 @@
+ def _ext():
+     if _STATE["ext"] is None:
+         import torch  # noqa: F401  (the extension links libtorch)
+-        d = os.environ.get("AK_FP4G_EXT_DIR", "[campaign directory]/auto_kernel_overlays/l8b/fp4g/ext")
++        d = os.environ.get("AK_FP4G_EXT_DIR", "/opt/firmus/ak/lib")
+         if d not in sys.path:
+             sys.path.insert(0, d)
+         import ak_l8b_fp4g
+@@ -178,11 +201,28 @@
+     return _Handle(G, cm)
+ 
+ 
++class _NoopHandle:
++    """AK_FP4G_NOOVERLAP: the handle finish_param_sync gets for a gather already finished at its dispatch"""
++
++    def wait(self):
++        return None
++
++
++_NOOP_HANDLE = _NoopHandle()
++
++
+ def _wrap_start_param_sync(orig):
+     def start_param_sync(self, force_sync: bool = False):
+         G = getattr(self, "_ak_fp4g", None)
+         if G is None or not _STATE["active"]:
+-            return orig(self, force_sync=force_sync)
++            r = orig(self, force_sync=force_sync)
++            if (_NOOVERLAP and not force_sync and G is None and self.next_param_gather_bucket_group is None
++                    and self.param_gather_handle is not None):
++                # bucket group 0's stock gather: the current stream waits for it right after its dispatch
++                self.param_gather_handle.wait()
++                self.param_gather_handle = None
++                _STATE["nooverlap_g0"] += 1
++            return r
+         if force_sync:
+             if self.param_gather_handle is not None:
+                 self.param_gather_handle.wait()
+@@ -191,6 +231,10 @@
+         else:
+             assert self.param_gather_handle is None
+         h = _dispatch(G)
++        if _NOOVERLAP:
++            h.wait()  # the gather, post_ag3, the norm unpack and the join, before any later compute
++            h = _NOOP_HANDLE
++            _STATE["nooverlap_fp4g"] += 1
+         if force_sync or not self.ddp_config.overlap_param_gather:
+             h.wait()
+             self.param_gather_handle = None
+@@ -269,8 +313,7 @@
+     _STATE["setup_done"] = True
+     chunks = list(getattr(opt, "model_chunks", []))
+     if len(chunks) != 1:
+-        _say("NOT armed: %d model chunks" % len(chunks))
+-        return
++        raise RuntimeError("[auto_kernel fp4g] NOT armed: %d model chunks" % len(chunks))
+     ddp = chunks[0]
+     named = list(ddp.named_parameters())
+     fp4 = {id(p): (n, p) for n, p in named if p.dim() == 2 and p.dtype == torch.bfloat16 and n.endswith(_SUFFIXES)}
+@@ -451,6 +494,9 @@
+         _STATE["k1"] = (torch.tensor(k1_rows, dtype=torch.int64, device=dev),
+                         torch.tensor(k1_begin, dtype=torch.int32, device=dev), n1)
+     _STATE["side"] = torch.cuda.Stream(device=dev)
++    if not groups:
++        raise RuntimeError("[auto_kernel fp4g] NOT armed: no bucket group holds only NVFP4 weights and norms (%s)"
++                           % {k: v for k, v in sorted(reasons.items())})
+     _STATE["active"] = bool(groups)
+     # poison: the stale part of every pure bucket's bf16 buffer (the other ranks' shards) set to NaN
+     if _POISON and groups:
+@@ -474,6 +520,18 @@
+              "buckets per group %s" % sorted({len(G["buckets"]) for G in groups}), img_bytes / 1e9, ts_bytes / 1e6,
+              norm_bytes / 1e3, len(slots), n_slot, os.path.basename(so), _sha(so),
+              {k: v for k, v in sorted(reasons.items())}, _POISON, _STATE.get("poisoned", 0), _CHECK))
++    if _NOOVERLAP:
++        # L4 v3 (C5): the wrapper must be on the class, and the stock group it waits for must exist
++        last = [gi for gi, bg in enumerate(ddp.bucket_groups)
++                if bg.next_param_gather_bucket_group is None and getattr(bg, "_ak_fp4g", None) is None]
++        ovl = bool(ddp.ddp_config.overlap_param_gather)
++        if not _STATE["patched"] or (ovl and len(last) != 1):
++            raise RuntimeError("[auto_kernel fp4g] AK_FP4G_NOOVERLAP=1 cannot install: start_param_sync wrapped %s, "
++                               "stock bucket groups with no next gather %s" % (_STATE["patched"], last))
++        _say("no-overlap parameter gather ARMED (AK_FP4G_NOOVERLAP=1): each of the %d FP4G groups' gathers is finished "
++             "at its dispatch (all-gather wait, post_ag3, norm unpack, join) and bucket group %s's stock all-gather is "
++             "waited for at its dispatch; overlap_param_gather %s; the same kernels, buffers and order, only the waits "
++             "move" % (len(groups), last[0] if last else None, ovl))
+ 
+ 
+ def before_allreduce():
+@@ -563,12 +621,16 @@
+     _TARGET = "megatron.core.distributed.param_and_grad_buffer"
+ 
+     def _patch(mod):
++        if _NOOVERLAP and not hasattr(mod, "_ParamAndGradBucketGroup"):
++            raise RuntimeError("[auto_kernel fp4g] AK_FP4G_NOOVERLAP=1 cannot install: %s has no "
++                               "_ParamAndGradBucketGroup" % _TARGET)
+         cls = mod._ParamAndGradBucketGroup
+         if getattr(cls.start_param_sync, "_ak_fp4g", False):
+             return
+         w = _wrap_start_param_sync(cls.start_param_sync)
+         w._ak_fp4g = True
+         cls.start_param_sync = w
++        _STATE["patched"] = True
+ 
+     class _Finder(importlib.abc.MetaPathFinder):
+         def find_spec(self, fullname, path, target=None):

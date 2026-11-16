@@ -1,0 +1,127 @@
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -652,6 +652,24 @@
+         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
+         synchronous call.
+         """
++        # --- auto_kernel X7-dense proof (Llama 3.1 8B campaign, 2026-10-02) ---------------------------------------------
++        if not getattr(self, "_ak_x7_checked", False) and not torch.cuda.is_current_stream_capturing():
++            sent = []
++            for bkt in self.buckets:
++                for p in bkt.params:
++                    if getattr(p, "_ak_x7_store", False):
++                        sent.append(p.main_grad)
++            if sent:
++                self._ak_x7_checked = True
++                left = sum(int((g.view(torch.int16) == 0x7FBD).sum()) for g in sent)
++                elems = sum(int(g.numel()) for g in sent)
++                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++                    print("[auto_kernel x7] stored weight gradients fully written at the first sync of a bucket group: "
++                          "%d params, %d elements, %d sentinel elements left: %s" % (len(sent), elems, left, left == 0),
++                          flush=True)
++                if left:
++                    raise RuntimeError("[auto_kernel x7] %d stored-gradient elements were never written" % left)
++        # -------------------------------------------------------------------------------------------------------------
+         if self.is_first_batch and self.grad_reduce_handle is not None:
+             # Make this start_grad_sync call a no-op if in first batch and collective has
+             # already been dispatched.
+@@ -690,6 +708,17 @@
+                     current_stream.wait_event(event)
+                     waited_event_ids.add(id(event))
+ 
++        # --- auto_kernel X8 overlay (2026-09-19): the autograd gradients this bucket group's
++        # DDP hook deferred are added into main_grad here, as ONE torch._foreach_add_ per
++        # group instead of one launch per parameter (1,802 x 6.2 us = 11.1 ms/step measured,
++        # EXPERIMENT_LOG block 10 sec 3).  Same elementwise add, same dtype, same single
++        # contribution -- the result is byte-identical to the per-parameter add_.  Must run
++        # before the collective reads the buffer, which is why it lives here.
++        # (sec 168: in 0929 after the new predecessor drain and the local-graph wgrad-event
++        # wait, still before the extra-main-grad copy, the grad check, the scaling and the RS.)
++        self._ak_flush_pending_adds()
++        # ---------------------------------------------------------------------------------
++
+         # Copy accumulated .main_grad into communication buffer before collective if
+         # .main_grad is not in .grad_data already (e.g., because we want to do local
+         # gradient accumulation in a higher precision).
+@@ -906,6 +935,31 @@
+                 if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                     param.main_grad.copy_(param.main_grad_copy_in_grad_buffer)
+ 
++    def _ak_flush_pending_adds(self):
++        """auto_kernel X8: apply the deferred `main_grad += grad` of this bucket group."""
++        pending = getattr(self, "_ak_pending_adds", None)
++        if not pending:
++            return
++        # torch._foreach_add_ groups by (device, dtype); every pair here is a bf16 main_grad
++        # view and its bf16 autograd grad, so the fast path is one fused launch per dtype group.
++        # Under X7 (buffer not zeroed) a single contribution is COPIED instead -- per param:
++        # a zero_out_wgrad weight (two contributions per step, its main_grad still zeroed)
++        # is always ADDED, whatever the group's mode.
++        to_copy = [(m, g) for m, g, p in pending if getattr(p, "_ak_x7_store", False)]
++        to_add = [(m, g) for m, g, p in pending if not getattr(p, "_ak_x7_store", False)]
++        if to_copy:
++            torch._foreach_copy_([m for m, g in to_copy], [g for m, g in to_copy])
++        if to_add:
++            torch._foreach_add_([m for m, g in to_add], [g for m, g in to_add])
++        mains = [m for m, g, p in pending]
++        for m, g, p in pending:
++            p.grad = None
++        self._ak_pending_adds = []
++        self._ak_flushes = getattr(self, "_ak_flushes", 0) + 1
++        if self._ak_flushes <= 2 and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++            print("[auto_kernel x8] bucket group flushed %d deferred grad adds in one _foreach_add_ (%d params in group)"
++                  % (len(mains), len(self.params)), flush=True)
++
+     def register_grad_ready(
+         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
+     ):
+@@ -1664,6 +1718,49 @@
+         """
+         Zero out the underlying grad_buffer.
+         """
++        # --- auto_kernel X7 overlay (2026-09-19) ------------------------------------------
++        # With one microbatch per optimizer step every gradient contribution is written
++        # exactly once, so the buffer does not need to start at zero: the TE-fused weight
++        # gradients are STORED (overwrite_main_grad=True -> accumulate_on_output=False, a TMA
++        # store instead of a TMA reduce-add; the wgrad kernel writes zeros for an empty
++        # expert, moe_blockscaled_grouped_gemm_wgrad.py "k_tile_cnt == 0 handling") and the
++        # autograd gradients are COPIED into main_grad by the DDP hook instead of added.
++        # `0 + x` is `x` in every case except -0.0 (which becomes +0.0 when added to +0),
++        # so the values are identical and only the sign bit of exact zeros can differ.
++        # AK_X7_SKIP_GRAD_ZERO=1 arms it; the padding between parameters is never read.
++        # (sec 168: ported to the 20260929 image; 0929's reset() is the 0828 body, and
++        # cuDNN FE 1.28 moved the wgrad kernel to gemm/cutedsl/grouped/wgrad/ with the
++        # epilogue and the MoE scheduler unchanged.)
++        import os as _os
++        if _os.environ.get("AK_X7_SKIP_GRAD_ZERO", "0") == "1":
++            if not getattr(self, "_ak_x7_announced", False):
++                self._ak_x7_announced = True
++                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++                    print("[auto_kernel x7] grad-buffer zeroing SKIPPED: %d elements of %s, %d extra main grads still zeroed"
++                          % (self.grad_data.numel(), self.grad_data.dtype, len(self.extra_main_grads)), flush=True)
++            for grad in self.extra_main_grads:
++                grad.zero_()
++            # X7'' (2026-09-20): every parameter that is NOT an expert weight (the only
++            # path proved store == reduce-add-into-zeros) is zeroed each step, as
++            # shipped, in one _foreach_zero_ over its main_grad views; the expert
++            # weights (93 % of the buffer) are not.
++            if not hasattr(self, "_ak_x7_zeroed_grads"):
++                keep = [p for p in self.params if getattr(p, "_ak_x7_store", False)]
++                zero = [p for p in self.params if not getattr(p, "_ak_x7_store", False)]
++                self._ak_x7_zeroed_grads = [p.main_grad for p in zero]
++                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
++                    print("[auto_kernel x7] store path for %d weights (%d elements); main_grad zeroed each step for %d other params (%d elements)"
++                          % (len(keep), sum(int(p.numel()) for p in keep), len(zero), sum(int(p.numel()) for p in zero)), flush=True)
++                # Llama X7-dense proof (2026-10-02): on this first reset the STORED weights' main_grad is filled with a
++                # NaN bit pattern no GEMM writes (0x7FBD); the first grad sync of each bucket group counts what is left
++                # of it (start_grad_sync) -- every element must have been written by the step's wgrad.
++                self._ak_x7_sentinel = [p.main_grad for p in keep]
++                for g in self._ak_x7_sentinel:
++                    g.view(torch.int16).fill_(0x7FBD)
++            if self._ak_x7_zeroed_grads:
++                torch._foreach_zero_(self._ak_x7_zeroed_grads)
++            return
++        # -----------------------------------------------------------------------------------
+         self.grad_data.zero_()
+         for grad in self.extra_main_grads:
+             grad.zero_()

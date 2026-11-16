@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#SBATCH --exclusive
+#SBATCH --mem=0
+set -eo pipefail
+srun --ntasks-per-node=1 --cpu-bind=none bash -c '
+set -e
+test -c /dev/fuse
+test -r /dev/fuse && test -w /dev/fuse
+test -r "$CONT"
+test -r "$HF_CKPT_PATH/config.json"
+test -r "$NEMO_GYM_SWE_TRAIN_DATA_PATH"
+test -r "$NEMO_GYM_SWE_VALIDATION_DATA_PATH"
+test -r "$NEMO_GYM_SWE_SIF_DIR" && test -x "$NEMO_GYM_SWE_SIF_DIR"
+test -r "$NRL_MEGATRON_CHECKPOINT_DIR"
+test -w "$LOGDIR"
+printf "QWEN_PREFLIGHT_OK %s\n" "$(hostname)"
+'
+exec bash "${RUNSUB_DIR}/run.sub"

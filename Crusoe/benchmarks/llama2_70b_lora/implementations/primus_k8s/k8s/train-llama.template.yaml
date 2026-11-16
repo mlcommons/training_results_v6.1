@@ -1,0 +1,112 @@
+# MLPerf v6.1 Llama run (llama31_8b or llama2_70b_lora) on N MI355X nodes. Render with
+# run-llama-mlperf.sh, not by hand. Template vars:
+#   __J__ job/DNS name   __N__ nodes   __BENCH__ llama31_8b|llama2_70b_lora   __GBS__ global batch
+#   __MBS__ micro batch  __CP__/__TP__ context/tensor parallel (LoRA)  __SEED__      __RUN__ log subdir   __IMAGE__   __PULL_SECRET__
+#   __SELKEY__/__SELVAL__ node selector (pin a node set; default all MI355X)
+#   __DATA_SUBPATH__ dataset dir on the shared volume (relative to its root)
+# The per-benchmark recipe (LR / warmup / eval cadence per RCP batch size) lives in
+# launch-llama.sh (ConfigMap llama-v61-launch); AMD's in-image config_MI355X_1x8x1.sh is the base.
+---
+apiVersion: v1
+kind: Service
+metadata: { name: __J__, labels: { app: llama-v61 } }
+spec: { clusterIP: None, publishNotReadyAddresses: true, selector: { job-name: __J__ }, ports: [{ port: 29502, name: c10d }, { port: 29600, name: ready }] }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: __J__, labels: { app: llama-v61, bench: __BENCH__ } }
+spec:
+  completionMode: Indexed
+  completions: __N__
+  parallelism: __N__
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app: llama-v61, bench: __BENCH__ }
+      annotations:
+        k8s.v1.cni.cncf.io/networks: >-
+          kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad,kube-amd-network/amd-host-device-nad
+    spec:
+      restartPolicy: Never
+      subdomain: __J__
+      hostIPC: true
+      enableServiceLinks: false        # stray Services' env vars confuse launcher autodetection
+      imagePullSecrets: [{ name: __PULL_SECRET__ }]   # line removed by the runner when PULL_SECRET is unset
+      nodeSelector: { amd.com/gpu.product-name: AMD_Instinct_MI355_OAM, __SELKEY__: "__SELVAL__" }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { job-name: __J__ } }
+              topologyKey: kubernetes.io/hostname
+      # MLPerf training rules ("Data State at Start of Run"): flush the cache or restart the
+      # system before benchmarking. Drop the host page cache (incl. NFS client cache) on every
+      # node right before the run and leave evidence; the launcher only logs cache_clear when
+      # this evidence exists.
+      initContainers:
+        - name: cache-flush
+          image: mirror.gcr.io/library/busybox:1.36
+          securityContext: { privileged: true }
+          env:
+            - name: IDX
+              valueFrom: { fieldRef: { fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']" } }
+            - name: NODE
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              d=/joblogs/__RUN__; mkdir -p "$d"
+              b=$(grep -E '^Cached:' /proc/meminfo | tr -s ' ')
+              sync; echo 3 > /proc/sys/vm/drop_caches
+              a=$(grep -E '^Cached:' /proc/meminfo | tr -s ' ')
+              echo "$(date -u +%FT%TZ) node=${NODE%%.*} drop_caches=3 before=[$b] after=[$a]" > "$d/cacheflush-node${IDX}.txt"
+              cat "$d/cacheflush-node${IDX}.txt"
+          volumeMounts:
+            - { name: shared, mountPath: /joblogs, subPath: llama-v61/logs }
+      containers:
+        - name: train
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext: { capabilities: { add: ["IPC_LOCK", "SYS_PTRACE"] } }
+          envFrom: [{ configMapRef: { name: rccl-roce-env } }]
+          env:
+            - { name: BENCH, value: "__BENCH__" }
+            - { name: NN, value: "__N__" }
+            - { name: GBS, value: "__GBS__" }
+            - { name: MBS, value: "__MBS__" }
+            - { name: CP, value: "__CP__" }
+            - { name: TP, value: "__TP__" }
+            - { name: LR_OVERRIDE, value: "__LR__" }
+            - { name: MANUAL_GC, value: "__MGC__" }
+            - { name: SEED, value: "__SEED__" }
+            - { name: RUN_NAME, value: "__RUN__" }
+            - { name: JOB, value: "__J__" }
+            # LoRA's trainer re-reads the gated Llama-2-70b-hf config/tokenizer at startup;
+            # the prep job already cached them under HF_HOME, the token covers any revalidation.
+            - { name: HF_HOME, value: /hf_cache }
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: __HF_SECRET__, key: token, optional: true } }
+            - name: IDX
+              valueFrom: { fieldRef: { fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']" } }
+          command: ["/bin/bash", "/launch/launch-llama.sh"]
+          resources:
+            requests: { amd.com/gpu: 8, amd.com/vnic: 8, cpu: 64, memory: 512Gi }
+            limits:   { amd.com/gpu: 8, amd.com/vnic: 8, cpu: 200, memory: 2Ti }
+          volumeMounts:
+            - { name: shared, mountPath: /data,    subPath: __DATA_SUBPATH__/data }
+            - { name: shared, mountPath: /model,   subPath: __DATA_SUBPATH__/model }
+            - { name: shared, mountPath: /ckpt,    subPath: __DATA_SUBPATH__/data }
+            - { name: shared, mountPath: /joblogs, subPath: llama-v61/logs }
+            - { name: shared, mountPath: /hf_cache, subPath: cache/hf }
+            - { name: launch, mountPath: /launch }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: rccl-topo, mountPath: /etc/crusoe/rccl_topo/mi355x-288gb-ib.xml, readOnly: true }
+      volumes:
+        - name: shared
+          persistentVolumeClaim: { claimName: mlperf-training-shared }
+        - name: launch
+          configMap: { name: llama-v61-launch }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 256Gi }
+        - name: rccl-topo
+          hostPath: { path: /etc/crusoe/rccl_topo/mi355x-288gb-ib.xml, type: File }

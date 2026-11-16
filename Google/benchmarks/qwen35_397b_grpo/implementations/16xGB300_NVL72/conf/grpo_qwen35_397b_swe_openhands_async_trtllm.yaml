@@ -1,0 +1,79 @@
+# TRT-LLM variant of the shared async recipe. Engine shape comes from the
+# TRTLLM_* exports in config_*.sh (oc.env); everything else is inherited.
+
+defaults: /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/conf/grpo_qwen35_397b_swe_openhands_async.yaml
+
+env:
+  nemo_gym:
+    global_aiohttp_connector_limit_per_host: 16384
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_prompt_overrides:
+          - user_prompt_template: /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/prompts/openhands/user_prompt.j2
+            system_prompt_template: /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/prompts/openhands/system_prompt.j2
+            agent_cls: CodeActAgent
+            diversify_tool_names: false
+          concurrency: ${div:${oc.decode:${oc.env:GYM_TRAIN_CONCURRENCY,${policy.train_global_batch_size}}},${env.nemo_gym.shards.0.replicas}}
+
+cluster:
+  num_nodes: 32
+  segment_size: ${oc.decode:${oc.env:NEMORL_TRAIN_SEGMENT_SIZE,4}}
+
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: ${oc.decode:${oc.env:EP,8}}
+    checkpoint:
+      async_save: false
+  generation:
+    backend: trtllm
+    refit_transport: nccl_reshard
+    stop_token_ids: [248046, 248044]
+    trtllm_cfg:
+      tensor_parallel_size: ${oc.decode:${oc.env:TRTLLM_TP,8}}
+      # MXFP8 routed experts by default. TRTLLM_GEN_PRECISION=bfloat16 with
+      # TRTLLM_GEN_IS_MX=false runs BF16 experts instead.
+      precision: ${oc.env:TRTLLM_GEN_PRECISION,fp8}
+      is_mx: ${oc.decode:${oc.env:TRTLLM_GEN_IS_MX,true}}  # FP8 recipe; ignored unless precision is fp8
+      max_model_len: 65536
+      # Each slot reserves recurrent state up front; size it to the admitted conversations.
+      max_batch_size: ${oc.decode:${oc.env:TRTLLM_MAX_BATCH,256}}
+      max_num_tokens: 16384
+      gpu_memory_utilization: ${oc.decode:${oc.env:TRTLLM_GPU_UTIL,0.8}}
+      fp8: false  # FP8 recipe; keeps KV cache in BF16
+      moe_expert_parallel_size: ${oc.decode:${oc.env:TRTLLM_MEP,8}}
+      async_engine: true
+      expose_http_server: true
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
+      tool_parser: qwen3_coder
+      # With enable_thinking=false, only explicit <think> blocks count as reasoning.
+      reasoning_parser: deepseek-r1
+      default_chat_template_kwargs:
+        enable_thinking: false
+        truncate_history_thinking: false
+    trtllm_kwargs:
+      attn_backend: TRTLLM
+      moe_config:
+        # CuTe DSL MXFP8 MoE kernel; TRTLLM_MOE_BACKEND=CUTLASS selects the CUTLASS one.
+        backend: ${oc.env:TRTLLM_MOE_BACKEND,CUTEDSL}
+      # Piecewise CUDA graphs for prefill and mixed batches up to max_num_tokens;
+      # TRTLLM_TORCH_COMPILE_CONFIG=null turns them and torch.compile off.
+      torch_compile_config: "${oc.decode:${oc.env:TRTLLM_TORCH_COMPILE_CONFIG,'{enable_piecewise_cuda_graph: true, capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4352, 5376, 6400, 7424, 8448, 10496, 12544, 14592, 16384]}'}}"
+      enable_chunked_prefill: true
+      kv_cache_config:
+        # Explicit bfloat16: the FlashInfer GDN decode kernel runs in bf16.
+        mamba_ssm_cache_dtype: bfloat16
+        # V1 KV cache manager; V2 fails in the refit warmup.
+        use_kv_cache_manager_v2: false
+        # Must be set explicitly: this model's TRT-LLM defaults turn reuse off
+        # and only explicitly set fields override them. Refit resets the cache.
+        enable_block_reuse: true
+        # Also the prefill chunk size with reuse on; larger values starve decode.
+        mamba_state_cache_interval: 4096
+        # Save-last snapshots kept per conversation (MAMBA_MAX_OFFGRID); 0 keeps all.
+        mamba_max_off_grid_snapshots_per_chain: ${oc.decode:${oc.env:MAMBA_MAX_OFFGRID,2}}
+      disable_mm_encoder: true
+      # Emit intermediate responses every N decode iterations; RL requests do not stream.
+      stream_interval: ${oc.decode:${oc.env:TRTLLM_STREAM_INTERVAL,100}}

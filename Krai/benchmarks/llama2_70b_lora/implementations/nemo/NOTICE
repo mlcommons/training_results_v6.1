@@ -1,0 +1,91 @@
+Krai Ltd implementation of the MLPerf Training llama2_70b_lora benchmark (AMD Instinct MI300X), version v6
+Copyright (c) 2026 Krai Ltd. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This implementation is derived from AMD's MLPerf Training v5.1 llama2_70b_lora implementation (MI300X), as
+published in the MLPerf Training v5.1 results and shipped in the container rocm/amd-mlperf:llama2_70b_training_5.1
+at /workspace/code (its README is README_upstream_AMD_v5.1.md). Files carrying "Copyright (c) 2024, NVIDIA
+CORPORATION" headers are licensed by NVIDIA under the Apache License, Version 2.0; their headers are retained. Files
+not listed below are AMD's, unchanged (AMD's own Dockerfile and its configs for other GPUs are not included).
+
+Files modified by Krai Ltd (no notice is added inside src/train.py and src/callbacks/custom_callbacks.py, so that
+line numbers in the MLPerf result logs match this code):
+  config_MI300X_1x8x1.sh (a block appended at the end), src/train.py, src/callbacks/custom_callbacks.py,
+  src/conf/megatron_gpt_peft_tuning_config.yaml
+Files added by Krai Ltd: Dockerfile (builds the image), patches/ (patch modules, their checks and tests, and
+te_algos_fix7.csv, a hipBLASLt algorithm selection read by Transformer Engine via TE_HIPBLASLT_ALGO_LOAD; data, no
+code), te_patches/, README.md, README_kernel_changes.md. patches/hs_*.py, te_algos_fix7.csv, check_swiglu_exact.py
+and test_hs_*.py, lora_dropout_packed.py, eval_trim.py and the
+check_lora_*.py and check_eval_trim*.py checks were written by Krai Ltd.
+
+te_patches/linear.py and te_patches/layernorm_linear.py are Transformer Engine 2.2 (ROCm) files from that container
+(Apache License, Version 2.0), with one line changed each; the Dockerfile copies them over the installed ones.
+
+Third-party code adapted in patches/:
+
+* patches/hs_lora_epilogue.py adapts the MCoreSelfAttentionMixin methods get_query_key_value_tensors and forward of
+  NVIDIA NeMo (nemo/collections/nlp/modules/common/megatron/adapters/mcore_mixins.py),
+  Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved. Licensed under the Apache License, Version 2.0.
+
+* patches/hs_act_store.py follows the structure of SwiGLUFunction in Megatron-LM
+  (megatron/core/fusions/fused_bias_swiglu.py), distributed under the Megatron-LM license:
+
+Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+ * Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+ * Neither the name of NVIDIA CORPORATION nor the names of its
+   contributors may be used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+* patches/hs_resgrad_fold.py and patches/hs_qkvnorm_e4m3.py reproduce (with an added epilogue) the Triton RMSNorm
+  backward and forward kernels of ROCm Transformer Engine (transformer_engine/pytorch/triton_kernels/rmsnorm.py),
+  Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved. AMD's contributions to Transformer Engine
+  are distributed under the MIT License:
+
+MIT License
+
+Copyright (c) 2022-2024 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+* patches/hs_host_sync.py re-implements MainParamsOptimizerWrapper.step of NVIDIA NeMo
+  (nemo/core/optim/optimizer_with_main_params.py), Copyright (c) 2021, NVIDIA CORPORATION. Licensed under the
+  Apache License, Version 2.0.
+
+* patches/eval_trim.py mirrors the cache key that triton.runtime.autotuner.Autotuner.run builds (Triton 3.4,
+  Copyright (c) 2018-2020 Philippe Tillet, (c) 2020-2025 OpenAI; MIT License) so that a new token count reuses a
+  tuned configuration.

@@ -1,0 +1,1965 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pyre-strict
+"""DO8: the C8 attention-backward dO quantization (component A item A11) folded into L11's e5m2-du mode.
+
+Gin item (DO8) (yambda_5b.gin, DLRM_HSTU_FP8_L11_DO8; only "1" arms it, "0" or any other value is off). Producer side
+of R15's A11 contract (ops/flydsl/hstu_do8_registry.py, contract v1.2, 'plus' only); r16 iteration 36, track DO8E5.
+
+WHAT. On an ordinary-layer backward call that item (39) L11 runs in its e5m2-du (B1a, item (38)(a)) mode, and whose
+attention backward will quantize dO on the C8 do_blk path (the attention forward tagged a dO8 site on `out`; R15's
+forward gate), ONE launch of a separate kernel, l11_outproj_lnmd_bwd_do8 (l11_do8.cu, its own .so), replaces L11's E5
+launch. It writes everything L11's E5 launch writes (bf16 d(attn), B1a's e5m2 u block + pad rows, amax / u-colsum /
+dW / dB partials), on sequence-aligned 64-token tiles, and in addition the attention backward's e4m3 dO (dO8 [M, 512])
+and E8M0 group scales (E8 [M, 4] = 127 - e_g), byte-identical to hstu_do_fp8.quantize_do_e4m3_blk(d(attn),
+seq_offsets, N) on every row that quantizer writes. The tiles come from a device work list (l11_do8_wl_build) built
+from the attention call's own seq_offsets tensor (the site's), once per step: both ordinary layers receive the same
+x_offsets object, so the second layer reuses the first layer's list (memo keyed on that object, its _version, numel,
+dtype, device, M and the stream). After the last write to d(attn) the backward publishes (dO8, E8) on the site
+(hstu_do8_registry.publish, bf16_written=True); the C8 attention backward takes them instead of running the quantizer
+on the bf16 d(attn), or -- any failed check -- quantizes as before (same bytes).
+
+WHY A SEPARATE .so (iter-35 review C-I1). L11's loader latches ALL of L11 off unless every instantiation in its .so has
+0 VGPR spill / 0 scratch, and the E5 + emission instantiation crashes clang's greedy RA under L11's iterative-ilp
+scheduler. So DO8 is its own translation unit with its own flags (no -amdgpu-sched-strategy: the default scheduler,
+255 VGPR / 0 spill / 0 scratch in the iter-35 lab), cache (/tmp/dlrm_hstu_fp8_l11_do8/<key>), resource gate, prebuild
+self-check and latch. Any DO8 failure (build, gate, self-check, launch, registry) latches only DO8; L11 keeps running
+its own launches (and the attention backward its quantizer). l11_outproj_lnmd.cu / .py are untouched.
+
+DO8-VD (r16 iteration 41, track do8vd). L11-VD's VALU diet (l11_outproj_lnmd_vd.cu: C1 bf16-domain keep masks, C2
+one Newton step, C3 unsigned-max fallback predicate, C4 packed dW/dB chains, LANEFIX, PIN) is carried into DO8's
+kernel body: l11_do8.cu is the diet source (impl tag "+vd(C1,C2,C3,C4,LANEFIX,PIN)"), l11_do8_novd.cu the pre-diet
+source, byte for byte the DO8 source before the diet. The source follows L11's own selector
+(l11_outproj_lnmd.vd_requested(), DLRM_HSTU_FP8_L11_VD == "1"), so DO8 and L11 always build the same consumer
+variant; each source has its own cache key (the key covers the source bytes). The diet launch rejects a dscale
+outside (0, FLT_MAX], as L11-VD's launches do.
+
+DECIDE BEFORE EMISSION. `emission_site` is evaluated on host metadata only (no sync, no allocation, no launch) right
+before the launch: knob on, prebuilt, not latched, L11 enabled and prebuilt, the call is in the e5m2-du mode (B1a's
+plan), a site on attn, the consumer knob on (registry.take_enabled()), site T == M and (H, D) == (4, 128), seq_offsets
+int32/int64, contiguous, on the device, B <= 8192. Otherwise L11's own E5 launch runs (no emission). The bf16-du mode
+(B1a declined, i.e. its warm-up calls) has no DO8 variant: counted, never printed.
+
+LINES (every rank, "[rank N]", ops.utils.arm_print_all_ranks, once each per process; only with the knob on). All start
+with FAMILY. "armed OK: <FAMILY> prebuild before run_start ...", "armed OK: <FAMILY> ACTIVE mode=e5 plus ..." at the
+first published record, "<FAMILY> NOT armed: <reason> ..." once per unexpected reason, "<FAMILY> DISABLED: ...",
+"<FAMILY> INERT: ...", "<FAMILY> prebuild DEVICE FAULT: ...". Counters ("[l11-do8] counters ...") at events 1, 2, 4,
+8, ... and once at exit.
+
+DO8-ONLY (r16 iteration 42, track do8only; gin item (88) (DO8-ONLY), DLRM_HSTU_FP8_L11_DO8_ONLY == "1", read per call; R15
+contract v2 'only', ops/flydsl/hstu_do8_registry.py). On a call DO8 emits for, after every decline check and the dz8 /
+dO8 / E8 allocations (host only; the placeholder / partials allocations and the launch's checks follow it and are
+covered by cancel), registry.plan(site, attn) decides: "only" -> the EM = 2 launch from a second .so (l11_do8.cu built
+with -DL11DO8_ONLY=1: the same outputs minus the bf16 d(attn) store); autograd receives the launch's untouched d(attn)
+buffer as a placeholder (NaN-filled with DLRM_HSTU_FP8_L11_DO8_ONLY_POISON=1), and publish() hands the record over with
+bf16_written=False, re-raising any registry error (no exact fallback exists without the bf16 d(attn)). "plus" (and the
+knob unset or "0": then the registry is not even asked) -> exactly the DO8 path above. A planned call that fails after
+the plan is cancelled (registry.cancel) and falls back like any failed DO8 call (L11's own E5 launch writes the bf16
+d(attn)); a failed EM = 2 kernel launch (rc > 0) latches only 'only', any other failure latches DO8 as in 'plus'. The
+'only' .so has its own build, cache key, resource gate (EM = 2 instantiation, 0 VGPR spill, 0 scratch, LDS_BYTES) and
+first-use self-check (EM = 2 vs EM = 1 on self_check's synthetic inputs: dO8, E8, dz8 and every partial byte-identical,
+the EM = 2 d(attn) buffer's sentinel bytes untouched), built at prebuild after DO8's own self-check; any failure there
+(or of an EM = 2 kernel launch) latches only 'only' (DO8 keeps its 'plus' launches). The pre-diet source
+(l11_do8_novd.cu, DLRM_HSTU_FP8_L11_VD != "1") has no 'only' build: 'plus' (one INERT line). Lines start with
+FAMILY_ONLY: "armed OK: ... only prebuild before run_start ...", "armed OK: ... only ACTIVE mode=e5 only ..." at the
+first 'only' record, "... only DISABLED: ...", "... only INERT: ...", "... only prebuild DEVICE FAULT: ..."; counters
+"[l11-do8] only counters: planned= only_launched= published= cancelled= fallback= plan_plus= latched=" at the arming
+line, at the first cancel / fallback / plan_plus, at a latch and once at exit.
+
+DO8 DIET (r16 iteration 52; gin item (89), DLRM_HSTU_FP8_L11_DO8_DIET == "1", read once, lazily). l11_do8.cu carries
+the r16 iter52 VALU/SGPR diet of the emission tail (O1 packed u16 group maxima, O7(i) one SGPR row count per tile, O11,
+v3b, O2 + E8 window, combine v6x) behind its preprocessor switch L11DO8_DIET (default 1). Knob "1": the build flags are
+exactly the ones before this switch existed (no define; the .cu's default 1). Absent, "0" or any other value: the
+flags gain -DL11DO8_DIET=0, which compiles ship14's (c68395d) kernel body in every guarded region, for the 'plus' and
+the 'only' .so alike; the define is part of the flags, so each setting has its own cache key and .so. Same output
+bytes either way (only the ISA differs). The pre-diet l11_do8_novd.cu has no such switch (the define is inert there).
+The prebuild lines gain "; diet OFF (...)" only when the knob is not "1".
+
+NIB (r16 iteration 54, gin item (94); knob DLRM_HSTU_FP8_LNMD_MASK_NIB, exactly "1" arms, default off; contract
+ops/lnmd_mask_nib.py). NIB v2: the NIB keep-mask reader exists ONLY in the DO8-ONLY ('only', EM 2) build; the 'plus'
+build is ALWAYS today's int8 build (its flags, cache key and .so are the knob-off build's). Why: the Leg L lab job N
+(production ROCm 7.2.1) measured the NIB 'plus' build at SGPR spill 41 vs the int8 build's 38, which fails the
+per-variant gate (iter53 VERIFY B2: <= base + 2); the NIB 'only' build passed (34 vs 33), and with DO8-ONLY every
+steady-state DO8 call runs the 'only' .so. With the knob on, a source that has the L11_MKB_NIB switch (the text
+"#if L11_MKB_NIB": l11_do8.cu; the pre-diet l11_do8_novd.cu has none, and a source that only names the macro does not
+count) and NIB writers that can arm in this process (_nib_writers_off: item (28)(e)'s maskgen
+DLRM_HSTU_FP8_LNMD_FWD_MASKGEN != "0", DLRM_HSTU_FP8_MASK16 == "1", DLRM_HSTU_FP8_LNMD_FWD_V2 != "0" and
+DLRM_HSTU_FP8_BWD_OUT_WGRAD_IMPL != "producer", read as triton_hstu_linear reads them; otherwise every keep mask is
+int8), _flags adds -DL11_MKB_NIB=1 to the 'only' build (its own cache key): that kernel reads the LN*U*dropout keep
+mask as uint8 [M, 256] (layout A, one dword per row-lane) instead of int8 [M, 512]; same keep decisions, same outputs
+byte for byte; its impl string carries "+mkb=nib". mask_format() is the format of the LOADED 'plus' .so (always "int8":
+_load raises on a "+mkb=nib" impl); only_mask_format() is that of the LOADED 'only' .so ("nib" | "int8"; "int8" when
+nothing is loaded), which _load_only checks against the build flags (raise). nib_ready() (knob on; DO8 requested,
+enabled and prebuilt; DO8-ONLY requested, its 'only' .so prebuilt, not latched and reading NIB; L11 enabled and
+prebuilt) is what the NIB writers ask before they write a NIB mask.
+ROUTING in run_e5_plus (never a latch on a format question: r16 iter53 VERIFY B1):
+  - a NIB mask (lnmd_mask_nib.is_nib) is a counted DECLINE ("E5 mask format", one NOT armed line per process) before
+    any allocation unless nib_ready() and its layout is uint8 [M, 256] row-contiguous, 16-B aligned; after the dz8 /
+    dO8 / E8 allocations _plan_only asks the dO8 registry as for any DO8-ONLY call: "only" -> the NIB 'only' .so
+    reads the mask as is; "plus" (or the 'only' fallback: no 'only' plan is open then) -> the same DECLINE (the 'plus'
+    .so reads int8): L11's own E5 launch serves the call with the exact int8 unpack (lnmd_mask_nib.as_int8), without
+    DO8's dO8/E8 emission;
+  - an int8 mask while the loaded 'only' .so reads NIB (after a NIB writer latch, a writer launch that raised or the
+    FP8 warmup's startup byte check, for the rest of the process; or per call wherever item (28)(e)'s maskgen does not
+    arm on a call that reaches DO8, e.g. fewer than 2^20 rows: LNMD fwd v2's floor): no plan (_plan_only is not
+    called); the int8 'plus' launch (dO8/E8 emitted, the bf16 d(attn) written), counted (counters() mask_int8_plus),
+    one line per process;
+  - any other mask (the knob off, or an int8 'only' .so): exactly the path without NIB.
+The raw launch_e5_plus raises on a mask the .so it launches does not read. Calibration steps (bf16 LN, no FP8 y saved)
+never reach DO8: L11 declines them at D4. The self-checks: self_check ('plus', int8) is ship15's; self_check_only
+feeds a NIB 'only' launch lnmd_mask_nib.pack_ref(mask) and its EM = 1 reference ('plus', int8) the int8 mask, and also
+requires unpack(pack_ref(mask)) == mask. The prebuild "armed OK" lines end with " mask=int8" ('plus', always) and
+" mask=nib(uint8[M,256])" or " mask=int8" ('only'). At exit, knob on only, "[l11-do8] nib counters: only_mask_format=
+int8_plus= nib_plus= mask_declined= fallback= final=1" follows the DO8 counters line (nib_summary_line; review N2).
+PREBUILD FALLBACK (review R1-F4, v2): a NIB 'only' build that fails at prebuild (hipcc, DO8's resource gate, the
+impl-format check, self_check_only) does not latch DO8-ONLY: one "<FAMILY>: LN*U*dropout keep mask NIB DISABLED"
+line, the NIB 'only' .so is dropped, nib_build_requested() is False for the rest of the process (_nib_fallback), and
+the int8 'only' build + self-check run instead (DO8 'plus' untouched; nib_ready() stays False, so the writers decline
+N6). A self-check device fault still aborts; with DLRM_HSTU_FP8_L11_DO8_FAIL_CLOSED=1 the failure raises as before. A
+'plus' failure behaves exactly as without NIB (no NIB involved).
+"""
+
+import atexit
+import ctypes
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import threading
+import time
+import weakref
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
+
+from generative_recommenders.ops import lnmd_mask_nib
+from generative_recommenders.ops.hip import l11_outproj_lnmd as l11
+from generative_recommenders.ops.utils import arm_print_all_ranks
+
+KNOB: str = "DLRM_HSTU_FP8_L11_DO8"
+SCHED_ENV: str = KNOB + "_SCHED"  # "default" (code default, the lab-measured flags) | "iterative-ilp" (diagnostic)
+KERNEL_NAME: str = "l11_outproj_lnmd_bwd_do8"
+BUILD_KERNEL_NAME: str = "l11_do8_wl_build"
+FAMILY: str = "L11 DO8 dO8/E8 emission"
+ITEM: str = "(DO8)"
+
+_SOURCE: Path = Path(__file__).with_name("l11_do8.cu")  # DO8-VD: L11-VD's VALU diet in DO8's kernel body
+_SOURCE_NOVD: Path = Path(__file__).with_name("l11_do8_novd.cu")  # the pre-diet DO8 source (L11-VD off)
+_ARCH: str = "gfx950"
+# L11's flags (l11_outproj_lnmd._FLAGS) WITHOUT "-mllvm -amdgpu-sched-strategy=iterative-ilp": the iter-35 lab built the
+# E5 + emission instantiation only with the default scheduler (iterative-ilp crashed clang-22's greedy RA, e5a..e5f).
+_BASE_FLAGS: Tuple[str, ...] = (
+    "-DKITTENS_CDNA4",
+    "-std=c++20",
+    "-w",
+    "-O3",
+    "-ffp-contract=off",
+    "--save-temps",
+    "-shared",
+    "-fPIC",
+    "-Rpass-analysis=kernel-resource-usage",
+)
+_SCHED_FLAGS: Dict[str, Tuple[str, ...]] = {
+    "default": (),
+    "iterative-ilp": ("-mllvm", "-amdgpu-sched-strategy=iterative-ilp"),
+}
+_CACHE_ROOT: str = "/tmp/dlrm_hstu_fp8_l11_do8"
+_LIB_NAME: str = "libl11_do8.so"
+_BUILD_TIMEOUT_S: int = 300
+_ABI_VERSION: int = 1
+LDS_BYTES: int = 163840  # the 'plus' instantiation: L11's 96 KiB + the 64 KiB d(attn) tile staging
+H: int = 4  # heads: lane >> 4 of the kernel's 64 lanes x 8 columns
+HD: int = 128  # head dim (H * HD = 512 = L11's D)
+B_MAX: int = 8192  # sequences per list build (1024 threads x 8)
+# The production instantiation's template arguments in the mangled name (E5 1, WLIST 2, EM 1, RET 0, EMV 2, TM 0).
+_PROD_MANGLE: str = "ILi1ELi2ELi0ELi0ELi1ELi2ELi1ELi0ELi1ELi2ELi1ELi0ELi2ELi0EE"
+# DO8-ONLY (r16 iter42): the producer knob of R15's contract v2 (== hstu_do8_registry.ONLY_ENV; the registry reads the
+# same variable per call), its line family, the 'only' build of l11_do8.cu and its instantiation (EM 2).
+ONLY_KNOB: str = KNOB + "_ONLY"
+FAMILY_ONLY: str = FAMILY + " only"
+ITEM_ONLY: str = "(DO8-ONLY)"
+_ONLY_DEFINE: str = "-DL11DO8_ONLY=1"
+_LIB_NAME_ONLY: str = "libl11_do8_only.so"
+_ONLY_MANGLE: str = "ILi1ELi2ELi0ELi0ELi1ELi2ELi1ELi0ELi1ELi2ELi2ELi0ELi2ELi0EE"
+_POISON_BF16: int = 0x7FC0  # contract v2 debug knob (registry.poison_requested): a bf16 NaN in every placeholder word
+_SENTINEL_BF16: int = 0x7FA5  # the 'only' self-check's prefill of the EM = 2 d(attn) buffer (a NaN payload)
+# review_do8only P1: the attribute an EM = 2 placeholder carries (its site), so publish() can never send it out as 'plus'
+_ONLY_PLACEHOLDER_ATTR: str = "_l11_do8_only_placeholder_site"
+# DO8 DIET (r16 iter52, gin item (89)): the knob, and the define its "off" adds to every l11_do8 build ('plus' and
+# 'only'); "1" adds nothing (the .cu defaults L11DO8_DIET to 1), so the default build command is unchanged.
+DIET_KNOB: str = KNOB + "_DIET"
+_DIET_OFF_DEFINE: str = "-DL11DO8_DIET=0"
+# NIB (r16 iter54): the build switch of l11_do8.cu's packed keep-mask reader (NIB v2: the 'only' .so only), the text
+# that marks a source as NIB-capable, the impl tag of a NIB build and the format names of the prebuild lines.
+_NIB_DEFINE: str = "-DL11_MKB_NIB=1"
+_NIB_MARKER: bytes = b"#if L11_MKB_NIB"  # the switch itself (review R2-F8): naming the macro is not enough
+_NIB_IMPL_TAG: str = "+mkb=nib"
+_MASK_DESC: Dict[str, str] = {"nib": "nib(uint8[M,256])", "int8": "int8"}
+_MASK_DECLINE: str = "E5 mask format"  # run_e5_plus's decline reason prefix (decline key "E5 mask")
+
+
+class OnlyLaunchError(RuntimeError):
+    """DO8-ONLY (r15 review N1): the EM = 2 kernel launch itself failed (l11do8_e5_only_launch rc > 0). This is the one
+    failure of an 'only' call that latches 'only' alone; any other failure of such a call (launch_e5_plus's checks,
+    plan(cap), the drain, the placeholder / partials allocations, the host work after the launch) can happen to a
+    'plus' call too and latches DO8, as it does there."""
+
+
+_lock = threading.Lock()
+_requested: Optional[bool] = None
+_override: Optional[bool] = None
+_diet: Optional[bool] = None  # DO8 DIET knob, read once (lazily, at the first build)
+_diet_override: Optional[bool] = None
+_broken: Optional[str] = None
+_lib: Optional[ctypes.CDLL] = None
+_lib_path: Optional[Path] = None
+_fn_launch: Optional[Callable[..., int]] = None
+_fn_wl_build: Optional[Callable[..., int]] = None
+_fn_wl_cap: Optional[Callable[..., int]] = None
+_fn_plan: Optional[Callable[..., int]] = None
+_fn_drain: Optional[Callable[[], int]] = None
+_impl: str = ""
+_resources: Dict[str, Any] = {}
+_build_secs: float = 0.0
+_prebuilt: bool = False
+_active_logged: bool = False
+_once: set = set()
+_plan_cache: Dict[int, Tuple[int, int, int, int]] = {}
+_registry_mod: Any = None
+_registry_tried: bool = False
+# Work-list memo (one entry): the list of the latest seq_offsets object (weakref) + its key.
+_WL_MEMO: Dict[str, Any] = {}
+# Per-call engagement counters (per process).
+_COUNTS: Dict[str, int] = {
+    "calls": 0,
+    "emitted": 0,
+    "published": 0,
+    "refused": 0,
+    "failed": 0,
+    "wl_built": 0,
+    "wl_reused": 0,
+    "bf16_mode": 0,
+}
+_DECLINED: Dict[str, int] = {}
+_STATE: Dict[str, Any] = {"events": 0, "atexit": False}
+# DO8-ONLY state: latch, prebuild flag, the 'only' .so, the in-flight 'only' call (its site and a weakref to its
+# placeholder, from the launch to publish) and the producer-side counters.
+_only_broken: Optional[str] = None
+_only_prebuilt: bool = False
+_only_lib: Optional[ctypes.CDLL] = None
+_only_lib_path: Optional[Path] = None
+_fn_launch_only: Optional[Callable[..., int]] = None
+_impl_only: str = ""
+_only_resources: Dict[str, Any] = {}
+_only_logged: bool = False
+_ONLY_CALL: Dict[str, Any] = {}
+_ONLY_COUNTS: Dict[str, int] = {
+    "planned": 0,
+    "only_launched": 0,
+    "published": 0,
+    "cancelled": 0,
+    "fallback": 0,
+    "plan_plus": 0,
+}
+_ONLY_STATE: Dict[str, Any] = {"atexit": False}
+# NIB (r16 iter54, review R1-F4): the reason the NIB 'only' build failed at prebuild (_nib_fall_back). Set: the int8
+# 'only' build runs instead and nib_build_requested() is False for the rest of the process (nothing is latched).
+_nib_fallback: Optional[str] = None
+# NIB v2 (run_e5_plus): int8_plus = int8 keep masks run as DO8 'plus' (no plan) because the loaded 'only' .so reads NIB;
+# nib_plus = NIB keep masks declined because DO8-ONLY ran the call as 'plus' (registry plan "plus" / 'only' fallback).
+_NIB_COUNTS: Dict[str, int] = {"int8_plus": 0, "nib_plus": 0}
+
+
+# ---------------------------------------------------------------------------- knob / latch / lines
+def requested() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8 == "1" (read once, lazily: the gin env bootstrap runs after import)."""
+    global _requested
+    if _override is not None:
+        return _override
+    if _requested is None:
+        _requested = os.environ.get(KNOB, "0") == "1"
+    return _requested
+
+
+def enabled() -> bool:
+    return requested() and _broken is None
+
+
+def broken() -> Optional[str]:
+    return _broken
+
+
+def prebuilt() -> bool:
+    return _prebuilt
+
+
+def resources() -> Dict[str, Any]:
+    return dict(_resources)
+
+
+def impl() -> str:
+    return _impl
+
+
+def library_path() -> Optional[Path]:
+    return _lib_path
+
+
+def counters() -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(_COUNTS)
+    out["declined"] = dict(_DECLINED)
+    out["events"] = int(_STATE["events"])
+    # NIB (r16 iter54): the loaded 'plus' / 'only' .so's keep-mask formats and the run_e5_plus "E5 mask format"
+    # declines (also in "declined" under their key; the "[l11-do8] counters" line prints them there)
+    out["mask_format"] = mask_format()
+    out["mask_only_format"] = only_mask_format()
+    out["mask_declined"] = int(_DECLINED.get(decline_key(_MASK_DECLINE), 0))
+    out["mask_fallback"] = int(_nib_fallback is not None)  # the NIB 'only' build failed at prebuild -> int8 'only'
+    out["mask_int8_plus"] = int(_NIB_COUNTS["int8_plus"])  # v2: int8 masks run as 'plus' (NIB 'only' .so loaded)
+    out["mask_nib_plus"] = int(_NIB_COUNTS["nib_plus"])  # v2: NIB masks declined on a call run as 'plus'
+    return out
+
+
+def set_requested_for_testing(value: Optional[bool]) -> None:
+    global _override, _requested
+    _override = value
+    _requested = None
+
+
+def diet_requested() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8_DIET == "1" (surrounding whitespace ignored; read once, lazily: the first build runs after
+    the gin env bootstrap). Absent, "", "0" or any other value: False -> every l11_do8 build adds -DL11DO8_DIET=0 (ship14's
+    c68395d kernel body). The gin file binds it True (item (89))."""
+    global _diet
+    if _diet_override is not None:
+        return _diet_override
+    if _diet is None:
+        _diet = os.environ.get(DIET_KNOB, "").strip() == "1"
+    return _diet
+
+
+def set_diet_for_testing(value: Optional[bool]) -> None:
+    """Tests only: force the DIET knob (None = read the environment again). A library already loaded is not rebuilt:
+    use reset_for_testing(unload=True) before the next _load()."""
+    global _diet_override, _diet
+    _diet_override = value
+    _diet = None
+
+
+def _diet_tail() -> str:
+    """The prebuild lines' DIET note: empty with the knob on (the lines are unchanged), else names the OFF build."""
+    if diet_requested():
+        return ""
+    return f"; diet OFF ({DIET_KNOB} != 1: {_DIET_OFF_DEFINE}, ship14 c68395d kernel body)"
+
+
+def set_prebuilt_for_testing(value: bool) -> None:
+    global _prebuilt
+    _prebuilt = value
+
+
+def reset_for_testing(unload: bool = False) -> None:
+    """Tests only: clear the latch, once-lines, counters, memo, prebuilt flag; unload=True also forgets the library."""
+    global _broken, _prebuilt, _active_logged, _registry_mod, _registry_tried, _nib_fallback
+    global _lib, _lib_path, _fn_launch, _fn_wl_build, _fn_wl_cap, _fn_plan, _fn_drain, _impl
+    _broken = None
+    _nib_fallback = None
+    _prebuilt = False
+    _active_logged = False
+    _registry_mod = None
+    _registry_tried = False
+    _once.clear()
+    _plan_cache.clear()
+    _WL_MEMO.clear()
+    for k in _COUNTS:
+        _COUNTS[k] = 0
+    for k in _NIB_COUNTS:
+        _NIB_COUNTS[k] = 0
+    _DECLINED.clear()
+    _STATE["events"] = 0
+    _reset_only_for_testing(unload)
+    if unload:
+        with _lock:
+            _lib = None
+            _lib_path = None
+            _fn_launch = _fn_wl_build = _fn_wl_cap = _fn_plan = _fn_drain = None
+            _impl = ""
+            _resources.clear()
+
+
+def _reset_only_for_testing(unload: bool) -> None:
+    global _only_broken, _only_prebuilt, _only_logged, _only_lib, _only_lib_path, _fn_launch_only, _impl_only
+    _only_broken = None
+    _only_prebuilt = False
+    _only_logged = False
+    _ONLY_CALL.clear()
+    for k in _ONLY_COUNTS:
+        _ONLY_COUNTS[k] = 0
+    if unload:
+        with _lock:
+            _only_lib = None
+            _only_lib_path = None
+            _fn_launch_only = None
+            _impl_only = ""
+            _only_resources.clear()
+
+
+def _fail_closed() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8_FAIL_CLOSED=1 (smoke/debug only): raise instead of latching off."""
+    return os.environ.get(KNOB + "_FAIL_CLOSED", "0") == "1"
+
+
+def _print_once(key: str, message: str) -> None:
+    if key in _once:
+        return
+    _once.add(key)
+    arm_print_all_ranks(message)
+
+
+def summary_line(final: bool = False) -> str:
+    dec = ",".join(f"{k}:{v}" for k, v in sorted(_DECLINED.items()))
+    c = _COUNTS
+    return (
+        f"[l11-do8] counters: events={_STATE['events']} calls={c['calls']} emitted={c['emitted']} "
+        f"published={c['published']} refused={c['refused']} failed={c['failed']} wl_built={c['wl_built']} "
+        f"wl_reused={c['wl_reused']} bf16_mode={c['bf16_mode']} declined={{{dec}}} "
+        f"latched={int(_broken is not None)}" + (" final=1" if final else "")
+    )
+
+
+def nib_summary_line(final: bool = False) -> str:
+    """NIB v2 (review N2): this process's run_e5_plus keep-mask routing counts. only_mask_format = the loaded 'only'
+    .so's format; int8_plus = int8 masks run as DO8 'plus' (the 'only' .so reads NIB); nib_plus = NIB masks declined on
+    a call DO8-ONLY ran as 'plus'; mask_declined = every "E5 mask format" decline (nib_plus included); fallback = the
+    NIB 'only' build fell back to int8 at prebuild. Printed by _final after the DO8 counters line, knob on only."""
+    return (
+        f"[l11-do8] nib counters: only_mask_format={only_mask_format()} int8_plus={_NIB_COUNTS['int8_plus']} "
+        f"nib_plus={_NIB_COUNTS['nib_plus']} mask_declined={int(_DECLINED.get(decline_key(_MASK_DECLINE), 0))} "
+        f"fallback={int(_nib_fallback is not None)}" + (" final=1" if final else "")
+    )
+
+
+def _final() -> None:
+    if _STATE["events"]:
+        arm_print_all_ranks(summary_line(final=True))
+        if lnmd_mask_nib.requested():  # NIB v2 (review N2): the routing counts at exit; knob off: nothing more
+            arm_print_all_ranks(nib_summary_line(final=True))
+
+
+def _event() -> None:
+    """One per-call event (emitted / published / refused / declined / failed); log-spaced counter lines."""
+    _STATE["events"] += 1
+    n = int(_STATE["events"])
+    if not _STATE["atexit"]:
+        _STATE["atexit"] = True
+        atexit.register(_final)
+    if n & (n - 1) == 0:
+        arm_print_all_ranks(summary_line())
+
+
+def _count(key: str, event: bool = True) -> None:
+    _COUNTS[key] += 1
+    if event:
+        _event()
+
+
+def _disable(reason: str) -> None:
+    """Latch DO8 (only DO8) off for this process and print one DISABLED line."""
+    global _broken
+    if _fail_closed():
+        raise RuntimeError(f"{FAMILY} failed with {KNOB}_FAIL_CLOSED=1: {reason}")
+    if _broken is not None:
+        return
+    _broken = reason
+    _COUNTS["failed"] += 1
+    _event()
+    arm_print_all_ranks(
+        f"{FAMILY} DISABLED: {reason} -> item (39) L11's own launches + quantize_do_e4m3_blk for this process "
+        "(L11 unaffected)"
+    )
+
+
+def decline_key(reason: str) -> str:
+    tokens = reason.split()
+    key = tokens[0] if tokens else reason
+    if len(tokens) > 1:
+        key += " " + re.split(r"[=:(\d]", tokens[1], maxsplit=1)[0]
+    return key
+
+
+def note_decline(reason: str, quiet: bool = False) -> None:
+    """Count a declined call; one 'NOT armed' line per (reason key, process) unless quiet (expected states)."""
+    k = decline_key(reason)
+    _DECLINED[k] = _DECLINED.get(k, 0) + 1
+    _event()
+    if not quiet:
+        _print_once(
+            "decline:" + k,
+            f"{FAMILY} NOT armed: {reason} -> item (39) L11's own launch; the C8 attention backward quantizes dO",
+        )
+
+
+def note_bf16_mode(ctx: Any) -> None:
+    """The seam's bf16-du branch (B1a declined this call): DO8 has no variant there. Counted only when a dO8 site
+    exists (an emission was possible in principle); never printed (an expected state: B1a's warm-up calls)."""
+    if requested() and getattr(ctx, "do8_site", None) is not None:
+        _COUNTS["bf16_mode"] += 1
+
+
+# ---------------------------------------------------------------------------- DO8-ONLY knob / latch / lines
+def only_requested() -> bool:
+    """DLRM_HSTU_FP8_L11_DO8_ONLY == "1" (surrounding whitespace ignored), read per call like the registry's own read of
+    the same variable (hstu_do8_registry.only_requested, which prints the REQUESTED / invalid-value lines). Absent, "",
+    "0" or any other value: False, and DO8 runs exactly its 'plus' path."""
+    return os.environ.get(ONLY_KNOB, "").strip() == "1"
+
+
+def only_enabled() -> bool:
+    """An 'only' launch is possible: the knob on, DO8 enabled, the 'only' .so prebuilt and not latched."""
+    return only_requested() and enabled() and _only_prebuilt and _only_broken is None
+
+
+def only_broken() -> Optional[str]:
+    return _only_broken
+
+
+def only_prebuilt() -> bool:
+    return _only_prebuilt
+
+
+def only_resources() -> Dict[str, Any]:
+    return dict(_only_resources)
+
+
+def only_impl() -> str:
+    return _impl_only
+
+
+def only_library_path() -> Optional[Path]:
+    return _only_lib_path
+
+
+def only_counters() -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(_ONLY_COUNTS)
+    out["latched"] = int(_only_broken is not None)
+    return out
+
+
+def set_only_prebuilt_for_testing(value: bool) -> None:
+    global _only_prebuilt
+    _only_prebuilt = value
+
+
+def only_summary_line(final: bool = False) -> str:
+    c = _ONLY_COUNTS
+    return (
+        f"[l11-do8] only counters: planned={c['planned']} only_launched={c['only_launched']} "
+        f"published={c['published']} cancelled={c['cancelled']} fallback={c['fallback']} plan_plus={c['plan_plus']} "
+        f"latched={int(_only_broken is not None)}" + (" final=1" if final else "")
+    )
+
+
+def _only_final() -> None:
+    if any(_ONLY_COUNTS.values()) or _only_broken is not None:
+        arm_print_all_ranks(only_summary_line(final=True))
+
+
+def _only_atexit() -> None:
+    if not _ONLY_STATE["atexit"]:
+        _ONLY_STATE["atexit"] = True
+        atexit.register(_only_final)
+
+
+def _only_event(key: str) -> None:
+    """Count one 'only' event; the counter line at the first cancel / fallback / plan_plus of the process."""
+    _ONLY_COUNTS[key] += 1
+    _only_atexit()
+    if key in ("cancelled", "fallback", "plan_plus") and _ONLY_COUNTS[key] == 1:
+        arm_print_all_ranks(only_summary_line())
+
+
+def _disable_only(reason: str) -> None:
+    """Latch DO8-ONLY (only 'only') off for this process and print one DISABLED line: DO8 keeps its 'plus' launches
+    (EM = 1, the bf16 d(attn) written) and its own latch."""
+    global _only_broken
+    if _fail_closed():
+        raise RuntimeError(f"{FAMILY_ONLY} failed with {KNOB}_FAIL_CLOSED=1: {reason}")
+    if _only_broken is not None:
+        return
+    _only_broken = reason
+    _only_atexit()
+    arm_print_all_ranks(
+        f"{FAMILY_ONLY} DISABLED: {reason} -> item {ITEM} 'plus' for this process (the bf16 d(attn) is written; "
+        "DO8 and L11 unaffected)"
+    )
+    arm_print_all_ranks(only_summary_line())
+
+
+# ---------------------------------------------------------------------------- registry (R15 hstu_do8_registry)
+def registry() -> Any:
+    """The consumer's registry module, or None when this tree has no R15 hook (one INERT line, knob on only)."""
+    global _registry_mod, _registry_tried
+    if _registry_tried:
+        return _registry_mod
+    _registry_tried = True
+    try:
+        from generative_recommenders.ops.flydsl import hstu_do8_registry as reg  # R15 A11 hook (contract v1.2)
+
+        _registry_mod = reg
+    except ImportError as error:
+        _registry_mod = None
+        if requested():
+            _print_once(
+                "inert-registry",
+                f"{FAMILY} INERT: no ops/flydsl/hstu_do8_registry ({error}); R15's A11 consumer hook is not in this "
+                "tree, so no dO8 site exists and nothing is emitted",
+            )
+    return _registry_mod
+
+
+def site_of(attn: torch.Tensor) -> Any:
+    """FORWARD (HSTUComputeOutputFunction.forward only, R15 contract rule (a)): the dO8 site tagged on `attn`, or None.
+    Knob off: None, nothing imported, nothing printed."""
+    if not requested():
+        return None
+    reg = registry()
+    if reg is None:
+        return None
+    return reg.site_of(attn)
+
+
+# ---------------------------------------------------------------------------- build / load
+def sched() -> str:
+    raw = os.environ.get(SCHED_ENV, "").strip() or "default"
+    if raw not in _SCHED_FLAGS:
+        _print_once("sched", f"{FAMILY}: {SCHED_ENV}={raw!r} is not one of {sorted(_SCHED_FLAGS)} -> 'default'")
+        return "default"
+    return raw
+
+
+def _source() -> Path:
+    """DLRM_HSTU_FP8_L11_DO8_SRC overrides the source (A/B of a candidate .cu only). Otherwise L11's own L11-VD
+    selector decides: l11_do8.cu (the diet) when DLRM_HSTU_FP8_L11_VD == "1", else l11_do8_novd.cu (pre-diet)."""
+    override = os.environ.get(KNOB + "_SRC", "").strip()  # A/B of a candidate .cu only
+    if override:
+        return Path(override)
+    return _SOURCE if l11.vd_requested() else _SOURCE_NOVD
+
+
+# ---------------------------------------------------------------------------- NIB keep-mask format (r16 iter54)
+def _nib_writers_off() -> Optional[str]:
+    """None = the NIB keep-mask writers can arm in this process; otherwise the knob that keeps every keep mask int8,
+    in which case a NIB 'only' .so would never get a NIB mask (review R1-F3; NIB v2: every call would run 'plus'), so
+    the int8 'only' .so is built. Host env only,
+    read exactly as ops/triton/triton_hstu_linear.py reads it (names, defaults, tests): item (28)(e)'s maskgen
+    (_use_lnmd_fwd_maskgen: DLRM_HSTU_FP8_LNMD_FWD_MASKGEN != "0"), mask16 (_use_mask16: DLRM_HSTU_FP8_MASK16 == "1"),
+    the LN*U*dropout forward v2 (_use_lnmd_fwd_v2: DLRM_HSTU_FP8_LNMD_FWD_V2 != "0"), and the FP8 out-proj wgrad not in
+    its "producer" mode (_FP8_OUT_WGRAD_IMPL: that forward writes its own int8 mask)."""
+    env = os.environ
+    if env.get("DLRM_HSTU_FP8_LNMD_FWD_MASKGEN", "0") == "0":
+        return "DLRM_HSTU_FP8_LNMD_FWD_MASKGEN is off (item (28)(e)'s maskgen writes every NIB mask)"
+    if env.get("DLRM_HSTU_FP8_MASK16", "0") != "1":
+        return "DLRM_HSTU_FP8_MASK16 is not 1 (the maskgen needs mask16)"
+    if env.get("DLRM_HSTU_FP8_LNMD_FWD_V2", "0") == "0":
+        return "DLRM_HSTU_FP8_LNMD_FWD_V2 is off (the maskgen needs the v2 forward)"
+    if env.get("DLRM_HSTU_FP8_BWD_OUT_WGRAD_IMPL", "nn") == "producer":
+        return "DLRM_HSTU_FP8_BWD_OUT_WGRAD_IMPL=producer (its forward writes the int8 mask)"
+    return None
+
+
+def _nib_src(src: bytes) -> bool:
+    """The NIB reader 'only' build for THIS source: the knob DLRM_HSTU_FP8_LNMD_MASK_NIB == "1", no NIB fallback at
+    this process's prebuild (_nib_fallback), the source has the L11_MKB_NIB switch ("#if L11_MKB_NIB": l11_do8.cu; not
+    the pre-diet l11_do8_novd.cu) and the NIB writers can arm (_nib_writers_off). Knob off: False before any other
+    read. NIB v2: _flags asks this for the 'only' build only."""
+    return (
+        lnmd_mask_nib.requested()
+        and _nib_fallback is None
+        and _NIB_MARKER in src
+        and _nib_writers_off() is None
+    )
+
+
+def nib_build_requested(source: Optional[Path] = None) -> bool:
+    """True = the next 'only' build of the selected source (`_source()`, or `source`) is the NIB reader build: the knob
+    on, no NIB fallback in this process, the source text contains the switch "#if L11_MKB_NIB", and the NIB writers can
+    arm (_nib_writers_off). Then _flags adds -DL11_MKB_NIB=1 to the 'only' build (the cache key covers the flags, so
+    NIB and int8 builds never share a cache entry). NIB v2: the 'plus' build is int8 whatever this says. Knob off:
+    False, no read."""
+    if not lnmd_mask_nib.requested():
+        return False
+    try:
+        return _nib_src((source or _source()).read_bytes())
+    except OSError:
+        return False
+
+
+def _mask_format_of(impl_: str) -> str:
+    return "nib" if _NIB_IMPL_TAG in impl_ else "int8"
+
+
+def mask_format() -> str:
+    """The keep-mask format of the LOADED 'plus' .so: "int8" (int8 [M, 512]; also when nothing is loaded). NIB v2: the
+    'plus' build never gets -DL11_MKB_NIB=1 and _load raises on a "+mkb=nib" impl, so a loaded 'plus' .so never reads
+    "nib" (uint8 [M, 256]). The 'only' .so's format: only_mask_format()."""
+    if _lib is None:
+        return "int8"
+    return _mask_format_of(_impl)
+
+
+def only_mask_format() -> str:
+    """NIB v2: the keep-mask format of the LOADED 'only' .so: "nib" (uint8 [M, 256]; its impl contains "+mkb=nib":
+    built while nib_build_requested(), checked in _load_only) or "int8" (int8 [M, 512]; also when nothing is loaded).
+    The only DO8 .so that may read NIB."""
+    if _only_lib is None:
+        return "int8"
+    return _mask_format_of(_impl_only)
+
+
+def _nib_not_ready() -> Optional[str]:
+    """None = nib_ready(); otherwise its first unmet condition (run_e5_plus's NIB decline names it). Host state only,
+    in nib_ready()'s order; the knob first (off: nothing else is read)."""
+    if not lnmd_mask_nib.requested():
+        return f"{lnmd_mask_nib.KNOB} is not 1"
+    if not (requested() and enabled() and prebuilt() and broken() is None):
+        return "DO8 off, latched or not prebuilt"
+    if not only_requested():
+        return f"DO8-ONLY off ({ONLY_KNOB} != 1): only its 'only' .so reads NIB"
+    if not (only_prebuilt() and only_broken() is None):
+        return "the DO8-ONLY 'only' .so is not prebuilt or latched"
+    if only_mask_format() != "nib":
+        return "the loaded 'only' .so reads the int8 keep mask"
+    if not (l11.enabled() and l11.prebuilt()):
+        return "L11 item (39) not enabled/prebuilt"
+    return None
+
+
+def nib_ready() -> bool:
+    """The NIB writers may write a NIB keep mask for a DO8 call (NIB v2: only the DO8-ONLY 'only' .so reads it): the
+    knob on; DO8 requested, enabled (not latched) and prebuilt (build + gate + self-check before RUN_START); DO8-ONLY
+    requested (DLRM_HSTU_FP8_L11_DO8_ONLY == "1", read per call), its 'only' .so prebuilt, not latched and reading NIB
+    (only_mask_format() == "nib"); L11 enabled and prebuilt (DO8 never runs without it). Host state only (cheap; the
+    writers ask per maskgen call)."""
+    return _nib_not_ready() is None
+
+
+def _mask_mismatch(random_mask: Any, m: int, fmt: str) -> Optional[str]:
+    """None = `random_mask` is what a DO8 .so of keep-mask format `fmt` reads for m rows: "nib" ->
+    lnmd_mask_nib.layout_ok (uint8 [m, 256], row stride 256, 16-B aligned); "int8" -> L11's D8 layout (int8 [m, 512],
+    row stride 512, 16-B aligned). Otherwise a description of the mismatch. Host metadata only (no sync, no
+    allocation, no unpack)."""
+    if fmt == "nib":
+        if lnmd_mask_nib.layout_ok(random_mask, m):
+            return None
+        want = f"uint8 [{m}, {lnmd_mask_nib.ROW_BYTES}] (NIB)"
+    else:
+        if isinstance(random_mask, torch.Tensor) and l11._rows512(random_mask, torch.int8, m):
+            return None
+        want = f"int8 [{m}, {l11.D}]"
+    if isinstance(random_mask, torch.Tensor):
+        got = (f"{random_mask.dtype} {tuple(random_mask.shape)} stride {tuple(random_mask.stride())} "
+               f"a16={int(random_mask.data_ptr() % 16 == 0)}")
+    else:
+        got = type(random_mask).__name__
+    return f"keep mask {got}; the loaded {fmt} .so reads {want}, row-contiguous, 16-B aligned"
+
+
+def _mask_decline(random_mask: Any, m: int, mask_nib: bool, only_nib: bool) -> Optional[str]:
+    """NIB v2, run_e5_plus before any allocation: None = the .so this call may launch reads `random_mask`; otherwise
+    the decline reason. mask_nib (lnmd_mask_nib.is_nib): only the NIB 'only' .so reads it -> nib_ready() and the NIB
+    layout (uint8 [m, 256], row stride 256, 16-B aligned). Any other mask is for the int8 'plus' .so (or an int8 'only'
+    .so): int8 [m, 512], row stride 512, 16-B aligned -- checked for every tensor mask, and for any mask while the NIB
+    'only' .so is loaded (only_nib); with int8 .so only, a non-tensor stand-in is not checked (today's path: a failing
+    launch latches DO8, as before). Host metadata only (no sync, no allocation, no unpack)."""
+    if mask_nib:
+        why = _nib_not_ready()
+        if why is not None:
+            return f"keep mask NIB uint8 {tuple(random_mask.shape)}; no NIB 'only' .so is ready ({why})"
+        return _mask_mismatch(random_mask, m, "nib")
+    if isinstance(random_mask, torch.Tensor) or only_nib:
+        return _mask_mismatch(random_mask, m, "int8")
+    return None
+
+
+def _note_int8_plus(m: int) -> None:
+    """NIB v2, run_e5_plus: an int8 keep mask while the loaded 'only' .so reads NIB (after a NIB writer latch, or on a
+    call the NIB writers did not arm): the call runs DO8 'plus' (the int8 .so; _plan_only is not called, so the
+    registry is not asked and cannot answer "only"). Counted (counters() mask_int8_plus), one line per process; not a
+    decline (DO8 emits dO8/E8 as for any 'plus' call)."""
+    _NIB_COUNTS["int8_plus"] += 1
+    _print_once(
+        "nib-int8-plus",
+        f"{FAMILY}: {lnmd_mask_nib.FAMILY}: an int8 keep mask reached DO8 while its 'only' .so reads NIB (M={m}; a NIB "
+        "writer latch, or a call the NIB writers did not arm) -> DO8 'plus' for such calls (the int8 .so: dO8/E8 "
+        "emitted, the bf16 d(attn) written; no 'only' plan); counted (mask_int8_plus), one line per process",
+    )
+
+
+def _flags(src: bytes, only: bool = False) -> List[str]:
+    sha = hashlib.sha256(src).hexdigest()
+    # DO8 DIET (item (89)): knob off -> -DL11DO8_DIET=0 (c68395d body; before the 'only' define); on -> no define
+    diet = [] if diet_requested() else [_DIET_OFF_DEFINE]
+    return [f"--offload-arch={_ARCH}", *_BASE_FLAGS, *_SCHED_FLAGS[sched()], f'-DL11DO8_SRC_SHA256="{sha}"'] + diet + (
+        [_ONLY_DEFINE] if only else []
+    ) + ([_NIB_DEFINE] if only and _nib_src(src) else [])  # NIB v2: the 'only' build only, knob on ('plus' unchanged)
+
+
+def build_command(source: Path, out: Path, only: bool = False) -> List[str]:
+    """The exact hipcc command of `build` (the lab build task reuses it to keep the --save-temps ISA). only=True: the
+    DO8-ONLY .so (the same flags + -DL11DO8_ONLY=1)."""
+    return [l11._hipcc(), str(source.resolve()), *_flags(source.read_bytes(), only), "-o", str(out.resolve())]
+
+
+def cache_key(source: Optional[Path] = None, only: bool = False) -> str:
+    source = source or _source()
+    src = source.read_bytes()
+    digest = hashlib.sha256()
+    digest.update(src)
+    digest.update(b"\0" + "\0".join(_flags(src, only)).encode())
+    digest.update(b"\0" + _ARCH.encode())
+    digest.update(b"\0" + l11._toolchain(l11._hipcc()).encode())
+    return digest.hexdigest()[:16]
+
+
+def _cache_dir(source: Optional[Path] = None, only: bool = False) -> Path:
+    root = os.environ.get(KNOB + "_CACHE", "").strip() or _CACHE_ROOT
+    return Path(root) / cache_key(source, only)
+
+
+def check_resources(kernels: List[Dict[str, str]], mangle: str = _PROD_MANGLE) -> Dict[str, Any]:
+    """DO8's own gate (L11's is untouched): the 'plus' kernel and the list builder must report 0 VGPR spill and 0
+    scratch, and the 'plus' kernel exactly LDS_BYTES of LDS; raises otherwise (the caller latches DO8 off). DO8-ONLY:
+    mangle=_ONLY_MANGLE gates the 'only' .so the same way (its single DO8 kernel must be the EM = 2 instantiation)."""
+    mine = [k for k in kernels if KERNEL_NAME in k.get("Function Name", "")]
+    wlb = [k for k in kernels if BUILD_KERNEL_NAME in k.get("Function Name", "")]
+    if len(mine) != 1:
+        raise RuntimeError(f"{len(mine)} {KERNEL_NAME} resource remarks in the build log (need exactly 1)")
+    if len(wlb) < 1:
+        raise RuntimeError(f"no {BUILD_KERNEL_NAME} resource remarks in the build log")
+    for k in mine + wlb:
+        spill = int(k.get("VGPRs Spill", "-1"))
+        scratch = int(k.get("ScratchSize [bytes/lane]", "-1"))
+        if spill != 0 or scratch != 0:
+            raise RuntimeError(
+                f"resource check: {k.get('Function Name')} VGPR spill {spill}, scratch {scratch} B/lane (need 0/0)"
+            )
+    p = mine[0]
+    if mangle not in p.get("Function Name", ""):
+        raise RuntimeError(f"resource check: unexpected instantiation {p.get('Function Name')}")
+    lds = int(p.get("LDS Size [bytes/block]", "-1"))
+    if lds != LDS_BYTES:
+        raise RuntimeError(f"resource check: {KERNEL_NAME} LDS {lds} B (expected {LDS_BYTES})")
+    return {
+        "vgpr": int(p.get("VGPRs", "-1")),
+        "sgpr": int(p.get("TotalSGPRs", "-1")),
+        "vgpr_spill": int(p.get("VGPRs Spill", "-1")),
+        "sgpr_spill": int(p.get("SGPRs Spill", "-1")),
+        "scratch": int(p.get("ScratchSize [bytes/lane]", "-1")),
+        "lds": lds,
+        "wl_build_vgpr": max(int(k.get("VGPRs", "-1")) for k in wlb),
+        "sched": sched(),
+        "kernels": len(mine) + len(wlb),
+    }
+
+
+def build(source: Optional[Path] = None, only: bool = False) -> Tuple[Path, Dict[str, Any]]:
+    """Compile (cache hit: no compile) and return (library path, resource summary). Raises on any failure (missing
+    hipcc, compile error or compiler crash, timeout, VGPR spill, scratch, LDS mismatch). Same race-safe cache protocol
+    as L11's loader (per-host/pid/thread temp file, atomic renames, sidecar before the .so). only=True: the DO8-ONLY
+    .so (-DL11DO8_ONLY=1, its own cache key, file name and gate on the EM = 2 instantiation)."""
+    source = source or _source()
+    name = _LIB_NAME_ONLY if only else _LIB_NAME
+    mangle = _ONLY_MANGLE if only else _PROD_MANGLE
+    so = _cache_dir(source, only) / name
+    meta = so.with_name(name + ".resources.json")
+    if so.is_file() and meta.is_file():
+        summary = json.loads(meta.read_text())
+        check_resources(summary["kernels_raw"], mangle)
+        return so, summary
+    so.parent.mkdir(parents=True, exist_ok=True)
+    tag = f"tmp-{socket.gethostname()}-{os.getpid()}-{threading.get_ident()}"
+    tmp = so.parent / f"{tag}-{name}"
+    tmp_meta = so.parent / f"{tag}-{name}.resources.json"
+    work = so.parent / f"{tag}-build"
+    src = source.read_bytes()
+    cmd = build_command(source, tmp, only)
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_BUILD_TIMEOUT_S, cwd=str(work))
+        log = (proc.stderr or "") + (proc.stdout or "")
+        if proc.returncode != 0 or not tmp.is_file():
+            raise RuntimeError(f"hipcc rc={proc.returncode} (sched={sched()}): {log.strip()[-1200:]}")
+        kernels = l11.parse_resource_remarks(log)
+        summary = check_resources(kernels, mangle)
+        summary["kernels_raw"] = kernels
+        summary["src_sha256"] = hashlib.sha256(src).hexdigest()
+        tmp_meta.write_text(json.dumps(summary))
+        os.replace(tmp_meta, meta)
+        os.replace(tmp, so)
+    finally:
+        for t in (tmp, tmp_meta):
+            try:
+                t.unlink()
+            except FileNotFoundError:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
+    return so, summary
+
+
+def _bind(lib: ctypes.CDLL) -> None:
+    global _fn_launch, _fn_wl_build, _fn_wl_cap, _fn_plan, _fn_drain, _impl
+    abi = lib.l11do8_abi_version
+    abi.restype = ctypes.c_int
+    abi.argtypes = []
+    got = int(abi())
+    if got != _ABI_VERSION:
+        raise RuntimeError(f"l11do8_abi_version()={got}, expected {_ABI_VERSION}")
+    launch = lib.l11do8_e5_plus_launch
+    launch.restype = ctypes.c_int
+    launch.argtypes = (
+        [ctypes.c_void_p] * 4  # G8, W8, sa, sb
+        + [ctypes.c_int]  # M
+        + [ctypes.c_void_p] * 9  # X, U, MK, MEAN, RSTD, WN, BN, DX, DZ8
+        + [ctypes.c_int]  # rows_out
+        + [ctypes.c_void_p] * 5  # INVS, AMAXP, DWP, DBP, DUCS
+        + [ctypes.c_longlong]  # P
+        + [ctypes.c_float, ctypes.c_float]  # dscale, invD
+        + [ctypes.c_void_p] * 2  # WL, CNT
+        + [ctypes.c_longlong]  # cap
+        + [ctypes.c_void_p] * 2  # DO8, E8
+        + [ctypes.c_void_p]  # stream
+    )
+    wlb = lib.l11do8_wl_build_launch
+    wlb.restype = ctypes.c_int
+    wlb.argtypes = [
+        ctypes.c_void_p,  # OFFS
+        ctypes.c_int,  # offs_i64
+        ctypes.c_int,  # B
+        ctypes.c_int,  # M
+        ctypes.c_int,  # nprog
+        ctypes.c_void_p,  # WL
+        ctypes.c_longlong,  # cap
+        ctypes.c_void_p,  # CNT
+        ctypes.c_void_p,  # stream
+    ]
+    cap = lib.l11do8_wl_cap
+    cap.restype = ctypes.c_longlong
+    cap.argtypes = [ctypes.c_longlong, ctypes.c_longlong]
+    plan_ = lib.l11do8_plan
+    plan_.restype = ctypes.c_int
+    plan_.argtypes = [ctypes.c_longlong, ctypes.c_void_p]
+    drain = lib.l11do8_drain_last_error
+    drain.restype = ctypes.c_int
+    drain.argtypes = []
+    tag = lib.l11do8_impl
+    tag.restype = ctypes.c_char_p
+    tag.argtypes = []
+    _impl = (tag() or b"").decode()
+    _fn_launch, _fn_wl_build, _fn_wl_cap, _fn_plan, _fn_drain = launch, wlb, cap, plan_, drain
+
+
+def _load() -> None:
+    global _lib, _lib_path, _build_secs
+    if _lib is not None:
+        return
+    with _lock:
+        if _lib is not None:
+            return
+        t0 = time.perf_counter()
+        so, summary = build()
+        lib = ctypes.CDLL(str(so))
+        _bind(lib)
+        if _mask_format_of(_impl) != "int8":  # NIB v2: the 'plus' .so always reads the int8 keep mask
+            raise RuntimeError(f"'plus' .so reads keep mask format {_mask_format_of(_impl)}; the 'plus' build is "
+                               f"always int8 (impl {_impl[:200]!r})")
+        _resources.clear()
+        _resources.update({k: v for k, v in summary.items() if k != "kernels_raw"})
+        _build_secs = time.perf_counter() - t0
+        _lib_path = so
+        _lib = lib
+
+
+def _load_only() -> None:
+    """DO8-ONLY: build (or reuse) + gate + load the 'only' .so and bind l11do8_e5_only_launch, whose C signature is
+    l11do8_e5_plus_launch's (same argtypes, copied from the bound 'plus' entry: _load() runs first). The work list,
+    plan and drain stay the 'plus' .so's. Raises on any failure (the caller latches 'only' only). NIB v2: the .so must
+    read the keep-mask format its build flags requested (nib_build_requested(): "nib", else "int8"); a mismatch raises
+    (prebuild_only's NIB fallback then rebuilds 'only' as int8)."""
+    global _only_lib, _only_lib_path, _fn_launch_only, _impl_only
+    if _only_lib is not None:
+        return
+    _load()
+    with _lock:
+        if _only_lib is not None:
+            return
+        assert _fn_launch is not None
+        want = "nib" if nib_build_requested() else "int8"  # NIB v2: the format the 'only' build flags select
+        so, summary = build(only=True)
+        lib = ctypes.CDLL(str(so))
+        abi = lib.l11do8_abi_version
+        abi.restype = ctypes.c_int
+        abi.argtypes = []
+        got = int(abi())
+        if got != _ABI_VERSION:
+            raise RuntimeError(f"'only' .so: l11do8_abi_version()={got}, expected {_ABI_VERSION}")
+        launch = lib.l11do8_e5_only_launch
+        launch.restype = ctypes.c_int
+        launch.argtypes = list(_fn_launch.argtypes)
+        tag = lib.l11do8_impl
+        tag.restype = ctypes.c_char_p
+        tag.argtypes = []
+        impl_ = (tag() or b"").decode()
+        if "EM 2 only" not in impl_:
+            raise RuntimeError(f"'only' .so impl {impl_[:200]!r} is not the EM 2 build")
+        if _mask_format_of(impl_) != want:  # NIB v2: only_mask_format() must be what the build requested
+            raise RuntimeError(f"'only' .so reads keep mask format {_mask_format_of(impl_)}, the build requested "
+                               f"{want} (impl {impl_[:200]!r})")
+        _only_resources.clear()
+        _only_resources.update({k: v for k, v in summary.items() if k != "kernels_raw"})
+        _impl_only = impl_
+        _fn_launch_only = launch
+        _only_lib_path = so
+        _only_lib = lib
+
+
+def wl_cap(m: int, b: int) -> int:
+    """List capacity (entries) for m rows and b sequences, from the .so (cdiv(m, 64) + b + 2)."""
+    assert _fn_wl_cap is not None
+    cap = int(_fn_wl_cap(int(m), int(b)))
+    if cap <= 0:
+        raise RuntimeError(f"l11do8_wl_cap(M={m}, B={b}) = {cap}")
+    return cap
+
+
+def plan(cap: int) -> Tuple[int, int, int, int]:
+    """(G, fl, nf, P) for a list of at most cap tiles, from the .so."""
+    got = _plan_cache.get(cap)
+    if got is not None:
+        return got
+    assert _fn_plan is not None
+    out = (ctypes.c_longlong * 4)()
+    rc = int(_fn_plan(int(cap), ctypes.addressof(out)))
+    if rc != 0:
+        raise RuntimeError(f"l11do8_plan(cap={cap}) rc={rc}")
+    got = (int(out[0]), int(out[1]), int(out[2]), int(out[3]))
+    if len(_plan_cache) < 4096:
+        _plan_cache[cap] = got
+    return got
+
+
+# ---------------------------------------------------------------------------- decide before emission
+def _offsets_ok(offs: Any, device: torch.device) -> Optional[str]:
+    if not isinstance(offs, torch.Tensor):
+        return "seq_offsets not a tensor"
+    if offs.dim() != 1 or offs.dtype not in (torch.int32, torch.int64) or not offs.is_contiguous():
+        return f"seq_offsets {offs.dtype} {tuple(offs.shape)} contiguous={offs.is_contiguous()}"
+    if offs.device != device:
+        return f"seq_offsets on {offs.device}, d(attn) on {device}"
+    if not (1 <= offs.numel() <= B_MAX + 1):
+        return f"seq_offsets B={offs.numel() - 1} outside [0, {B_MAX}]"
+    if offs.data_ptr() % offs.element_size() != 0:
+        return "seq_offsets misaligned"
+    return None
+
+
+def emission_site(ctx: Any, attn: torch.Tensor) -> Any:
+    """DECIDE BEFORE EMISSION (host metadata only: no sync, no allocation, no launch), called by the seam right before
+    L11's e5m2-du launch. Returns the dO8 site to emit for, or None (L11's own launch runs; nothing is published)."""
+    if not requested():
+        return None
+    site = getattr(ctx, "do8_site", None)
+    if site is None:
+        # no site: the attention backward does not plan the C8 do_blk quantization for this call (or the consumer
+        # knob was off at the forward) -- an expected state, not counted as a call
+        return None
+    _COUNTS["calls"] += 1
+    if _broken is not None:
+        note_decline(f"latched off: {_broken}", quiet=True)
+        return None
+    if not _prebuilt:
+        note_decline("D11 not prebuilt before RUN_START (no build/self-check inside the timed run)")
+        return None
+    if not (l11.enabled() and l11.prebuilt()):
+        note_decline("L11 item (39) not enabled/prebuilt", quiet=True)
+        return None
+    reg = registry()
+    if reg is None:
+        note_decline("no hstu_do8_registry", quiet=True)
+        return None
+    if not reg.take_enabled():
+        note_decline("consumer knob DLRM_HSTU_FP8_BWD_DO8 off")
+        return None
+    m = int(attn.shape[0])
+    if int(site.T) != m or (int(site.H), int(site.D)) != (H, HD) or int(attn.shape[-1]) != H * HD:
+        note_decline(f"site T={site.T} H={site.H} D={site.D} vs d(attn) [{m}, {int(attn.shape[-1])}] (kernel: H=4, D=128)")
+        return None
+    if site.device != attn.device:
+        note_decline(f"site device {site.device} vs d(attn) {attn.device}")
+        return None
+    why = _offsets_ok(site.seq_offsets, attn.device)
+    if why is not None:
+        note_decline(why)
+        return None
+    return site
+
+
+# ---------------------------------------------------------------------------- device work list
+def work_list(offs: torch.Tensor, m: int, n: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """(WL int32 [cap, 2], CNT int32 [2], cap) of the sequence-aligned 64-token tile list for m rows, built on the
+    current stream by l11_do8_wl_build from `offs` (the attention's own seq_offsets tensor), or reused: one entry,
+    keyed on the offs OBJECT (weakref identity: a freed and re-allocated offsets tensor never matches) and its
+    data_ptr, _version, numel, dtype, device, m and the stream. Both ordinary layers pass the same x_offsets object,
+    so the list is built once per step."""
+    assert _fn_wl_build is not None
+    stream = torch.cuda.current_stream(device)
+    key = (offs.data_ptr(), offs._version, int(offs.numel()), str(offs.dtype), str(offs.device), int(m),
+           int(stream.cuda_stream))
+    ref = _WL_MEMO.get("ref")
+    if ref is not None and ref() is offs and _WL_MEMO.get("key") == key:
+        _COUNTS["wl_reused"] += 1
+        return _WL_MEMO["wl"], _WL_MEMO["cnt"], int(_WL_MEMO["cap"])
+    b = int(offs.numel()) - 1
+    cap = wl_cap(m, b)
+    wl = torch.empty((cap, 2), dtype=torch.int32, device=device)
+    cnt = torch.empty((2,), dtype=torch.int32, device=device)
+    nprog = max(1, min(128, (int(n) + 63) // 64))  # x4c19's grid (cdiv(N, 64)); longer sequences: grid-stride
+    rc = int(
+        _fn_wl_build(
+            offs.data_ptr(), int(offs.dtype == torch.int64), b, int(m), nprog, wl.data_ptr(), cap, cnt.data_ptr(),
+            stream.cuda_stream,
+        )
+    )
+    if rc > 0:
+        raise RuntimeError(f"l11do8_wl_build_launch rc={rc} (hipError) M={m} B={b}")
+    _WL_MEMO.clear()
+    _WL_MEMO.update(ref=weakref.ref(offs), key=key, wl=wl, cnt=cnt, cap=cap)
+    _COUNTS["wl_built"] += 1
+    return wl, cnt, cap
+
+
+# ---------------------------------------------------------------------------- launch / run
+def launch_e5_plus(
+    g8: torch.Tensor,
+    w8: torch.Tensor,
+    sa: torch.Tensor,
+    sb: torch.Tensor,
+    attn: torch.Tensor,
+    u: torch.Tensor,
+    random_mask: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    dropout_ratio: float,
+    inv_scale: torch.Tensor,
+    dz8: torch.Tensor,
+    wl: torch.Tensor,
+    cnt: torch.Tensor,
+    cap: int,
+    do8: torch.Tensor,
+    e8: torch.Tensor,
+    only: bool = False,
+    dx: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """One DO8 launch on the current stream into the caller's dz8 / do8 / e8 (raw: tests and the self-check keep the
+    partials). Returns (dx, DWP, DBP, DUCS, AMAXP, P); raises on a launch error (rc > 0). `run_e5_plus` is the
+    production entry. DO8-ONLY: only=True launches the EM = 2 instantiation of the 'only' .so (same outputs, dx NOT
+    written: the returned dx is the untouched placeholder); dx = a caller buffer of attn's shape / dtype (the 'only'
+    self-check prefills a sentinel), else a fresh torch.empty_like(attn) in both modes."""
+    _load()
+    if only:
+        _load_only()
+    fn = _fn_launch_only if only else _fn_launch
+    assert fn is not None and _fn_drain is not None
+    m = int(attn.shape[0])
+    if dx is not None and not (dx.dtype == attn.dtype and tuple(dx.shape) == tuple(attn.shape) and dx.is_contiguous()
+                               and l11._a16(dx) and dx.device == attn.device):
+        raise RuntimeError(f"dx layout {dx.dtype} {tuple(dx.shape)} {dx.stride()} (attn {tuple(attn.shape)})")
+    rows_out = int(dz8.shape[0])
+    if not (dz8.dtype == torch.float8_e5m2 and dz8.dim() == 2 and int(dz8.shape[1]) == l11.DU_ROW
+            and dz8.stride() == (l11.DU_ROW, 1) and l11._a16(dz8) and m <= rows_out < m + l11.E5_MAX_PAD):
+        raise RuntimeError(f"dz8 layout {dz8.dtype} {tuple(dz8.shape)} {dz8.stride()} (M={m})")
+    if not (do8.dtype == torch.float8_e4m3fn and tuple(do8.shape) == (m, l11.D) and do8.is_contiguous()
+            and l11._a16(do8)):
+        raise RuntimeError(f"do8 layout {do8.dtype} {tuple(do8.shape)} {do8.stride()} (M={m})")
+    if not (e8.dtype == torch.uint8 and tuple(e8.shape) == (m, H) and e8.is_contiguous() and l11._a16(e8)):
+        raise RuntimeError(f"e8 layout {e8.dtype} {tuple(e8.shape)} {e8.stride()} (M={m})")
+    if not (wl.dtype == torch.int32 and tuple(wl.shape) == (cap, 2) and wl.is_contiguous()
+            and cnt.dtype == torch.int32 and cnt.numel() == 2 and cnt.is_contiguous()):
+        raise RuntimeError(f"work list layout {tuple(wl.shape)} {wl.dtype} / {tuple(cnt.shape)} {cnt.dtype}")
+    # NIB (r16 iter54): the keep mask must be the format of the .so this launch uses (raw entry: raise; the production
+    # run_e5_plus routes a NIB mask only to the NIB 'only' .so and declines any mismatch first, so this never latches)
+    mm = _mask_mismatch(random_mask, m, _mask_format_of(_impl_only if only else _impl))
+    if mm is not None:
+        raise RuntimeError(f"mask format: {mm} (M={m})")
+    G, fl, nf, P = plan(cap)
+    device = attn.device
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    with torch.cuda.device(index):
+        stale = int(_fn_drain())
+        if stale != 0:
+            _print_once(f"stale:{stale}", f"{FAMILY}: stale HIP error {stale} drained before the launch (not ours)")
+        stream = torch.cuda.current_stream(device).cuda_stream
+        if dx is None:
+            dx = torch.empty_like(attn)  # 'plus': the bf16 d(attn); 'only': the placeholder (not written)
+        dwp = torch.empty((P, l11.D), dtype=torch.float32, device=device)
+        dbp = torch.empty((P, l11.D), dtype=torch.float32, device=device)
+        ducs = torch.empty((P, l11.D), dtype=torch.float32, device=device)
+        amaxp = torch.empty((G * 8,), dtype=torch.float32, device=device)
+        rc = int(
+            fn(
+                g8.data_ptr(), w8.data_ptr(), sa.data_ptr(), sb.data_ptr(), m,
+                attn.data_ptr(), u.data_ptr(), random_mask.data_ptr(), mean.data_ptr(), rstd.data_ptr(),
+                norm_weight.data_ptr(), norm_bias.data_ptr(), dx.data_ptr(), dz8.data_ptr(), rows_out,
+                inv_scale.data_ptr(), amaxp.data_ptr(), dwp.data_ptr(), dbp.data_ptr(), ducs.data_ptr(), int(P),
+                l11.dropout_scale(dropout_ratio), 1.0 / l11.D, wl.data_ptr(), cnt.data_ptr(), int(cap),
+                do8.data_ptr(), e8.data_ptr(), stream,
+            )
+        )
+    if rc > 0:
+        msg = f"l11do8_e5_{'only' if only else 'plus'}_launch rc={rc} (hipError) M={m}"
+        raise OnlyLaunchError(msg) if only else RuntimeError(msg)  # N1: only the EM = 2 kernel's own rc latches 'only'
+    if rc < 0:
+        _print_once(f"stale:{-rc}", f"{FAMILY}: stale HIP error {-rc} drained at the launch (not ours; result used)")
+    return dx, dwp, dbp, ducs, amaxp, P
+
+
+def run_e5_plus(
+    g8: torch.Tensor,
+    w8: torch.Tensor,
+    sa: torch.Tensor,
+    sb: torch.Tensor,
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    BLOCK_D: int,
+    num_warps: int,
+    dropout_ratio: float,
+    silu_u: bool,
+    random_mask: torch.Tensor,
+    du_row_width: int,
+    site_key: int,
+    inv_scale: torch.Tensor,
+    cast_scale: torch.Tensor,
+    generation: Optional[Tuple[object, int]],
+    site: Any,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor]]:
+    """PRODUCTION: l11_outproj_lnmd.run_e5's exact contract and return (dx, placeholder du, dweight, dbias,
+    DuE5m2Emit) -- the same checks (l11._operands_ok, l11.e5_decline_reason), the same dz8 / record construction --
+    plus (dO8 [M, 512] e4m3fn, E8 [M, 4] uint8) for `site` (from emission_site). None = declined (its own line) or
+    failed (DO8 latched, DISABLED line): the caller then runs L11's own run_e5 on the SAME operands, which writes only
+    fresh buffers too, so nothing of this attempt is visible.
+    DO8-ONLY: after every decline check and the dz8 / dO8 / E8 allocations, `_plan_only` asks registry.plan(site, x)
+    (x = the attn the forward received); the placeholder / partials allocations and launch_e5_plus's checks (layouts,
+    plan(cap), the drain) follow it and are covered by cancel. "only" -> the EM = 2 launch, and dx is the untouched
+    placeholder (poisoned on request) that publish() then hands over with bf16_written=False. A failure after an "only"
+    plan (or with a plan left open on the site) cancels it (registry.cancel) before returning None (L11's own run_e5
+    then writes the bf16 d(attn)). Only the EM = 2 kernel's own failure (rc > 0: OnlyLaunchError) latches 'only' alone;
+    any other failure of the call can happen to a 'plus' call too and latches DO8, as there (r15 review N1).
+    NIB v2 (module docstring, ROUTING): a NIB keep mask runs only as 'only' on the NIB 'only' .so (else a counted
+    "E5 mask format" decline, never a latch); an int8 mask while the loaded 'only' .so reads NIB runs 'plus' without
+    _plan_only (counted mask_int8_plus); any other mask: exactly the path without NIB."""
+    if not (enabled() and _prebuilt and l11.enabled() and l11.prebuilt()):
+        return None
+    m = int(x.shape[0])
+    why = l11._operands_ok(g8, w8, sa, sb, m)
+    only = launched = False
+    try:
+        from generative_recommenders.ops.triton import bwd_fp8, hstu_du_e5m2
+
+        grad_dtype, limit = bwd_fp8.grad_dtype_and_limit()
+        pad = int(bwd_fp8.uvqk_tm_pad())
+        if why is None:
+            why = l11.e5_decline_reason(x, u, BLOCK_D, num_warps, silu_u, du_row_width, grad_dtype, limit, pad,
+                                        inv_scale)
+        if why is not None:
+            note_decline("E5 " + why, quiet=True)  # L11's own run_e5 runs the same checks and prints its line
+            return None
+        # NIB v2 (r16 iter54; iter53 VERIFY B1: never a latch on a format question). Only the NIB 'only' .so reads a
+        # NIB uint8 [M, 256] mask; the 'plus' .so (and an int8 'only' .so) reads the int8 [M, 512] one. A mask the .so
+        # this call may launch cannot read is a counted DECLINE here, before the work list and every allocation --
+        # never launch_e5_plus's raise, which the except below would turn into a DO8 latch. L11's own run_e5 then
+        # serves the call (it unpacks a NIB mask exactly: lnmd_mask_nib.as_int8). See _mask_decline.
+        mask_nib = lnmd_mask_nib.is_nib(random_mask)
+        only_nib = only_mask_format() == "nib"
+        mm = _mask_decline(random_mask, m, mask_nib, only_nib)
+        if mm is not None:
+            note_decline(f"{_MASK_DECLINE}: {mm}")
+            return None
+        if _lib is None:
+            raise RuntimeError("library not loaded (no prebuild)")
+        wl, cnt, cap = work_list(site.seq_offsets, m, int(site.N), x.device)
+        rows_out = (m + pad - 1) // pad * pad
+        dz8 = torch.empty((rows_out, du_row_width), dtype=grad_dtype, device=x.device)
+        do8 = torch.empty((m, l11.D), dtype=torch.float8_e4m3fn, device=x.device)
+        e8 = torch.empty((m, H), dtype=torch.uint8, device=x.device)
+        if only_nib and not mask_nib:
+            # NIB v2: an int8 mask while the loaded 'only' .so reads NIB -> DO8 'plus' (the int8 .so; only stays False)
+            # without asking the registry (it could answer "only"); counted, one line per process. Review N1: drop a
+            # stale 'only' call entry (a call that raised before its publish) as _plan_only does at every DO8-ONLY call
+            if only_requested():
+                _ONLY_CALL.clear()
+            _note_int8_plus(m)
+        else:
+            only = _plan_only(site, x)  # DO8-ONLY: contract v2 plan(); False with its knob off (N1: cancel covers ...)
+            if mask_nib and not only:
+                # NIB v2: the registry answered "plus" (or the 'only' fallback): no 'only' plan is open, and the 'plus'
+                # .so reads int8 -> the same counted DECLINE (nothing to cancel); L11's own run_e5 serves the call
+                _NIB_COUNTS["nib_plus"] += 1
+                note_decline(f"{_MASK_DECLINE}: keep mask NIB on a call DO8-ONLY runs as 'plus' (dO8 registry plan "
+                             "'plus' or the 'only' fallback); only the 'only' .so reads NIB")
+                return None
+        dx, dwp, dbp, ducs, amaxp, P = launch_e5_plus(
+            g8, w8, sa, sb, x, u, random_mask, mean, rstd, weight, bias, dropout_ratio, inv_scale, dz8, wl, cnt, cap,
+            do8, e8, only=only,
+        )
+        launched = True
+        if only and _registry_mod.poison_requested():
+            dx.view(torch.int16).fill_(_POISON_BF16)  # contract v2 evidence knob: any hidden reader sees NaN
+        dweight = torch.empty((l11.D,), dtype=weight.dtype, device=x.device)
+        dbias = torch.empty((l11.D,), dtype=weight.dtype, device=x.device)
+        l11.dwdb_finalize(dwp, dbp, dweight, dbias, P)
+        du = hstu_du_e5m2.placeholder_du(u, m, l11.D)
+        emit = hstu_du_e5m2.DuE5m2Emit(
+            dz8=dz8,
+            u_cols=(0, l11.D),
+            u_amax=amaxp.amax(),
+            u_colsum=ducs.sum(dim=0),
+            inv_scale=inv_scale,
+            cast_scale=cast_scale,
+            rows=m,
+            width=du_row_width,
+            site_key=site_key,
+            generation=generation,
+            buffer_ptr=0,  # no d(uvqk) buffer handed over (placeholder du), as B1a and run_e5
+        )
+    except Exception as error:  # noqa: BLE001 -- latch DO8 (or 'only' only); the caller runs L11's own launch
+        if only or getattr(site, "only_plan", None) is not None:
+            # DO8-ONLY: this call will not publish 'only' (L11's own run_e5 writes the bf16 d(attn)): close the plan,
+            # also one left open on the site by a raise inside _plan_only after registry.plan answered "only" (N1)
+            _cancel_only(site)
+        if only and isinstance(error, OnlyLaunchError):
+            # the EM = 2 kernel launch itself failed (rc > 0): latch 'only' only; DO8 'plus' keeps running
+            _disable_only(f"e5 only launch: {type(error).__name__}: {str(error)[:600]}")
+            return None
+        if only:
+            # r15 review N1: launch_e5_plus's checks, plan(cap), the drain, the placeholder / partials allocations
+            # (incl. OOM) or the host work after the launch: failures a 'plus' call can have too -> latch DO8, as 'plus'
+            stage = "after" if launched else "before"
+            _disable(f"e5 only call ({stage} the EM = 2 launch): {type(error).__name__}: {str(error)[:600]}")
+            return None
+        _disable(f"e5 plus: {type(error).__name__}: {str(error)[:600]}")
+        return None
+    _count("emitted")
+    if only:
+        _ONLY_CALL.update(site=site, dx=weakref.ref(dx))  # publish() hands this placeholder over as 'only'
+        setattr(dx, _ONLY_PLACEHOLDER_ATTR, site)  # review_do8only P1: publish() never sends it out as 'plus'
+        _only_event("only_launched")
+    if not l11._active_e5_logged:
+        # Item (39)'s own e5 ACTIVE line (its census marker), once per process, printed here because this call ran
+        # L11's e5m2-du mode through the DO8 kernel (l11.run_e5, which prints it, did not run). Same text as
+        # l11_outproj_lnmd.run_e5 plus a DO8 tail; impl= names the kernel that ran (DO8's own impl, "+vd(...)" only
+        # for the DO8-VD build: r16 iter39 PLAN C4), not L11's .so. DO8-ONLY: an 'only' first call adds its build.
+        l11._active_e5_logged = True
+        only_tail = f"; item {ITEM_ONLY}: EM 2 build, no bf16 d(attn) store, impl={_impl_only}" if only else ""
+        arm_print_all_ranks(
+            f"armed OK: {l11.FAMILY} ACTIVE mode=e5 (B1a contract) ({l11.KNOB}, item (39), with item (38)(a) "
+            f"DLRM_HSTU_FP8_BWD_DU_E5M2): one {l11.KERNEL_NAME} E5 launch replaces hipBLASLt F8B8BS NTB0 out-proj "
+            f"dgrad + _ln_mul_dropout_bwd_dx_du_rng_v3 (B1a EMIT: e5m2 u block + pad rows of dz8, amax/colsum "
+            f"partials; no bf16 du, dy never in HBM); impl={_impl} M={m} Mp={int(dz8.shape[0])} P={P} "
+            f"device={x.device}; launched as {KERNEL_NAME} (item {ITEM}, + dO8/E8{only_tail})"
+        )
+    return dx, du, dweight, dbias, emit, do8, e8
+
+
+def _plan_only(site: Any, attn: torch.Tensor) -> bool:
+    """DO8-ONLY, contract v2 rule (1): True = this call runs the EM = 2 launch and publishes 'only'. Host only, after
+    every decline check and the dz8 / dO8 / E8 allocations; the placeholder / partials allocations and launch_e5_plus's
+    checks follow it and are covered by cancel (r15 review N1). Knob unset / "0" / other: False without touching the
+    registry or any state (B3 + v2.1 exactly).
+    Knob on: 'plus' without asking when the 'only' .so is not prebuilt / latched (counted fallback); else
+    registry.plan(site, attn) ("plus" reasons are counted and printed by the registry: plan_plus here)."""
+    if not only_requested():
+        return False
+    _ONLY_CALL.clear()  # a stale entry of a call that never published (it raised) is not this call's
+    reg = registry()
+    if reg is None or not (_only_prebuilt and _only_broken is None):
+        _only_event("fallback")
+        return False
+    if reg.plan(site, attn) != "only":  # never raises
+        _only_event("plan_plus")
+        return False
+    _only_event("planned")
+    return True
+
+
+def _cancel_only(site: Any) -> None:
+    """Contract v2 rule (4): an "only" plan whose 'only' call did not complete (L11's own launch rewrites the call,
+    bf16 d(attn) included): close it, so the attention backward binds as for any call without a record."""
+    _ONLY_CALL.clear()
+    reg = registry()
+    if reg is not None and reg.cancel(site):
+        _only_event("cancelled")
+
+
+def publish(site: Any, dattn: torch.Tensor, do8: torch.Tensor, e8: torch.Tensor) -> bool:
+    """BACKWARD, after the LAST write to dattn (the exact tensor returned as d(attn)), on the current stream: hand the
+    record to R15's registry ('plus': bf16_written=True). True = published. A refusal is counted (the consumer then
+    quantizes the bf16 d(attn): dO8/E8 exact) and never raises. A refused (or publish-latched) call is not
+    bit-identical to (DO8) off: DO8's launch already ran, so its dW/dB/u-colsum keep DO8's tile-walk fp32 order
+    (the declared (39) summation-order class); d(attn), dz8 and amax are bitwise.
+    DO8-ONLY: when this site's call ran the EM = 2 launch (run_e5_plus), the record goes out as 'only' instead
+    (_publish_only: bf16_written=False, every error re-raised)."""
+    reg = registry()
+    if reg is None or site is None:
+        return False
+    if _ONLY_CALL and _ONLY_CALL.get("site") is site:
+        return _publish_only(reg, site, dattn, do8, e8)
+    if getattr(dattn, _ONLY_PLACEHOLDER_ATTR, None) is not None:
+        # review_do8only P1: an EM = 2 placeholder whose call is no longer the in-flight 'only' call (another DO8 call
+        # planned between its launch and this publish). Fail closed: its bf16 values were never written, so a 'plus'
+        # record (bf16_written=True) would let an M-E1 re-run or a debug reader quantize garbage. The raise aborts the
+        # backward before the attention backward runs; were it swallowed, the still-open plan would make bind raise.
+        raise RuntimeError(
+            f"{FAMILY_ONLY}: publish got an EM = 2 placeholder that is not the in-flight 'only' call's; its bf16 values "
+            "were never written, so it cannot be published as 'plus' (contract v2)"
+        )
+    try:
+        rec = reg.publish(site, dattn, do8, e8, producer="L11", bf16_written=True)
+    except Exception as error:  # noqa: BLE001 -- the registry never raises for 'plus'; be fail-safe anyway
+        _disable(f"publish: {type(error).__name__}: {str(error)[:300]}")
+        return False
+    if rec is None:
+        _count("refused")
+        _print_once(
+            "refused",
+            f"{FAMILY} NOT armed: hstu_do8_registry.publish refused a record (its refused{{...}} counter names the "
+            "check) -> the C8 attention backward quantizes the bf16 d(attn)",
+        )
+        return False
+    _count("published")
+    global _active_logged
+    if not _active_logged:
+        _active_logged = True
+        G, _, _, P = plan(int(_WL_MEMO.get("cap", 0))) if _WL_MEMO.get("cap") else (0, 0, 0, 0)
+        arm_print_all_ranks(
+            f"armed OK: {FAMILY} ACTIVE mode=e5 plus ({KNOB}, item {ITEM}, with items (39) and (38)(a) and R15's "
+            f"hstu_do8_registry): one {KERNEL_NAME} launch replaces l11_outproj_lnmd_bwd (E5) and also emits the C8 "
+            f"attention backward's e4m3 dO + E8 (quantize_do_e4m3_blk skipped when taken; bf16 d(attn) still "
+            f"written); impl={_impl} M={int(dattn.shape[0])} cap={_WL_MEMO.get('cap')} G={G} P={P} "
+            f"device={dattn.device}"
+        )
+    return True
+
+
+def _publish_only(reg: Any, site: Any, dattn: torch.Tensor, do8: torch.Tensor, e8: torch.Tensor) -> bool:
+    """DO8-ONLY, contract v2 rules (2) and (5): after the LAST write (the EM = 2 launch emitted dO8/E8; nothing writes
+    the placeholder), publish(..., bf16_written=False). Never swallowed: the bf16 d(attn) does not exist, so a failed
+    'only' publish has no exact fallback; the registry's ValueError / Do8OnlyError (and a d(attn) that is not this
+    call's placeholder) propagate out of the backward, which aborts before the attention backward runs (were one
+    swallowed, the still-open plan would make bind raise)."""
+    ref = _ONLY_CALL.get("dx")
+    _ONLY_CALL.clear()
+    if ref is None or ref() is not dattn:
+        raise RuntimeError(
+            f"{FAMILY_ONLY}: publish got a d(attn) that is not the placeholder of this site's EM = 2 launch; its bf16 "
+            "values were never written, so it cannot be published as 'plus' (contract v2)"
+        )
+    reg.publish(site, dattn, do8, e8, producer="L11", bf16_written=False)
+    _count("published")
+    _only_event("published")
+    global _only_logged
+    if not _only_logged:
+        _only_logged = True
+        G, _, _, P = plan(int(_WL_MEMO.get("cap", 0))) if _WL_MEMO.get("cap") else (0, 0, 0, 0)
+        arm_print_all_ranks(
+            f"armed OK: {FAMILY_ONLY} ACTIVE mode=e5 only ({ONLY_KNOB}, item {ITEM_ONLY}, with item {ITEM} and R15's "
+            f"hstu_do8_registry contract v2): one {KERNEL_NAME} EM=2 launch emits the C8 attention backward's e4m3 "
+            f"dO + E8 and SKIPS the bf16 d(attn) store (autograd receives a placeholder; poison="
+            f"{int(bool(reg.poison_requested()))}); impl={_impl_only} M={int(dattn.shape[0])} cap={_WL_MEMO.get('cap')} "
+            f"G={G} P={P} device={dattn.device}"
+        )
+        arm_print_all_ranks(only_summary_line())
+    return True
+
+
+# ---------------------------------------------------------------------------- self-check / prebuild
+_SELF_CHECK_SEED = 20261010
+# Sequence lengths of the self-check (cycled to >= 32,768 rows): every in-tile group boundary (1, 7, 8, 9, 15, 16, 17,
+# 63, 64, 65), multi-tile sequences, a zero-length sequence, and lengths beyond one tile row of a WG.
+_SELF_CHECK_LENS = (1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127, 128, 0, 200, 640, 1000, 4096, 2288, 333)
+
+
+def self_check() -> Tuple[bool, str]:
+    """DO8 vs L11's own E5 launch and the stock quantizer, on seeded SYNTHETIC tensors (a private generator: no
+    training data, no global RNG draw, no FP8 scale state, no registry). Gates: the work list (count, status, entries
+    vs a host list); DO8's dx, dz8 u block + pad rows, guard columns (prefilled), amax bitwise vs L11's launch_e5 on
+    the same operands; dO8 / E8 (prefilled) bitwise vs quantize_do_e4m3_blk(L11's dx) on every row; u colsum, dW, dB
+    relL2 vs L11's <= 1e-5 (declared fp32 order); all-zero token groups included (E8 127); finite data (as L11's own
+    self-check: a NaN row would make every dW/dB column NaN and the relL2 gates vacuous -- the NaN / Inf / saturation /
+    subnormal matrix runs in the lab gate, staged/lab)."""
+    from generative_recommenders.ops.flydsl.hstu_do_fp8 import quantize_do_e4m3_blk
+    from generative_recommenders.ops.triton import bwd_fp8
+    from generative_recommenders.ops.triton import triton_hstu_linear as thl
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    lens: List[int] = []
+    while sum(lens) < 32768:
+        lens.extend(_SELF_CHECK_LENS)
+    M, Dm, p = sum(lens), l11.D, 0.1
+    offs_h = [0]
+    for n_ in lens:
+        offs_h.append(offs_h[-1] + n_)
+    offs = torch.tensor(offs_h, dtype=torch.int64, device=dev)
+    N = max(lens)
+    g = torch.Generator(device=dev)
+    g.manual_seed(_SELF_CHECK_SEED)
+    g8f = torch.randn((M, Dm), generator=g, device=dev) * 1024.0
+    # zero groups: sequence 5's first 8 rows (G8 zero -> dy zero -> d(attn) zero rows -> e = 0, E8 127)
+    s5 = offs_h[5]
+    g8f[s5:s5 + min(8, lens[5])] = 0.0
+    g8 = g8f.clamp_(-57344.0, 57344.0).to(torch.float8_e5m2)
+    del g8f
+    w8 = (torch.randn((l11.NOUT, Dm), generator=g, device=dev) * 90.0).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    sa = torch.full((1,), 2.0**-19, dtype=torch.float32, device=dev)
+    sb = torch.full((1,), 0.0613 / 448.0, dtype=torch.float32, device=dev)
+    x = (torch.randn((M, Dm), generator=g, device=dev) * 0.5).to(torch.bfloat16)
+    u = torch.randn((M, Dm), generator=g, device=dev).to(torch.bfloat16)
+    wn = (1.0 + 0.05 * torch.randn((Dm,), generator=g, device=dev)).to(torch.bfloat16)
+    bn = (0.05 * torch.randn((Dm,), generator=g, device=dev)).to(torch.bfloat16)
+    xf = x.float()
+    mean = xf.mean(dim=1)
+    rstd = torch.rsqrt(xf.var(dim=1, unbiased=False) + 1e-6)
+    del xf
+    mask = thl._create_dropout_mask(
+        N=M, D=Dm, BLOCK_D=Dm, concat_u=True, concat_x=True, dropout_ratio=p, seed=_SELF_CHECK_SEED, device=dev,
+    )
+    grad_dtype, limit = bwd_fp8.grad_dtype_and_limit()
+    pad = int(bwd_fp8.uvqk_tm_pad())
+    rows_out = (M + pad - 1) // pad * pad
+    inv = torch.full((1,), 0.7371 * 2.0**-3, dtype=torch.float32, device=dev)  # not a power of two: rounds
+    # L11's own E5 launch (its .so, its flags), into a prefilled dz8
+    dz8_s = torch.full((rows_out, l11.DU_ROW), 0x5A, dtype=torch.uint8, device=dev)
+    dx_s, dwp_s, dbp_s, ducs_s, amaxp_s, P_s = l11.launch_e5(
+        g8, w8, sa, sb, x, u, mask, mean, rstd, wn, bn, p, inv, dz8_s.view(grad_dtype)
+    )
+    # DO8: the device list from this offsets tensor (raw: the production memo stays untouched), prefilled outputs
+    b = len(lens)
+    cap = wl_cap(M, b)
+    wl = torch.full((cap, 2), -7, dtype=torch.int32, device=dev)
+    cnt = torch.full((2,), -7, dtype=torch.int32, device=dev)
+    assert _fn_wl_build is not None
+    rc = int(_fn_wl_build(offs.data_ptr(), 1, b, M, max(1, min(128, (N + 63) // 64)), wl.data_ptr(), cap,
+                          cnt.data_ptr(), torch.cuda.current_stream(dev).cuda_stream))
+    if rc > 0:
+        return False, f"l11do8_wl_build_launch rc={rc}"
+    dz8_d = torch.full((rows_out, l11.DU_ROW), 0x5A, dtype=torch.uint8, device=dev)
+    do8 = torch.full((M, Dm), 0x5A, dtype=torch.uint8, device=dev)
+    e8 = torch.full((M, H), 0xA5, dtype=torch.uint8, device=dev)
+    dx_d, dwp_d, dbp_d, ducs_d, amaxp_d, P_d = launch_e5_plus(
+        g8, w8, sa, sb, x, u, mask, mean, rstd, wn, bn, p, inv, dz8_d.view(grad_dtype), wl, cnt, cap,
+        do8.view(torch.float8_e4m3fn), e8,
+    )
+    q8, qe8 = quantize_do_e4m3_blk(dx_s.view(M, H, HD), offs, N)
+    dw_s = torch.empty((Dm,), dtype=wn.dtype, device=dev)
+    db_s = torch.empty((Dm,), dtype=wn.dtype, device=dev)
+    dw_d = torch.empty((Dm,), dtype=wn.dtype, device=dev)
+    db_d = torch.empty((Dm,), dtype=wn.dtype, device=dev)
+    l11.dwdb_finalize(dwp_s, dbp_s, dw_s, db_s, P_s)
+    l11.dwdb_finalize(dwp_d, dbp_d, dw_d, db_d, P_d)
+    torch.cuda.synchronize()
+
+    def nbytes(a: torch.Tensor, c: torch.Tensor) -> int:
+        a8 = a.contiguous().view(torch.uint8).reshape(-1)
+        c8 = c.contiguous().view(torch.uint8).reshape(-1)
+        if a8.numel() != c8.numel():
+            return -1
+        return int((a8 != c8).sum())
+
+    def rel(a: torch.Tensor, c: torch.Tensor) -> float:
+        a64, c64 = a.double(), c.double()
+        fin = torch.isfinite(a64) & torch.isfinite(c64)
+        return float((a64[fin] - c64[fin]).norm() / c64[fin].norm().clamp_min(1e-300))
+
+    # host reference list (sequence-major, every tile, no gaps: offs[0] == 0, offs[B] == M)
+    ref: List[Tuple[int, int]] = []
+    for i, n_ in enumerate(lens):
+        for t in range(0, n_, 64):
+            ref.append((offs_h[i] + t, min(64, n_ - t)))
+    cnt_h = cnt.tolist()
+    wl_ok = cnt_h == [len(ref), 0] and wl[: len(ref)].tolist() == [list(e) for e in ref]
+    dx_m = nbytes(dx_d, dx_s)
+    dz_m = nbytes(dz8_d[:, :Dm], dz8_s[:, :Dm])
+    guard = int((dz8_d[:, Dm:] != 0x5A).sum())
+    amax_eq = bool(torch.equal(amaxp_d.amax().reshape(1).view(torch.int32), amaxp_s.amax().reshape(1).view(torch.int32)))
+    do8_m = nbytes(do8, q8)
+    e8_m = nbytes(e8, qe8)
+    r_cs, r_dw, r_db = rel(ducs_d.sum(0), ducs_s.sum(0)), rel(dw_d, dw_s), rel(db_d, db_s)
+    e8_127 = int((qe8 == 127).sum())
+    finite = all(bool(torch.isfinite(t).all()) for t in (dx_d.float(), dw_d.float(), db_d.float(), ducs_d))
+    detail = (
+        f"M={M} B={b} cap={cap} tiles={cnt_h[0]} status={cnt_h[1]} P={P_d}: list ok {int(wl_ok)}; vs L11 E5 dx mism "
+        f"{dx_m}, dz8 u+pad mism {dz_m}, guard bytes changed {guard}, amax eq {int(amax_eq)}; vs quantize_do_e4m3_blk "
+        f"dO8 mism {do8_m}, E8 mism {e8_m} (E8=127 bytes {e8_127}); relL2 colsum {r_cs:.2e} dW {r_dw:.2e} dB "
+        f"{r_db:.2e}; finite {int(finite)}"
+    )
+    ok = (
+        wl_ok
+        and dx_m == 0
+        and dz_m == 0
+        and guard == 0
+        and amax_eq
+        and do8_m == 0
+        and e8_m == 0
+        and r_cs <= 1e-5
+        and r_dw <= 1e-5
+        and r_db <= 1e-5
+        and e8_127 > 0
+        and finite
+    )
+    return ok, detail
+
+
+def _self_check_mask(mask: torch.Tensor, fmt: str) -> Tuple[bool, torch.Tensor, bool]:
+    """NIB (r16 iter54): (nib, the mask a DO8 .so of keep-mask format `fmt` reads, round trip ok). A NIB .so gets
+    lnmd_mask_nib.pack_ref(mask) and the round trip unpack(pack_ref(mask)) == mask is checked (it also proves the
+    synthetic mask has bits 3-7 clear, the writers' invariant); an int8 .so gets `mask` itself (no extra work). NIB v2:
+    self_check_only asks it for the 'only' .so (only_mask_format()); its 'plus' reference keeps the int8 mask."""
+    if fmt != "nib":
+        return False, mask, True
+    packed = lnmd_mask_nib.pack_ref(mask)
+    return True, packed, bool(torch.equal(lnmd_mask_nib.unpack(packed), mask))
+
+
+def _self_check_mask_detail(nib: bool, nib_rt: bool) -> str:
+    """The self-check detail's NIB segment (appended; empty for an int8 .so, so its detail text is unchanged)."""
+    return f"; mask {_MASK_DESC['nib']} unpack(pack_ref) exact {int(nib_rt)}" if nib else ""
+
+
+def _nib_fall_back(why: str) -> bool:
+    """NIB (r16 iter54, review R1-F4; v2), prebuild_only only: a failure of the NIB 'only' build (hipcc, DO8's resource
+    gate, the impl-format check, self_check_only; a device fault re-raises before this is asked) does not latch
+    DO8-ONLY. True = fall back: one "<FAMILY>: LN*U*dropout keep mask NIB DISABLED" line on every rank, the NIB 'only'
+    .so state dropped, and nib_build_requested() False for the rest of the process (_nib_fallback), so the caller
+    re-runs prebuild_only(), which builds and self-checks the int8 'only' .so: DO8-ONLY stays on, DO8 'plus' (int8 in
+    v2, never NIB) is untouched, nib_ready() stays False and the NIB writers decline (N6). False = the failed build was
+    not the NIB build (or it already fell back once), or DLRM_HSTU_FP8_L11_DO8_FAIL_CLOSED=1: the caller latches (or
+    raises) exactly as before."""
+    global _nib_fallback, _only_prebuilt, _only_lib, _only_lib_path, _fn_launch_only, _impl_only
+    if _nib_fallback is not None or _fail_closed() or not nib_build_requested():
+        return False
+    _nib_fallback = why
+    _only_prebuilt = False
+    with _lock:
+        _only_lib = None
+        _only_lib_path = None
+        _fn_launch_only = None
+        _impl_only = ""
+        _only_resources.clear()
+    arm_print_all_ranks(
+        f"{FAMILY}: {lnmd_mask_nib.FAMILY} DISABLED ({lnmd_mask_nib.KNOB}): the NIB reader build failed at prebuild "
+        f"({why[:700]}) -> DO8-ONLY builds and self-checks its int8 keep-mask 'only' .so instead (DO8 'plus' reads "
+        "int8 anyway; nothing is latched); nib_ready() stays False, so the NIB writers stay off for this process"
+    )
+    return True
+
+
+def prebuild(l11_ready: bool, e5_expected: bool, self_check_fn: Optional[Callable[[], Tuple[bool, str]]] = None) -> bool:
+    """Before RUN_START (triton_fp8.prebuild_extensions -> triton_hstu_linear.prebuild_l11_do8, AFTER L11's prebuild):
+    arch check, build + load + DO8's resource gate, then the self-check. Knob off: no-op, no line. Without a prebuilt
+    L11 or without B1a's e5m2-du mode: one INERT line, nothing built. Any build / load / gate / self-check failure
+    latches DO8 off (DISABLED line; L11 untouched). A self-check exception whose text is a device fault re-raises
+    (abort before RUN_START, L11's policy). NIB v2 (r16 iter54): the 'plus' .so is always the int8 build, so a 'plus'
+    failure latches DO8 exactly as without NIB; its armed line ends " mask=int8"; a NIB 'only' build failure falls
+    back to the int8 'only' build inside prebuild_only (review R1-F4)."""
+    global _prebuilt
+    if not requested():
+        return False
+    if not l11_ready:
+        _print_once(
+            "inert-l11",
+            f"{FAMILY} INERT: needs item (39) L11 prebuilt and enabled in this process "
+            "(DLRM_HSTU_FP8_BWD_OUTPROJ_LNMD_FUSED=1, prebuild OK); nothing built",
+        )
+        return False
+    if not e5_expected:
+        _print_once(
+            "inert-e5",
+            f"{FAMILY} INERT: needs item (38)(a) B1a (DLRM_HSTU_FP8_BWD_DU_E5M2=1, not latched): DO8 exists only for "
+            "L11's e5m2-du mode; nothing built",
+        )
+        return False
+    if _broken is not None:
+        return False
+    t0 = time.perf_counter()
+    try:
+        if not torch.cuda.is_available() or torch.version.hip is None:
+            raise RuntimeError("no ROCm GPU")
+        arch = l11.device_arch(torch.cuda.current_device())
+        if arch != _ARCH:
+            raise RuntimeError(f"arch {arch or '<unknown>'} is not {_ARCH}")
+        _load()
+    except Exception as error:  # noqa: BLE001 -- build / gate / load: never a device fault, always latch DO8
+        _disable(f"prebuild build/load: {type(error).__name__}: {str(error)[:600]}")
+        return False
+    try:
+        ok, detail = (self_check_fn or self_check)()
+        torch.cuda.synchronize()
+    except Exception as error:  # noqa: BLE001
+        msg = f"{type(error).__name__}: {error}"
+        if l11._DEVICE_FAULT.search(msg):
+            arm_print_all_ranks(f"{FAMILY} prebuild DEVICE FAULT: {msg[:600]}")
+            raise
+        _disable(f"prebuild self-check: {msg[:600]}")
+        return False
+    if not ok:
+        _disable(f"prebuild self-check mismatch: {detail}")
+        return False
+    _prebuilt = True
+    so_key = _lib_path.parent.name if _lib_path is not None else "?"
+    arm_print_all_ranks(
+        f"armed OK: {FAMILY} prebuild before run_start: built+loaded+self-check OK {time.perf_counter() - t0:.1f}s "
+        f"(VGPR {_resources.get('vgpr')}, spill {_resources.get('vgpr_spill')}, scratch {_resources.get('scratch')}, "
+        f"LDS {_resources.get('lds')}, SGPR spill {_resources.get('sgpr_spill')}, sched={_resources.get('sched')}; "
+        f"so {so_key}; {detail}{_diet_tail()})"
+        f" mask={_MASK_DESC[mask_format()]}"  # NIB (r16 iter54): appended segment ("int8": NIB v2's 'plus' is int8)
+    )
+    _note_nib_inert()  # NIB: requested, but nothing in this process will read a NIB mask -> one line naming why
+    if only_requested():
+        prebuild_only()  # DO8-ONLY: its own build / gate / self-check / latch; never changes DO8's own result
+    return True
+
+
+def _note_nib_inert() -> None:
+    """NIB (r16 iter54; v2), prebuild after DO8's own armed line: the knob on (and no NIB fallback, which printed its
+    own DISABLED line) but no DO8 .so of this process will read a NIB mask -> one line naming why; nib_ready() stays
+    False and the NIB writers stay off. Knob off: nothing read, nothing printed."""
+    if not lnmd_mask_nib.requested() or _nib_fallback is not None:
+        return
+    try:
+        has_switch = _NIB_MARKER in _source().read_bytes()
+    except OSError:
+        has_switch = False
+    off = _nib_writers_off()
+    if not has_switch:
+        # the selected source has no NIB reader (the pre-diet l11_do8_novd.cu: L11-VD off, or a _SRC override without
+        # the switch): every DO8 .so reads int8, nib_ready() stays False, the writers stay off
+        _print_once(
+            "nib-inert",
+            f"{FAMILY}: {lnmd_mask_nib.FAMILY} requested ({lnmd_mask_nib.KNOB}=1) but {_source().name} has no "
+            "L11_MKB_NIB reader (needs DLRM_HSTU_FP8_L11_VD=1, ops/hip/l11_do8.cu) -> this .so reads the int8 "
+            "keep mask; nib_ready() False, the NIB writers stay off",
+        )
+    elif off is not None:
+        # review R1-F3: the NIB writers can never arm in this process, so the 'only' .so is built int8 as well
+        _print_once(
+            "nib-inert",
+            f"{FAMILY}: {lnmd_mask_nib.FAMILY} requested ({lnmd_mask_nib.KNOB}=1) but the NIB writers cannot arm "
+            f"in this process ({off}) -> this .so reads the int8 keep mask; nib_ready() False, the NIB writers "
+            "stay off",
+        )
+    elif not only_requested():
+        # NIB v2: only the DO8-ONLY 'only' .so reads NIB; with DO8-ONLY off nothing is built that could read it
+        _print_once(
+            "nib-inert",
+            f"{FAMILY}: {lnmd_mask_nib.FAMILY} requested ({lnmd_mask_nib.KNOB}=1) but DO8-ONLY is off ({ONLY_KNOB} "
+            "!= 1): only its 'only' .so reads NIB (NIB v2) -> this .so reads the int8 keep mask; nib_ready() False, "
+            "the NIB writers stay off",
+        )
+
+
+# ---------------------------------------------------------------------------- DO8-ONLY self-check / prebuild
+def self_check_only() -> Tuple[bool, str]:
+    """DO8-ONLY first-use check: the EM = 2 launch vs the EM = 1 launch on self_check's seeded SYNTHETIC inputs (same
+    recipe, seed and device list; no training data, no global RNG draw, no FP8 scale state, no registry). Both write
+    into prefilled dz8 / dO8 / E8. Gates: dO8, E8, the WHOLE dz8 (u block, pad rows, untouched guard columns), the
+    AMAXP / DWP / DBP / DUCS partials and P byte-identical; the EM = 2 d(attn) buffer, prefilled with a NaN sentinel,
+    unchanged in every byte (no DX store); EM = 1's d(attn) finite and written, its dO8 written, E8 = 127 groups
+    present. EM = 1 itself was just gated against L11's E5 launch and quantize_do_e4m3_blk by self_check on these
+    inputs, so a pass makes EM = 2's dO8 / E8 the quantizer's bytes of the d(attn) it no longer stores. NIB v2: a NIB
+    'only' .so (only_mask_format() == "nib") gets lnmd_mask_nib.pack_ref(mask), EM = 1 (the int8 'plus' .so) the int8
+    mask, every comparison above unchanged, plus the gate unpack(pack_ref(mask)) == mask (detail segment
+    "; mask nib(uint8[M,256]) unpack(pack_ref) exact 1")."""
+    from generative_recommenders.ops.triton import bwd_fp8
+    from generative_recommenders.ops.triton import triton_hstu_linear as thl
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    # ---- self_check's inputs, the same recipe and seed (keep in step with self_check)
+    lens: List[int] = []
+    while sum(lens) < 32768:
+        lens.extend(_SELF_CHECK_LENS)
+    M, Dm, p = sum(lens), l11.D, 0.1
+    offs_h = [0]
+    for n_ in lens:
+        offs_h.append(offs_h[-1] + n_)
+    offs = torch.tensor(offs_h, dtype=torch.int64, device=dev)
+    N = max(lens)
+    g = torch.Generator(device=dev)
+    g.manual_seed(_SELF_CHECK_SEED)
+    g8f = torch.randn((M, Dm), generator=g, device=dev) * 1024.0
+    s5 = offs_h[5]
+    g8f[s5:s5 + min(8, lens[5])] = 0.0
+    g8 = g8f.clamp_(-57344.0, 57344.0).to(torch.float8_e5m2)
+    del g8f
+    w8 = (torch.randn((l11.NOUT, Dm), generator=g, device=dev) * 90.0).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    sa = torch.full((1,), 2.0**-19, dtype=torch.float32, device=dev)
+    sb = torch.full((1,), 0.0613 / 448.0, dtype=torch.float32, device=dev)
+    x = (torch.randn((M, Dm), generator=g, device=dev) * 0.5).to(torch.bfloat16)
+    u = torch.randn((M, Dm), generator=g, device=dev).to(torch.bfloat16)
+    wn = (1.0 + 0.05 * torch.randn((Dm,), generator=g, device=dev)).to(torch.bfloat16)
+    bn = (0.05 * torch.randn((Dm,), generator=g, device=dev)).to(torch.bfloat16)
+    xf = x.float()
+    mean = xf.mean(dim=1)
+    rstd = torch.rsqrt(xf.var(dim=1, unbiased=False) + 1e-6)
+    del xf
+    mask = thl._create_dropout_mask(
+        N=M, D=Dm, BLOCK_D=Dm, concat_u=True, concat_x=True, dropout_ratio=p, seed=_SELF_CHECK_SEED, device=dev,
+    )
+    # NIB v2 (r16 iter54): a NIB 'only' .so reads the packed mask (exact torch reference); its EM = 1 reference (the
+    # 'plus' .so, int8) keeps the int8 mask, so every EM = 2 output is gated against the int8 path;
+    # unpack(pack_ref(mask)) == mask is gated as well
+    nib, mask_only, nib_rt = _self_check_mask(mask, only_mask_format())
+    grad_dtype, _ = bwd_fp8.grad_dtype_and_limit()
+    pad = int(bwd_fp8.uvqk_tm_pad())
+    rows_out = (M + pad - 1) // pad * pad
+    inv = torch.full((1,), 0.7371 * 2.0**-3, dtype=torch.float32, device=dev)
+    b = len(lens)
+    cap = wl_cap(M, b)
+    wl = torch.full((cap, 2), -7, dtype=torch.int32, device=dev)
+    cnt = torch.full((2,), -7, dtype=torch.int32, device=dev)
+    assert _fn_wl_build is not None
+    rc = int(_fn_wl_build(offs.data_ptr(), 1, b, M, max(1, min(128, (N + 63) // 64)), wl.data_ptr(), cap,
+                          cnt.data_ptr(), torch.cuda.current_stream(dev).cuda_stream))
+    if rc > 0:
+        return False, f"l11do8_wl_build_launch rc={rc}"
+
+    def launch(only: bool, dx: Optional[torch.Tensor]) -> Tuple[Any, ...]:
+        dz8 = torch.full((rows_out, l11.DU_ROW), 0x5A, dtype=torch.uint8, device=dev)
+        d8 = torch.full((M, Dm), 0x5A, dtype=torch.uint8, device=dev)
+        e8 = torch.full((M, H), 0xA5, dtype=torch.uint8, device=dev)
+        mk = mask_only if only else mask  # NIB v2: the 'only' .so's format; the EM = 1 'plus' reference reads int8
+        out = launch_e5_plus(g8, w8, sa, sb, x, u, mk, mean, rstd, wn, bn, p, inv, dz8.view(grad_dtype), wl, cnt, cap,
+                             d8.view(torch.float8_e4m3fn), e8, only=only, dx=dx)
+        return out + (dz8, d8, e8)
+
+    dx_p, dwp_p, dbp_p, ducs_p, amaxp_p, P_p, dz_p, d8_p, e8_p = launch(False, None)
+    sentinel = torch.full((M, Dm), _SENTINEL_BF16, dtype=torch.int16, device=dev)
+    dx_buf = sentinel.clone().view(torch.bfloat16)
+    dx_o, dwp_o, dbp_o, ducs_o, amaxp_o, P_o, dz_o, d8_o, e8_o = launch(True, dx_buf)
+    torch.cuda.synchronize()
+
+    def mism(a: torch.Tensor, c: torch.Tensor) -> int:
+        a8 = a.contiguous().view(torch.uint8).reshape(-1)
+        c8 = c.contiguous().view(torch.uint8).reshape(-1)
+        return -1 if a8.numel() != c8.numel() else int((a8 != c8).sum())
+
+    m_d8, m_e8, m_dz = mism(d8_o, d8_p), mism(e8_o, e8_p), mism(dz_o, dz_p)
+    m_dw, m_db, m_cs, m_am = mism(dwp_o, dwp_p), mism(dbp_o, dbp_p), mism(ducs_o, ducs_p), mism(amaxp_o, amaxp_p)
+    dx_changed = mism(dx_buf, sentinel.view(torch.bfloat16))
+    same_buf = dx_o.data_ptr() == dx_buf.data_ptr()
+    p_written = int((d8_p != 0x5A).sum())
+    dx_p_ok = bool(torch.isfinite(dx_p.float()).all())
+    e8_127 = int((e8_p == 127).sum())
+    detail = (
+        f"M={M} B={b} cap={cap} P={P_o}/{P_p}: EM=2 vs EM=1 dO8 mism {m_d8}, E8 mism {m_e8}, dz8 mism {m_dz} "
+        f"(u+pad+guard), DWP mism {m_dw}, DBP mism {m_db}, DUCS mism {m_cs}, AMAXP mism {m_am}; EM=2 d(attn) "
+        f"sentinel bytes changed {dx_changed} of {2 * M * Dm} (buffer returned {int(same_buf)}); EM=1 dO8 bytes "
+        f"written {p_written}, d(attn) finite {int(dx_p_ok)}, E8=127 bytes {e8_127}"
+    ) + _self_check_mask_detail(nib, nib_rt)
+    ok = (
+        P_o == P_p
+        and m_d8 == 0
+        and m_e8 == 0
+        and m_dz == 0
+        and m_dw == 0
+        and m_db == 0
+        and m_cs == 0
+        and m_am == 0
+        and dx_changed == 0
+        and same_buf
+        and p_written > 0
+        and dx_p_ok
+        and e8_127 > 0
+        and nib_rt
+    )
+    return ok, detail
+
+
+def prebuild_only(self_check_fn: Optional[Callable[[], Tuple[bool, str]]] = None) -> bool:
+    """DO8-ONLY prebuild (prebuild() calls it after DO8's own prebuild passed, knob DLRM_HSTU_FP8_L11_DO8_ONLY == "1"):
+    the 'only' .so (l11_do8.cu with -DL11DO8_ONLY=1), its resource gate (the EM = 2 instantiation, 0 VGPR spill, 0
+    scratch, LDS_BYTES; the list builders 0 / 0) and self_check_only. Any failure latches 'only' only (one DISABLED
+    line; DO8 keeps its 'plus' launches). The pre-diet source has no 'only' build: one INERT line, nothing built. A
+    self-check device fault re-raises (DO8's policy: abort before RUN_START). NIB v2 (r16 iter54, review R1-F4): a
+    failure of the NIB 'only' build (build / gate / impl format / self-check exception / mismatch) does not latch
+    'only': _nib_fall_back prints one line, drops the NIB 'only' .so and makes nib_build_requested() False, and this
+    function runs once more with the int8 'only' build (whose failure latches 'only' as before). DO8 'plus' (int8) is
+    untouched either way."""
+    global _only_prebuilt
+    if not (only_requested() and _prebuilt and _broken is None) or _only_broken is not None:
+        return False
+    if _source() == _SOURCE_NOVD:
+        _print_once(
+            "only-inert-novd",
+            f"{FAMILY_ONLY} INERT: needs DO8-VD (DLRM_HSTU_FP8_L11_VD=1, ops/hip/l11_do8.cu); the pre-diet "
+            f"{_SOURCE_NOVD.name} has no 'only' build -> item {ITEM} 'plus' (the bf16 d(attn) is written); nothing built",
+        )
+        return False
+    t0 = time.perf_counter()
+    try:
+        _load_only()
+    except Exception as error:  # noqa: BLE001 -- build / gate / load: latch 'only' only
+        why = f"prebuild build/load: {type(error).__name__}: {str(error)[:600]}"
+        if _nib_fall_back(f"'only' {why}"):  # NIB v2 (review R1-F4): the NIB 'only' build failed -> its int8 build
+            return prebuild_only(self_check_fn)
+        _disable_only(why)
+        return False
+    try:
+        ok, detail = (self_check_fn or self_check_only)()
+        torch.cuda.synchronize()
+    except Exception as error:  # noqa: BLE001
+        msg = f"{type(error).__name__}: {error}"
+        if l11._DEVICE_FAULT.search(msg):
+            arm_print_all_ranks(f"{FAMILY_ONLY} prebuild DEVICE FAULT: {msg[:600]}")
+            raise
+        why = f"prebuild self-check: {msg[:600]}"
+        if _nib_fall_back(f"'only' {why}"):  # NIB v2 (review R1-F4): the NIB 'only' check failed -> its int8 build
+            return prebuild_only(self_check_fn)
+        _disable_only(why)
+        return False
+    if not ok:
+        why = f"prebuild self-check mismatch: {detail}"
+        if _nib_fall_back(f"'only' {why}"):  # NIB v2 (review R1-F4): the NIB 'only' check failed -> its int8 build
+            return prebuild_only(self_check_fn)
+        _disable_only(why)
+        return False
+    _only_prebuilt = True
+    _only_atexit()
+    r = _only_resources
+    so_key = _only_lib_path.parent.name if _only_lib_path is not None else "?"
+    arm_print_all_ranks(
+        f"armed OK: {FAMILY_ONLY} prebuild before run_start: built+loaded+self-check OK {time.perf_counter() - t0:.1f}s "
+        f"(EM 2: VGPR {r.get('vgpr')}, spill {r.get('vgpr_spill')}, scratch {r.get('scratch')}, LDS {r.get('lds')}, "
+        f"SGPR spill {r.get('sgpr_spill')}, sched={r.get('sched')}; so {so_key}; {detail}{_diet_tail()})"
+        f" mask={_MASK_DESC[only_mask_format()]}"  # NIB (r16 iter54): appended segment, the 'only' .so's format
+    )
+    return True

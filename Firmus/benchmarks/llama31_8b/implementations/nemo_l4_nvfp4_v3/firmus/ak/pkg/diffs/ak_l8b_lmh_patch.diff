@@ -1,0 +1,98 @@
+--- a/ak_l8b_lmh_patch.py (validated 69d551d9b6a62193)
++++ b/ak_l8b_lmh_patch.py (L4)
+@@ -11,19 +11,19 @@
+ descriptors and runs one cublasLtMatmul with a given algorithm.  The algorithms are opaque (no config attribute reads),
+ so each is PINNED BY ITS 64 BYTES, recorded in lmh_pin.json at build time together with the kernel it launched (the unit
+ test resolves the kernel by name with the profiler and records the bytes).  At a problem's first call the patch asks the
+-heuristic for the problem's list and takes the entry whose bytes are the pinned ones; if none is, the call and every later
+-one of that problem run the stock torch matmul (no ARMED line).
++heuristic for the problem's list and takes the entry whose bytes are the pinned ones; if none is, the patch raises
++(L4: an armed switch never falls back silently; a T without a pin runs Megatron's code).
+ 
+ Only the recipe's case takes it: bf16 contiguous CUDA tensors, W [V, H] with V = 128256 and H = 4096, T = numel / H rows
+ (the pin is per (kind, T)), no bias, no output dtype; anything else runs Megatron's code.  The first call of each problem
+ (eager -- the training warm-up's iteration 0, and the validation warm-up's) compares the output with torch's matmul byte for
+-byte and raises on a mismatch; under CUDA-graph capture an unchecked problem runs stock.  The dgrad is reached through a
+-copy of the stock backward with that one line changed, compiled from the stock source only when its sha256 is the one
+-recorded here (the image's Megatron); else the dgrad stays stock and only the forward arms.
++byte and raises on a mismatch; a pinned problem first met under CUDA-graph capture raises (its check never ran).  The
++dgrad is reached through a copy of the stock backward with that one line changed, compiled from the stock source only
++when its sha256 is the one recorded here (the image's Megatron); else the patch raises (AK_LMH_DGRAD=0 keeps it stock).
+ 
+ Proof lines: "[auto_kernel lmh] LM-head forward through cuBLASLt, the pinned algorithm ARMED: ... True" and
+-"[auto_kernel lmh] LM-head dgrad through cuBLASLt, the pinned algorithm ARMED: ... True".  Loaded by zz-ak-l8b-lmh.pth;
+-armed by AK_LMH=1 in the training entry point; AK_LMH_DIR holds ak_l8b_lmh.so and lmh_pin.json; AK_LMH_DGRAD=0 keeps the
++"[auto_kernel lmh] LM-head dgrad through cuBLASLt, the pinned algorithm ARMED: ... True".  Loaded by `import firmus_ak`;
++armed by AK_LMH=1 alone; AK_LMH_DIR holds ak_l8b_lmh.so and lmh_pin.json; AK_LMH_DGRAD=0 keeps the
+ dgrad stock.
+ """
+ import hashlib
+@@ -35,10 +35,9 @@
+ import sys
+ import textwrap
+ 
+-_ARMED = os.environ.get("AK_LMH", "0") == "1" and (
+-    "pretrain" in os.path.basename(sys.argv[0] if sys.argv else "") or os.environ.get("AK_LMH_FORCE", "0") == "1")
++_ARMED = os.environ.get("AK_LMH", "0") == "1"
+ _DGRAD_ON = _ARMED and os.environ.get("AK_LMH_DGRAD", "1") == "1"
+-_DIR = os.environ.get("AK_LMH_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext"))
++_DIR = os.environ.get("AK_LMH_DIR", "/opt/firmus/ak/lmh")
+ V_LM, H_LM = 128256, 4096
+ # the dgrad copy is made only from the stock backward whose source sha256 (inspect.getsource of
+ # LinearWithGradAccumulationAndAsyncCommunication.backward in the image's Megatron, /workspace/Megatron-Bridge/3rdparty/
+@@ -113,21 +112,19 @@
+     ws = _workspace(w.device)
+     algo = _S["algo"].get(key)
+     if algo is None:
+-        if torch.cuda.is_current_stream_capturing():
+-            return False                      # never checked eagerly: stock (the warm-up's eager iteration comes first)
+         pin = _S["pin"].get("%s_T%d" % (_NAMES[kind], T))
+-        if pin is None:
++        if pin is None:                       # no pin for this T: Megatron's code (shape routing)
+             _S["stock"].add(key)
+             return False
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("[auto_kernel lmh] LM-head %s (T %d) first called under graph capture: its check "
++                               "never ran" % (_NAMES[kind], T))
+         lst = ext.heuristics(kind, w, a2d, out2d, ws, 64)
+         want = bytes.fromhex(pin["algo"])
+         idx = [i for i, e in enumerate(lst) if e[0] == want]
+         if not idx:
+-            _S["stock"].add(key)
+-            if _rank() == 0:
+-                _say("[auto_kernel lmh] LM-head %s through cuBLASLt NOT ARMED (T %d): the pinned algorithm %s is not in "
+-                     "the heuristic's list of %d -- stock torch matmul" % (_NAMES[kind], T, pin["algo_sha"][:16], len(lst)))
+-            return False
++            raise RuntimeError("[auto_kernel lmh] LM-head %s through cuBLASLt NOT ARMED (T %d): the pinned algorithm %s "
++                               "is not in the heuristic's list of %d" % (_NAMES[kind], T, pin["algo_sha"][:16], len(lst)))
+         algo = want
+         _S["algo"][key] = algo
+         _S["pin_index"] = idx[0]
+@@ -205,12 +202,7 @@
+     L._linear_forward = _linear_forward
+     if not _DGRAD_ON:
+         return
+-    try:
+-        _install_dgrad(L)
+-    except Exception as e:  # noqa: BLE001 -- never break the training import: the dgrad stays stock
+-        _S["why"] = "installing the dgrad copy failed (%s: %s): dgrad stays stock" % (type(e).__name__, str(e)[:120])
+-        if _rank() == 0:
+-            _say("[auto_kernel lmh] LM-head dgrad NOT ARMED: " + _S["why"])
++    _install_dgrad(L)                          # L4 (C5): a failure raises; AK_LMH_DGRAD=0 keeps the dgrad stock
+ 
+ 
+ def _install_dgrad(L):
+@@ -220,10 +212,9 @@
+     sha = hashlib.sha256(src.encode()).hexdigest()
+     want = json.load(open(os.path.join(_DIR, "lmh_pin.json"))).get("bwd_src_sha256")
+     if sha != want or src.count(DGRAD_LINE) != 1:
+-        _S["why"] = "the stock backward's source is not the recorded one (sha256 %s): dgrad stays stock" % sha[:16]
+-        if _rank() == 0:
+-            _say("[auto_kernel lmh] LM-head dgrad NOT ARMED: " + _S["why"])
+-        return
++        raise RuntimeError("[auto_kernel lmh] LM-head dgrad NOT ARMED: the stock backward's source is not the "
++                           "recorded one (sha256 %s, lmh_pin.json %s, dgrad lines %d)"
++                           % (sha[:16], str(want)[:16], src.count(DGRAD_LINE)))
+     lines = src.splitlines()
+     body = textwrap.dedent("\n".join(l for l in lines if not l.strip().startswith("@")))
+     body = body.replace(DGRAD_LINE, "grad_input = _ak_lmh_dgrad(grad_output, weight)")

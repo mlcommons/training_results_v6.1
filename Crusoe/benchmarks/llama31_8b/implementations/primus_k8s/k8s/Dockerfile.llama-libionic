@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+# MLPerf v6.1 Llama trainers (llama31_8b, llama2_70b_lora) for AINIC 1.117.5-a-77 hosts:
+# AMD's published v6.0 Primus images + the libionic userspace provider, so RCCL can use the
+# ionic RoCE NICs (without it, multi-node runs fall back to sockets or fail at init).
+#
+#   BASE=rocm/amd-mlperf:llama31_8b_training_6.0   or   rocm/amd-mlperf:llama2_70b_training_6.0
+#   docker build -f Dockerfile.llama-libionic --build-arg BASE=$BASE -t <registry>/<repo>/<name>:<tag> .
+#
+# The apt suite (jammy/noble) is taken from the base image's own /etc/os-release, so one
+# Dockerfile covers both images even if AMD moves the base OS.
+ARG BASE=rocm/amd-mlperf:llama31_8b_training_6.0
+FROM ${BASE}
+ARG AINIC_VER=1.117.5-a-77
+ARG MLPERF_LOGGING_REF=6.1.0-rc2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      wget gnupg ca-certificates libibverbs1 ibverbs-utils python3-venv \
+ && rm -rf /var/lib/apt/lists/*
+
+# AINIC userspace libionic matching the host's ionic kernel driver
+RUN . /etc/os-release \
+ && mkdir -p /etc/apt/keyrings \
+ && wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/rocm.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VER} ${VERSION_CODENAME} main" \
+      > /etc/apt/sources.list.d/amdainic.list \
+ && apt-get update && apt-get install -y --allow-downgrades libionic1 \
+ && apt-cache policy libionic1 | grep -q "${AINIC_VER}" \
+ && echo "driver ionic" > /etc/libibverbs.d/ionic.driver && ldconfig \
+ && ls /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav*.so \
+ && rm -rf /var/lib/apt/lists/*
+
+# AITER FP4 GEMM fix: asm_gemm_a4w4.cu tests `#if defined(__Float4_e2m1fn_x2)`, but AITER's
+# build defines TORCH_Float4_e2m1fn_x2 (jit/core.py). The prebuilt module therefore only
+# accepts uint8 inputs while TransformerEngine passes torch.float4_e2m1fn_x2, and every MXFP4
+# GEMM fails with "get_cfg Unsupported input_type:Float4_e2m1fn_x2" (llama31_8b dies at its
+# first training step; reproduced on the unmodified base image). Patch + rebuild that module.
+RUN if [ -f /workspace/aiter/csrc/py_itfs_cu/asm_gemm_a4w4.cu ] \
+       && grep -q 'defined(__Float4_e2m1fn_x2)' /workspace/aiter/csrc/py_itfs_cu/asm_gemm_a4w4.cu; then \
+      sed -i 's/#if defined(__Float4_e2m1fn_x2)/#if defined(TORCH_Float4_e2m1fn_x2)/' /workspace/aiter/csrc/py_itfs_cu/asm_gemm_a4w4.cu \
+      && rm -rf /workspace/aiter/aiter/jit/module_gemm_a4w4_asm.so /workspace/aiter/aiter/jit/build/module_gemm_a4w4_asm \
+      && cd /workspace/code && GPU_ARCHS=gfx950 python3 -c "from aiter.jit.core import get_args_of_build as g, build_module as b; n='module_gemm_a4w4_asm'; a=g(n); b(n, a['srcs'], a['flags_extra_cc'], a['flags_extra_hip'], a['blob_gen_cmd'], a['extra_include'], a['extra_ldflags'], a['verbose'], a['is_python_module'], a['is_standalone'], a['torch_exclude'], a.get('hipify', False))" \
+      && test -f /workspace/aiter/aiter/jit/module_gemm_a4w4_asm.so; \
+    fi
+
+# v6.1 compliance/RCP checker in its own venv; the in-image 6.0 logger stays untouched.
+RUN python3 -m venv /opt/mlperf-logging-61 \
+ && /opt/mlperf-logging-61/bin/pip install --no-cache-dir "git+https://github.com/mlcommons/logging.git@${MLPERF_LOGGING_REF}" \
+ && /opt/mlperf-logging-61/bin/python -m mlperf_logging.compliance_checker --help >/dev/null
+
+WORKDIR /workspace/code

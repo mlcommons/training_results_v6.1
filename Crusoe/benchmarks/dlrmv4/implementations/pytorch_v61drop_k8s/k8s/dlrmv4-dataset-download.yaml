@@ -1,0 +1,42 @@
+# Download the MLPerf DLRMv4 dataset (Yambda-5b preprocessed HSTU cache, ~227 GB) to the shared volume.
+# Same source and checksums as the MLCommons R2 downloader (training.mlcommons-storage.org/metadata/
+# dlrmv4_dataset.{uri,md5}), but fetched with aria2c: 16 range connections per file and 8 files at once,
+# then md5-verified in parallel. Runs on a spare MI355X node for its network bandwidth (no GPUs requested).
+apiVersion: batch/v1
+kind: Job
+metadata: { name: dlrmv4-dataset-download, labels: { app: v61-drop, role: dataset } }
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata: { labels: { app: v61-drop, role: dataset } }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: dl
+          image: mirror.gcr.io/library/ubuntu:24.04
+          command: [ "bash", "-c" ]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq aria2 curl ca-certificates coreutils >/dev/null
+              META=https://training.mlcommons-storage.org/metadata
+              BASE=$(curl -fsSL $META/dlrmv4_dataset.uri | head -1); BASE=${BASE%/}
+              D=/shared/datasets/dlrmv4/data; mkdir -p $D; cd $D
+              curl -fsSL $META/dlrmv4_dataset.md5 -o dlrmv4_dataset.md5
+              # aria2c input list: URL, then per-file dir/out options
+              awk -v b="$BASE" -v d="$D" '{p=$2; sub(/^\.\//,"",p); n=split(p,a,"/"); dir=d; for(i=1;i<n;i++) dir=dir"/"a[i];
+                   print b"/"p; print "  dir="dir; print "  out="a[n]}' dlrmv4_dataset.md5 > /tmp/aria2.list
+              echo "[$(date -u +%H:%M:%SZ)] downloading $(wc -l < dlrmv4_dataset.md5) files from $BASE"
+              aria2c -i /tmp/aria2.list -j 8 -x 16 -s 16 -k 64M --file-allocation=none --continue=true \
+                     --max-tries=10 --retry-wait=5 --auto-file-renaming=false --allow-overwrite=true \
+                     --summary-interval=60 --console-log-level=warn
+              echo "[$(date -u +%H:%M:%SZ)] download done: $(du -sh $D | cut -f1)"
+              # parallel md5 verification, one file per process
+              awk '{print}' dlrmv4_dataset.md5 | xargs -P 20 -I{} sh -c 'echo "{}" | md5sum -c --quiet -' && echo "[$(date -u +%H:%M:%SZ)] md5 OK" \
+                || { echo "!! md5 mismatch"; exit 1; }
+              touch /shared/datasets/dlrmv4/.download_complete
+          resources: { requests: { cpu: "24", memory: 32Gi }, limits: { cpu: "32", memory: 64Gi } }
+          volumeMounts: [ { name: shared, mountPath: /shared } ]
+      volumes:
+        - { name: shared, persistentVolumeClaim: { claimName: mlperf-training-shared } }

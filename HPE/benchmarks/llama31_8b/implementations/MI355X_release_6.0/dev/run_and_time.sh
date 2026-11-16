@@ -1,0 +1,68 @@
+#!/bin/bash
+
+set -e
+
+# Create results directory
+mkdir -p /results
+
+# Profiler setup
+if [[ $PROFILER == "rpd" ]]; then
+    export NVTE_NVTX_ENABLED=1
+    echo "Profiler is set to RPD"
+    bash loadTracer.sh
+else
+    echo "No profiler enabled (production mode)"
+fi
+
+cd /workspace/code
+
+echo "============================================"
+echo "MLPerf LLama3.1 8B Training"
+echo "============================================"
+echo "Config: ${EXP}"
+echo "Data:   ${DATA_PATH}"
+echo "GPUs:   ${GPUS_PER_NODE}"
+echo "Nodes:  ${NNODES}"
+echo "============================================"
+
+# Start timing
+start=$(date +%s)
+start_fmt=$(date +%Y-%m-%d\ %r)
+echo "STARTING TIMING RUN AT $start_fmt"
+
+# Launch distributed training
+torchrun \
+    --nproc_per_node=${GPUS_PER_NODE} \
+    --nnodes=${NNODES} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    src/train.py
+
+ret_code=$?
+
+# End timing
+end=$(date +%s)
+end_fmt=$(date +%Y-%m-%d\ %r)
+echo "ENDING TIMING RUN AT $end_fmt"
+
+# Report result
+result=$(( end - start ))
+result_name="LLAMA3.1_8B"
+echo "RESULT,$result_name,,$result,AMD,$start_fmt"
+
+if [[ $PROFILER == "rpd" ]]; then
+    sqlite3 -header -csv trace.rpd "select * from top;" > trace.csv
+    source /workspace/utilities/metrics/profiling/add_trace_csv_header.sh
+    add_trace_csv_header "LLAMA3.1_8B"
+    python3 /workspace/utilities/metrics/profiling/pie_chart_plot.py trace.csv "LLama3.1-8B E2E" "${IMAGE_NAME}" 2.0
+    mkdir -p /results/artifacts
+    cp *.png *.csv *.rpd /results/artifacts
+fi
+
+if [[ $ret_code != 0 ]]; then
+    echo "Training failed with exit code: $ret_code"
+    exit $ret_code
+fi
+
+exit 0

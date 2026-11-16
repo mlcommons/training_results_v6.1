@@ -1,0 +1,28 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+defaults:
+- /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/conf/grpo_qwen35_397b_swe_openhands_async_trtllm_disagg.yaml
+- /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/conf/bf16_adam_state.yaml
+
+policy:
+  megatron_cfg:
+    use_grouped_gemm_for_shared_expert: false
+    clear_memory_caches_before_refit: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+    model_overrides:
+      moe_use_grouped_tensor: ${oc.decode:${oc.env:MOE_USE_GROUPED_TENSOR,true}}
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      force_clear_fp8_caches: true
+      fp8_recipe: mxfp8
+      fp8_param: false
+    te_precision_config_file: /opt/nemo-rl/qwen_35/configs/te_routed_mxfp8_fwd_bwd.yaml
+  generation:
+    trtllm_cfg:
+      precision: fp8
+      is_mx: true
+
+  release_grads_before_refit: true
+  offload_optimizer_for_refit: false

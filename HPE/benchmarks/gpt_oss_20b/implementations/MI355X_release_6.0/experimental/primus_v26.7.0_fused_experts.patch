@@ -1,0 +1,124 @@
+diff --git a/examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh b/examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
+index 2e7e1a55..564a41a5 100644
+--- a/examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
++++ b/examples/mlperf/gpt_oss_20b/config_MI355X_1x8x1_tp1pp1ep1_gbs32.sh
+@@ -48,8 +48,8 @@ export PRIMUS_EP=1
+ # -----------------------------------------------------------------------------
+ # Primus Configuration
+ # -----------------------------------------------------------------------------
+-export PRIMUS_TURBO_GROUPED_GEMM_BACKEND="${PRIMUS_TURBO_GROUPED_GEMM_BACKEND:-triton}"
+-export PRIMUS_TURBO_GEMM_BACKEND=triton
++export PRIMUS_TURBO_GROUPED_GEMM_BACKEND="${PRIMUS_TURBO_GROUPED_GEMM_BACKEND:-fp4:flydsl,fp8:flydsl,bf16:hipblaslt}"  # HPE: from AMD branch feat/zhangrb/mlperf
++export PRIMUS_TURBO_GEMM_BACKEND="${PRIMUS_TURBO_GEMM_BACKEND:-fp4:aiter,fp8:hipblaslt,other:hipblaslt}"  # HPE: from AMD branch feat/zhangrb/mlperf
+ export PRIMUS_TURBO_FUSED_WGRAD_ACCUM="${PRIMUS_TURBO_FUSED_WGRAD_ACCUM:-1}"
+ export PRIMUS_NUM_WORKERS="${PRIMUS_NUM_WORKERS:-2}"
+ export PRIMUS_GRAD_REDUCE_IN_BF16=true
+diff --git a/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-mlperf-pretrain.yaml b/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-mlperf-pretrain.yaml
+index 24710c5a..52e9d22a 100644
+--- a/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-mlperf-pretrain.yaml
++++ b/examples/mlperf/gpt_oss_20b/configs/MI355/gpt_oss_20B-FP8-mlperf-pretrain.yaml
+@@ -192,6 +192,7 @@ modules:
+       # hipBLASLt, which is where each backend is faster on these shapes.
+       use_turbo_norm_te_linear: ${USE_TURBO_NORM_TE_LINEAR:true}
+       use_turbo_fused_act_with_probs : true
++      turbo_fused_grouped_gemm: ${PRIMUS_TURBO_FUSED_GROUPED_GEMM:true}
+ 
+       # deepep
+       use_turbo_deepep: false
+diff --git a/primus/backends/megatron/core/transformer/experts.py b/primus/backends/megatron/core/transformer/experts.py
+index df341a0d..451999ee 100644
+--- a/primus/backends/megatron/core/transformer/experts.py
++++ b/primus/backends/megatron/core/transformer/experts.py
+@@ -46,10 +46,11 @@ class PrimusGroupedMLP(TEGroupedMLP):
+         # NOTE: use_turbo_fused_act_with_probs is prioritized over use_te_activation_func and bias_activation_fusion
+         self.use_turbo_fused_act_with_probs = args.use_turbo_fused_act_with_probs
+         self.moe_router_padding_for_quantization = args.moe_router_padding_for_quantization
+-        self.turbo_grouped_gemm_without_padding = getattr(args, "turbo_grouped_gemm_without_padding", False)
+         # PrimusTurbo grouped GEMMs consume the original GPU tokens_per_expert
+         # tensor for every supported quantization recipe. Keep TE's explicit
+         # zero-padding fallback only when the no-padding path is not enabled.
++        self.turbo_grouped_gemm_without_padding = getattr(args, "turbo_grouped_gemm_without_padding", False)
++        self.turbo_fused_grouped_gemm = getattr(args, "turbo_fused_grouped_gemm", False)
+ 
+     def _use_explicit_quantization_padding(self) -> bool:
+         """Whether this forward must pad expert groups before quantization."""
+@@ -150,7 +151,7 @@ class PrimusGroupedMLP(TEGroupedMLP):
+                 activation = "gelu"
+             else:
+                 raise ValueError(
+-                    "Only support fusion of swiglu and gelu in PrimusGroupedMLP when `use_turbo_fused_act_with_probs` is True."
++                    "Only support fusion of silu and gelu in PrimusGroupedMLP when `use_turbo_fused_act_with_probs` is True."
+                 )
+ 
+             # `forward()` unsqueeze(-1)'s `permuted_probs` to [tokens, 1] so the non-fused
+@@ -193,6 +194,70 @@ class PrimusGroupedMLP(TEGroupedMLP):
+         Return:
+             output (torch.Tensor): The output of the local experts.
+         """
++
++        if self.turbo_fused_grouped_gemm:
++            assert (
++                tokens_per_expert.device == permuted_local_hidden_states.device
++            ), "tokens_per_expert and permuted_local_hidden_states must be on the same device"
++
++            if self.activation_func == F.silu and self.config.gated_linear_unit:
++                activation = "silu"
++            else:
++                raise ValueError(
++                    "Only support fusion of silu and gelu in PrimusGroupedMLP when `use_turbo_fused_act_with_probs` is True."
++                )
++
++            from primus.backends.megatron.core.extensions.primus_turbo import (
++                PrimusTurboLowPrecisionGlobalStateManager,
++            )
++
++            fallback_to_original_mlp = False
++            if PrimusTurboLowPrecisionGlobalStateManager.is_turbo_fp8_enabled():
++                from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
++
++                quant_config = PrimusTurboLowPrecisionGlobalStateManager.get_turbo_quant_config()
++                assert (
++                    quant_config.current_scaling()
++                ), "turbo_fused_grouped_gemm only supports current scaling currently"
++
++                output = grouped_mlp_fp8(
++                    permuted_local_hidden_states,
++                    self.linear_fc1.weights,
++                    self.linear_fc2.weights,
++                    tokens_per_expert,
++                    probs=permuted_probs,
++                    trans_w1=True,
++                    trans_w2=True,
++                    config=quant_config.data(),
++                    activation=activation,
++                    fuse_wgrad_accum_pattern="megatron",
++                )
++            elif PrimusTurboLowPrecisionGlobalStateManager.is_turbo_fp4_enabled():
++                from primus_turbo.pytorch.ops.grouped_mlp_fp4 import grouped_mlp_fp4
++
++                quant_config = PrimusTurboLowPrecisionGlobalStateManager.get_turbo_quant_config()
++                assert (
++                    quant_config.mxfp4_scaling()
++                ), "turbo_fused_grouped_gemm only supports mxfp4 scaling currently"
++
++                output = grouped_mlp_fp4(
++                    permuted_local_hidden_states,
++                    self.linear_fc1.weights,
++                    self.linear_fc2.weights,
++                    tokens_per_expert,
++                    probs=permuted_probs,
++                    trans_w1=True,
++                    trans_w2=True,
++                    config=quant_config.data(),
++                    activation=activation,
++                    fuse_wgrad_accum_pattern="megatron",
++                )
++            else:
++                fallback_to_original_mlp = True
++
++            if not fallback_to_original_mlp:
++                return output, None
++
+         use_explicit_quantization_padding = self._use_explicit_quantization_padding()
+         if use_explicit_quantization_padding:
+             # NOTE: When moe_router_padding_for_quantization is true the token is padded. So we can skip the padding here to reduce cpu sync.

@@ -1,0 +1,130 @@
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -3720,6 +3720,109 @@
+     _TE_SUPPORTS_CG_CAPTURABLE = is_te_min_version("2.7.0")
+     current_te_version = get_te_version()
+ 
++    # --- auto_kernel TCE-0929 (2026-10-02, sec 168) -------------------------------------------------------------
++    # TE 2.19's parallel_cross_entropy copies the whole logits tensor in its forward (overwrite_input=False ->
++    # COPY_INPUT; [8192, 3, 201088] bf16 = 9.9 GB written per rank per step) so that its backward kernel can rebuild
++    # the gradient from a private copy.  With overwrite_input=True TE runs the SAME forward kernel without the copy and
++    # the SAME backward kernel in place on the logits, so the loss and the gradient are the same bytes as long as
++    # nothing reads the logits between the forward and the backward (TE bumps their autograd version after its
++    # backward, so another saved use fails loudly; on the 20260828 image TE always overwrote the logits, in its
++    # forward).  Armed by AK_TCE_OVERWRITE=1.  The first eager training call is checked byte-for-byte against the stock
++    # copy path on the first _AK_TCE_OW_POS sequence positions of the live tensors (every row is independent in both
++    # kernels; labels are [s, b] as Megatron passes them): the loss in the forward, the gradient when autograd hands
++    # it to the logits.  Rank 0 prints one ARMED line with both verdicts; a mismatch raises.
++    _AK_TCE_OW = os.environ.get("AK_TCE_OVERWRITE", "0") == "1"
++    _AK_TCE_OW_STATE = {"armed": False, "fwd_ok": None, "bwd_ok": None, "ref_grad": None}
++    _AK_TCE_OW_POS = 256
++
++    def _ak_tce_ow_rank():
++        try:
++            return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        except Exception:  # noqa: BLE001
++            return 0
++
++    def _ak_tce_ow_same(a, b):
++        return (a.shape == b.shape and a.dtype == b.dtype
++                and bool(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))))
++
++    class _AKTceOwGradTap(torch.autograd.Function):
++        """Identity on the per-token loss; its backward sees grad_output and builds the stock path's gradient."""
++
++        @staticmethod
++        def forward(ctx, loss, k):
++            ctx.k = k
++            return loss.clone()
++
++        @staticmethod
++        def backward(ctx, grad_output):
++            # the reference tensors live in the state, NOT as inputs of this Function: as inputs they would link the
++            # stock node into the main graph and its backward would run twice
++            ref_x, ref_loss = _AK_TCE_OW_STATE.pop("ref")
++            with torch.enable_grad():
++                (g,) = torch.autograd.grad(ref_loss, ref_x, grad_output[: ctx.k].contiguous())
++            _AK_TCE_OW_STATE["ref_grad"] = g
++            return grad_output, None
++
++    def _ak_tce_ow_first(logits, labels, tp_group):
++        st = _AK_TCE_OW_STATE
++        k = min(_AK_TCE_OW_POS, logits.shape[0])
++        with torch.enable_grad():
++            ref_x = logits[:k].detach().clone().requires_grad_(True)
++            ref_loss = parallel_cross_entropy(ref_x, labels[:k].contiguous(), 0.0, False, tp_group, -100)
++        loss = parallel_cross_entropy(logits, labels, 0.0, False, tp_group, -100, overwrite_input=True)
++        st["fwd_ok"] = _ak_tce_ow_same(loss[:k], ref_loss)
++
++        def _hook(grad):
++            ref_g = st["ref_grad"]
++            st["bwd_ok"] = ref_g is not None and _ak_tce_ow_same(grad[:k], ref_g)
++            st["ref_grad"] = None
++            if _ak_tce_ow_rank() == 0:
++                print("[auto_kernel tce0929] TE cross-entropy overwrite_input ARMED: logits {} (no input copy) "
++                      "byte-exact vs the stock copy path (first {} positions): loss {}; gradient {}".format(
++                          list(logits.shape), k, st["fwd_ok"], st["bwd_ok"]), flush=True)
++            if not (st["fwd_ok"] and st["bwd_ok"]):
++                raise RuntimeError("[auto_kernel tce0929] E0 self-check FAILED (loss {}, gradient {})".format(
++                    st["fwd_ok"], st["bwd_ok"]))
++            return None
++
++        logits.register_hook(_hook)
++        st["ref"] = (ref_x, ref_loss)
++        return _AKTceOwGradTap.apply(loss, k)
++    # ---------------------------------------------------------------------------------------------------------------
++
++    # --- auto_kernel TCEV (2026-10-08) ------------------------------------------------------------------------------
++    # Evaluation (no grad): TE's stock call parallel_cross_entropy(..., overwrite_input=False) runs its forward kernel
++    # with COPY_INPUT, writing a full copy of the logits for a backward that never comes (4.2 GB per call at [8192, 2,
++    # 128256] bf16).  With AK_TCEV=1, eval calls on contiguous 3-D logits run the same TE forward kernel without the copy
++    # (transformer_engine.pytorch.triton.cross_entropy.cross_entropy_forward with overwrite_input=True: the kernel only
++    # reads the logits; nothing writes them, since no backward follows): the same loss, 4.2 GB less written per call.
++    # The first eager eval call is compared byte for byte with TE's stock eval call; rank 0 prints one ARMED line, a
++    # mismatch raises.  Training calls are untouched (tce0929's path).
++    _AK_TCEV = os.environ.get("AK_TCEV", "0") == "1"
++    _AK_TCEV_STATE = {"armed": False}
++
++    def _ak_tcev_fwd(logits, labels, tp_group):
++        import transformer_engine.pytorch.triton.cross_entropy as _tce_triton
++
++        loss, _, _, _, _, _, _ = _tce_triton.cross_entropy_forward(logits, labels, 0.0, False, tp_group, -100, True)
++        return loss
++
++    def _ak_tcev_first(logits, labels, tp_group, is_cg_capturable):
++        if _TE_SUPPORTS_CG_CAPTURABLE:
++            ref = parallel_cross_entropy(logits, labels, 0.0, False, tp_group, -100, is_cg_capturable)
++        else:
++            ref = parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
++        loss = _ak_tcev_fwd(logits, labels, tp_group)
++        ok = _ak_tce_ow_same(loss, ref)
++        if _ak_tce_ow_rank() == 0:
++            print("[auto_kernel tcev] eval cross-entropy without the input copy ARMED: logits {} {} (TE's forward kernel, "
++                  "no COPY_INPUT); loss byte-exact v TE's stock eval call: {}".format(
++                      list(logits.shape), str(logits.dtype).replace("torch.", ""), ok), flush=True)
++        if not ok:
++            raise RuntimeError("[auto_kernel tcev] E0 self-check FAILED in evaluation")
++        return loss
++    # ---------------------------------------------------------------------------------------------------------------
++
+     def te_parallel_cross_entropy(
+         logits: torch.Tensor,
+         labels: torch.Tensor,
+@@ -3727,6 +3830,17 @@
+         is_cg_capturable: bool = False,
+     ):
+         """Wrapper function for TE's Cross Entropy Loss kernel"""
++        if (_AK_TCE_OW and logits.dim() == 3 and logits.is_contiguous() and logits.requires_grad
++                and torch.is_grad_enabled()):  # auto_kernel TCE-0929: training calls only
++            if not _AK_TCE_OW_STATE["armed"] and not torch.cuda.is_current_stream_capturing():
++                _AK_TCE_OW_STATE["armed"] = True
++                return _ak_tce_ow_first(logits, labels, tp_group)
++            return parallel_cross_entropy(logits, labels, 0.0, False, tp_group, -100, overwrite_input=True)
++        if _AK_TCEV and not torch.is_grad_enabled() and logits.dim() == 3 and logits.is_contiguous():  # auto_kernel TCEV
++            if not _AK_TCEV_STATE["armed"] and not torch.cuda.is_current_stream_capturing():
++                _AK_TCEV_STATE["armed"] = True
++                return _ak_tcev_first(logits, labels, tp_group, is_cg_capturable)
++            return _ak_tcev_fwd(logits, labels, tp_group)
+         if _TE_SUPPORTS_CG_CAPTURABLE:
+             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
+             return parallel_cross_entropy(

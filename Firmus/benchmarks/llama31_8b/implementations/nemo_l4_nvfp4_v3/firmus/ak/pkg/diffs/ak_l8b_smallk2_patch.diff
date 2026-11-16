@@ -1,0 +1,53 @@
+--- a/ak_l8b_smallk2_patch.py (validated a7184add69a11ba3)
++++ b/ak_l8b_smallk2_patch.py (L4)
+@@ -32,10 +32,11 @@
+ learns n (the forward calls per step, 32); for each of its calls it records which modules' tensors the update changed
+ and requires that a module changed by a call that will be skipped is changed by no later call of its phase (each
+ module consumed once per phase) -- else it raises.  The schedule arms from the next step (the graph capture) when every
+-delayed-scaling key takes TE's fused update without an amax all-reduce; a forward phase of another length then raises.
++delayed-scaling key takes TE's fused update without an amax all-reduce, and raises otherwise (L4: AK_SMALLK2_DS=0
++keeps TE's updates); a forward phase of another length then raises.
+ Proof lines: "[auto_kernel smallk2] embedding gathered in [s, b, h] ARMED: ... True" and
+-"[auto_kernel smallk2] delayed-scaling updates batched ARMED: ... True".  Loaded by zz-ak-l8b-smallk2.pth; armed by
+-AK_SMALLK2=1 in the training entry point.
++"[auto_kernel smallk2] delayed-scaling updates batched ARMED: ... True".  Loaded by `import firmus_ak`; armed by
++AK_SMALLK2=1 alone.
+ """
+ import importlib
+ import importlib.abc
+@@ -43,7 +44,7 @@
+ import os
+ import sys
+ 
+-_ARMED = os.environ.get("AK_SMALLK2", "0") == "1" and "pretrain" in os.path.basename(sys.argv[0] if sys.argv else "")
++_ARMED = os.environ.get("AK_SMALLK2", "0") == "1"
+ _EMB_ON = _ARMED and os.environ.get("AK_SMALLK2_EMB", "1") == "1"
+ _DS_ON = _ARMED and os.environ.get("AK_SMALLK2_DS", "1") == "1"
+ # development only: per-replay digests of the delayed-scaling state (the backward key's deferred update applied to
+@@ -277,11 +278,13 @@
+                       os.path.basename(__file__), sha, mf[0] if mf else 0, mf[-1] if mf else 0,
+                       mb[0] if mb else 0, mb[-1] if mb else 0, bf, bb, ok), flush=True)
+         else:
+-            print("[auto_kernel smallk2] delayed-scaling updates batched NOT armed: {}; stock updates kept".format(
++            print("[auto_kernel smallk2] delayed-scaling updates batched NOT armed: {}".format(
+                 st["why"] or "iteration 0 check failed ({} / {})".format(bf, bb)), flush=True)
+     if why is None and not ok:
+         raise RuntimeError("[auto_kernel smallk2] E0 self-check FAILED for the delayed-scaling schedule: a module was "
+                            "changed by two calls of one phase ({} forward, {} backward)".format(bf, bb))
++    if not st["armed"]:
++        raise RuntimeError("[auto_kernel smallk2] delayed-scaling updates batched NOT armed: {}".format(st["why"]))
+ 
+ 
+ def _patch_q(mod):
+@@ -304,9 +307,8 @@
+         if st["learn"]:
+             import torch
+             if torch.cuda.is_current_stream_capturing():
+-                st["learn"] = False
+-                st["why"] = "first update inside graph capture"
+-                return orig(cls, forward=forward)
++                raise RuntimeError("[auto_kernel smallk2] delayed-scaling updates batched NOT armed: the first "
++                                   "update came inside graph capture (the iteration-0 check never ran)")
+             qstate = cls.quantization_state
+             before = _ds_snapshot(qstate, forward)
+             r = orig(cls, forward=forward)

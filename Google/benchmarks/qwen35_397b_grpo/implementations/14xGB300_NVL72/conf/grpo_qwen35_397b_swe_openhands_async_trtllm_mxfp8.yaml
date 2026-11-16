@@ -1,0 +1,34 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Routed-expert MXFP8 in the training forward and backward GEMMs, with BF16
+# Adam state. The pinned Megatron-Bridge includes the TE precision finalization fix.
+
+defaults:
+- /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/conf/grpo_qwen35_397b_swe_openhands_async_trtllm.yaml
+- /workspace/optimized/qwen35_397b_grpo_trtllm/pytorch/conf/bf16_adam_state.yaml
+
+policy:
+  generation:
+    trtllm_cfg:
+      gpu_memory_utilization: 0.7
+  megatron_cfg:
+    use_grouped_gemm_for_shared_expert: false
+    clear_memory_caches_before_refit: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+    model_overrides:
+      moe_use_grouped_tensor: ${oc.decode:${oc.env:MOE_USE_GROUPED_TENSOR,true}}
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      force_clear_fp8_caches: true
+      # Parameters stay BF16: nccl_reshard refit accepts FP8 parameters only
+      # for blockwise recipes.
+      fp8_param: false
+    # Absolute path: NeMo-RL resolves it against the Ray worker's working directory.
+    te_precision_config_file: /opt/nemo-rl/qwen_35/configs/te_routed_mxfp8_fwd_bwd.yaml
+
+  release_grads_before_refit: true
+  # Defaults to true; moving the optimizer to CPU during refit can hang.
+  offload_optimizer_for_refit: false

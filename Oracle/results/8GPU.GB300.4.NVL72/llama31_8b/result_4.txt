@@ -1,0 +1,1314 @@
++ echo 'Beginning trial 06 of 10'
+Beginning trial 06 of 10
++ export -p
++ echo ':::DLPAL /lfs/priya/mlperf_training/containers/llama31_8b-arm_20261012.sqsh 10975 2 GPU-sytjq-33xpq-[0-1] '\''unknown'\'' GB300_2x4x2xtp1pp1cp1_8b_fp4'
+:::DLPAL /lfs/priya/mlperf_training/containers/llama31_8b-arm_20261012.sqsh 10975 2 GPU-sytjq-33xpq-[0-1] 'unknown' GB300_2x4x2xtp1pp1cp1_8b_fp4
++ echo 'segment envvar: unset'
+segment envvar: unset
+++ srun -N1 -n1 --container-name=llama31_8b_10975 --no-container-mount-home --container-remap-root --container-writable mlperf-sysjson.sh
++ echo ':::SYSJSON {"submitter":"Oracle","division":"closed","status":"Available on-premise","system_name":"GB300_2x4","number_of_nodes":"2","host_processors_per_node":"2","host_processor_model_name":"Neoverse-V2","host_processor_core_count":"72","host_processor_vcpu_count":"","host_processor_frequency":"","host_processor_caches":"","host_processor_interconnect":"","host_memory_capacity":"0.9 TB","host_storage_type":"","host_storage_capacity":"","host_networking":"","host_networking_topology":"","host_memory_configuration":"","accelerators_per_node":"4","accelerator_model_name":"NVIDIA GB300","accelerator_host_interconnect":"","accelerator_frequency":"","accelerator_on-chip_memories":"","accelerator_memory_configuration":"","accelerator_memory_capacity":"284208 MiB","accelerator_interconnect":"","accelerator_interconnect_topology":"","cooling":"","hw_notes":"","framework":"PyTorch NVIDIA Release 26.09","framework_name":"","other_software_stack":{"cuda_version":"13.4.1.012","cuda_driver_version":"615.71.09","nccl_version":"2.31.2","cublas_version":"13.8.0.4","cudnn_version":"9.26.0.51","trt_version":"11.3.0.99","dali_version":"2.3.0","mofed_version":"5.4-rdmacore64.0","openmpi_version":"5.0.10","kernel_version":"Linux 6.14.0-1015-nvidia-64k","nvidia_kernel_driver":"595.91.07"},"operating_system":"Ubuntu 24.04.4 LTS","sw_notes":""}'
+:::SYSJSON {"submitter":"Oracle","division":"closed","status":"Available on-premise","system_name":"GB300_2x4","number_of_nodes":"2","host_processors_per_node":"2","host_processor_model_name":"Neoverse-V2","host_processor_core_count":"72","host_processor_vcpu_count":"","host_processor_frequency":"","host_processor_caches":"","host_processor_interconnect":"","host_memory_capacity":"0.9 TB","host_storage_type":"","host_storage_capacity":"","host_networking":"","host_networking_topology":"","host_memory_configuration":"","accelerators_per_node":"4","accelerator_model_name":"NVIDIA GB300","accelerator_host_interconnect":"","accelerator_frequency":"","accelerator_on-chip_memories":"","accelerator_memory_configuration":"","accelerator_memory_capacity":"284208 MiB","accelerator_interconnect":"","accelerator_interconnect_topology":"","cooling":"","hw_notes":"","framework":"PyTorch NVIDIA Release 26.09","framework_name":"","other_software_stack":{"cuda_version":"13.4.1.012","cuda_driver_version":"615.71.09","nccl_version":"2.31.2","cublas_version":"13.8.0.4","cudnn_version":"9.26.0.51","trt_version":"11.3.0.99","dali_version":"2.3.0","mofed_version":"5.4-rdmacore64.0","openmpi_version":"5.0.10","kernel_version":"Linux 6.14.0-1015-nvidia-64k","nvidia_kernel_driver":"595.91.07"},"operating_system":"Ubuntu 24.04.4 LTS","sw_notes":""}
++ srun -N1 -n1 --container-name=llama31_8b_10975 --no-container-mount-home --container-remap-root --container-writable bash -c 'echo ":::GITCOMMITID ${GIT_COMMIT_ID} ${LAUNCHER_GIT_COMMIT_ID}"'
+:::GITCOMMITID f39be57937c959fe5c783f084a365b403ad76cf3 
++ '[' 1 -eq 1 ']'
++ srun --ntasks-per-node=1 bash -c '
+                 host=$(hostname)
+                 echo "$host sync_start"
+                 sync && echo "$host sync_done"
+                 cache_before=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 sudo /sbin/sysctl vm.drop_caches=3
+                 cache_after=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 echo "$host cache_cleared ${cache_before}kB to ${cache_after}kB"
+            '
+GPU-sytjq-33xpq-0 sync_start
+GPU-sytjq-33xpq-0 sync_done
+GPU-sytjq-33xpq-1 sync_start
+GPU-sytjq-33xpq-1 sync_done
+vm.drop_caches = 3
+vm.drop_caches = 3
+GPU-sytjq-33xpq-0 cache_cleared 90752064kB to 921920kB
+GPU-sytjq-33xpq-1 cache_cleared 90406720kB to 759936kB
++ srun --ntasks-per-node=1 --container-name=llama31_8b_10975 --no-container-mount-home --container-remap-root --container-writable python -c '
+from callback_logging import mllogger
+mllogger.event(key=mllogger.constants.CACHE_CLEAR, value=True)'
+INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+:::MLLOG {"namespace": "", "time_ms": 1791887229621, "event_type": "POINT_IN_TIME", "key": "cache_clear", "value": true, "metadata": {"file": "<string>", "lineno": 3}}
+:::MLLOG {"namespace": "", "time_ms": 1791887230078, "event_type": "POINT_IN_TIME", "key": "cache_clear", "value": true, "metadata": {"file": "<string>", "lineno": 3}}
++ set +e
+++ date +%s
++ echo 'RUNANDTIME_START 1791887231'
+RUNANDTIME_START 1791887231
++ NV_MLPERF_DEBUG=1
++ srun -l --mpi=pmix --ntasks-per-node=4 --time=90 --container-name=llama31_8b_10975 --no-container-mount-home --container-remap-root --container-writable --container-mounts=/lfs/priya/mlperf_training/logs/llama31_8b_20261012/gb300_8gpu_10runs_local_nvme_job10975:/results,/lfs/priya/mlperf_training/logs/llama31_8b_20261012/gb300_8gpu_10runs_local_nvme_job10975/261013054235451127474_npy_index:/npy_index,/lfs/priya/mlperf_training/logs/llama31_8b_20261012/gb300_8gpu_10runs_local_nvme_job10975/mem_dump:/mem_dump,/mnt/localdisk/priya/mlperf_training/llama31_8b_20261012/8b/tokenizer:/workspace/llm/nemo_tokenizer:ro,/mnt/localdisk/priya/mlperf_training/llama31_8b_20261012/8b:/preproc_data:ro --container-workdir=/workspace/llm --container-env=MASTER_PORT,MASTER_ADDR,NCCL_SHARP_GROUP_SIZE_THRESH slurm2pytorch ./run_and_time.sh
+5: LOAD_CHECKPOINT=
+4: LOAD_CHECKPOINT=
+4: Hello from: GPU-sytjq-33xpq-1
+6: LOAD_CHECKPOINT=
+7: LOAD_CHECKPOINT=
+4: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+6: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+7: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+5: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+0: slurm2pytorch: MASTER_ADDR=GPU-sytjq-33xpq-0 MASTER_PORT=29500 WORLD_SIZE=8
+3: LOAD_CHECKPOINT=
+2: LOAD_CHECKPOINT=
+0: LOAD_CHECKPOINT=
+1: LOAD_CHECKPOINT=
+0: Hello from: GPU-sytjq-33xpq-0
+0: running LLM benchmark
+0: Extra args:  exp_manager.explicit_log_dir="/results/261013054235451127474"
+2: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+3: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+0: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+1: num_gpus=4 num_sockets = 2 num_nodes=2 cores_per_socket=72
+5: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+4: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+7: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+6: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+4: Setting logging level to 20
+5: Setting logging level to 20
+7: Setting logging level to 20
+6: Setting logging level to 20
+1: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+0: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+3: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+2: INFO:megatron.bridge.models.gemma.gemma2_provider:Gemma2: PyTorch FlexAttention available — softcap+SWA fused via Triton score_mod.
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248161, "event_type": "INTERVAL_START", "key": "init_start", "value": null, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 664}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248397, "event_type": "POINT_IN_TIME", "key": "submission_benchmark", "value": "llama31_8b", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 570}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248397, "event_type": "POINT_IN_TIME", "key": "submission_org", "value": "SUBMISSION_ORG_PLACEHOLDER", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 570}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248397, "event_type": "POINT_IN_TIME", "key": "submission_division", "value": "closed", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 570}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248397, "event_type": "POINT_IN_TIME", "key": "submission_status", "value": "onprem", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 570}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248397, "event_type": "POINT_IN_TIME", "key": "submission_platform", "value": "2xSUBMISSION_PLATFORM_PLACEHOLDER", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 570}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248398, "event_type": "POINT_IN_TIME", "key": "seed", "value": 15371, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+1: Setting logging level to 20
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248398, "event_type": "POINT_IN_TIME", "key": "global_batch_size", "value": 16, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248398, "event_type": "POINT_IN_TIME", "key": "gradient_accumulation_steps", "value": 1.0, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248398, "event_type": "POINT_IN_TIME", "key": "max_sequence_length", "value": 8192, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248398, "event_type": "POINT_IN_TIME", "key": "eval_samples", "value": 1024, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248399, "event_type": "POINT_IN_TIME", "key": "train_samples", "value": 1574207408, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248399, "event_type": "POINT_IN_TIME", "key": "init_checkpoint_step", "value": 0, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248399, "event_type": "POINT_IN_TIME", "key": "opt_name", "value": "adamw", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248399, "event_type": "POINT_IN_TIME", "key": "opt_base_learning_rate", "value": 0.0004, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248399, "event_type": "POINT_IN_TIME", "key": "opt_adamw_beta_1", "value": 0.9, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248400, "event_type": "POINT_IN_TIME", "key": "opt_adamw_beta_2", "value": 0.95, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248400, "event_type": "POINT_IN_TIME", "key": "opt_adamw_epsilon", "value": 1e-05, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248400, "event_type": "POINT_IN_TIME", "key": "opt_adamw_weight_decay", "value": 0.1, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248400, "event_type": "POINT_IN_TIME", "key": "opt_gradient_clip_norm", "value": 1.0, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248400, "event_type": "POINT_IN_TIME", "key": "opt_end_learning_rate", "value": 4e-05, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248401, "event_type": "POINT_IN_TIME", "key": "opt_learning_rate_warmup_steps", "value": 16, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248401, "event_type": "POINT_IN_TIME", "key": "opt_learning_rate_decay_steps", "value": 1199984, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248401, "event_type": "POINT_IN_TIME", "key": "max_steps", "value": 1200000, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248401, "event_type": "POINT_IN_TIME", "key": "opt_learning_rate_decay_schedule", "value": "cosine with linear warmup", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248401, "event_type": "POINT_IN_TIME", "key": "tensor_parallelism", "value": 1, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248402, "event_type": "POINT_IN_TIME", "key": "pipeline_parallelism", "value": 1, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248402, "event_type": "POINT_IN_TIME", "key": "context_parallelism", "value": 1, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248402, "event_type": "POINT_IN_TIME", "key": "expert_parallelism", "value": 1, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248402, "event_type": "POINT_IN_TIME", "key": "micro_batch_size", "value": 2, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248402, "event_type": "POINT_IN_TIME", "key": "config_filename", "value": "config_GB300_2x4x2xtp1pp1cp1_8b_fp4.sh", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248403, "event_type": "POINT_IN_TIME", "key": "lowest_numerical_precision_in_linear", "value": "nvfp4", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248403, "event_type": "POINT_IN_TIME", "key": "lowest_numerical_precision_in_attn", "value": "fp8", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248403, "event_type": "POINT_IN_TIME", "key": "lowest_numerical_precision_in_comm", "value": "bfloat16", "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887248403, "event_type": "POINT_IN_TIME", "key": "target_accuracy", "value": 3.3, "metadata": {"file": "/workspace/llm/pretrain.py", "lineno": 612}}
+0: 
+0: ======================================================================
+0: Configuration Summary (Non-Default Values vs Megatron Core)
+0: ======================================================================
+0: 
+0: [optimizer] Non-default values (vs Mcore OptimizerConfig):
+0:   adam_beta2: 0.95  (Mcore default: 0.999)
+0:   adam_eps: 1e-05  (Mcore default: 1e-08)
+0:   bf16: True  (Mcore default: False)
+0:   fp8_recipe: 'tensorwise'  (Mcore default: None)
+0:   lr: 0.0004  (Mcore default: None)
+0:   min_lr: 4e-05  (Mcore default: None)
+0:   overlap_param_gather: True  (Mcore default: False)
+0:   params_dtype: torch.bfloat16  (Mcore default: torch.float32)
+0:   use_distributed_optimizer: True  (Mcore default: False)
+0:   weight_decay: 0.1  (Mcore default: 0.01)
+0: 
+0: [ddp] Non-default values (vs Mcore DistributedDataParallelConfig):
+0:   bucket_size: 768000000  (Mcore default: None)
+0:   data_parallel_sharding_strategy: 'optim_grads_params'  (Mcore default: 'no_shard')
+0:   delay_wgrad_compute: None  (Mcore default: False)
+0:   overlap_grad_reduce: True  (Mcore default: False)
+0:   overlap_param_gather: True  (Mcore default: False)
+0:   use_distributed_optimizer: True  (Mcore default: False)
+0: 
+0: [model] Non-default values (vs Mcore TransformerConfig):
+0:   add_bias_linear: False  (Mcore default: True)
+0:   apply_rope_fusion: True  (Mcore default: False)
+0:   attention_dropout: 0.0  (Mcore default: 0.1)
+0:   attention_softmax_in_fp32: False  (Mcore default: True)
+0:   autocast_dtype: torch.bfloat16  (Mcore default: None)
+0:   batch_p2p_comm: False  (Mcore default: True)
+0:   bf16: True  (Mcore default: False)
+0:   bias_activation_fusion: True  (Mcore default: False)
+0:   bias_dropout_fusion: True  (Mcore default: False)
+0:   cpu_offloading_num_layers: 95  (Mcore default: 0)
+0:   cross_entropy_fusion_impl: 'te'  (Mcore default: 'native')
+0:   cross_entropy_loss_fusion: True  (Mcore default: False)
+0:   cuda_graph_impl: 'full_iteration'  (Mcore default: 'none')
+0:   cuda_graph_modules: []  (Mcore default: 'full')
+0:   cuda_graph_warmup_steps: 1  (Mcore default: 3)
+0:   deallocate_pipeline_outputs: True  (Mcore default: False)
+0:   embedding_init_method_std: 0.02  (Mcore default: None)
+0:   expert_tensor_parallel_size: 1  (Mcore default: None)
+0:   ffn_hidden_size: 14336  (Mcore default: None)
+0:   fp4: 'e2m1'  (Mcore default: None)
+0:   fp8_dot_product_attention: True  (Mcore default: False)
+0:   fp8_recipe: 'tensorwise'  (Mcore default: 'delayed')
+0:   fused_single_qkv_rope: True  (Mcore default: False)
+0:   gated_linear_unit: True  (Mcore default: False)
+0:   gradient_accumulation_fusion: True  (Mcore default: False)
+0:   hidden_dropout: 0.0  (Mcore default: 0.1)
+0:   hidden_size: 4096  (Mcore default: 0)
+0:   inference_cuda_graph_scope: <InferenceCudaGraphScope.none: 1>  (Mcore default: None)
+0:   kv_channels: 128  (Mcore default: None)
+0:   masked_softmax_fusion: True  (Mcore default: False)
+0:   microbatch_group_size_per_vp_stage: 1  (Mcore default: None)
+0:   normalization: 'RMSNorm'  (Mcore default: 'LayerNorm')
+0:   num_attention_heads: 32  (Mcore default: 0)
+0:   num_layers: 32  (Mcore default: 0)
+0:   num_layers_at_end_in_bf16: 0  (Mcore default: 1)
+0:   num_layers_at_start_in_bf16: 0  (Mcore default: 1)
+0:   num_query_groups: 8  (Mcore default: None)
+0:   overlap_p2p_comm: True  (Mcore default: False)
+0:   params_dtype: torch.bfloat16  (Mcore default: torch.float32)
+0:   persist_layer_norm: True  (Mcore default: False)
+0:   pipeline_dtype: torch.bfloat16  (Mcore default: None)
+0:   recompute_modules: ['core_attn']  (Mcore default: None)
+0:   tp_comm_bootstrap_backend: 'mpi'  (Mcore default: 'nccl')
+0:   tp_only_amax_red: True  (Mcore default: False)
+0:   use_te_rng_tracker: True  (Mcore default: False)
+0:   use_transformer_engine_op_fuser: True  (Mcore default: False)
+0:   wgrad_deferral_limit: 50  (Mcore default: 0)
+0: 
+0: ----------------------------------------------------------------------
+0: Other Configuration Values:
+0: ----------------------------------------------------------------------
+0: 
+0: [train]:
+0:   check_optimizer_step_success: False
+0:   decrease_batch_size_if_needed: False
+0:   empty_unused_memory_level: 0
+0:   exit_signal: <Signals.SIGTERM: 15>
+0:   exit_signal_handler: False
+0:   exit_signal_handler_for_dataloader: False
+0:   exit_signal_handler_for_training: False
+0:   global_batch_size: 16
+0:   iterations_to_skip: []
+0:   manual_gc: True
+0:   manual_gc_eval: False
+0:   manual_gc_interval: 500
+0:   micro_batch_size: 2
+0:   skip_sync_grad_norm_across_mp: True
+0:   train_iters: 1200000
+0: 
+0: [validation]:
+0:   eval_global_batch_size: 16
+0:   eval_interval: 768
+0:   eval_iters: 64
+0:   eval_micro_batch_size: 2
+0:   full_validation: False
+0:   multiple_validation_sets: False
+0:   skip_train: False
+0:   test_mode: False
+0: 
+0: [scheduler]:
+0:   end_weight_decay: 0.1
+0:   lr_decay_iters: 1200000
+0:   lr_decay_steps: 19200000
+0:   lr_decay_style: 'cosine'
+0:   lr_warmup_init: 2.3529411764705884e-05
+0:   lr_warmup_iters: 16
+0:   lr_warmup_samples: 0
+0:   lr_warmup_steps: 256
+0:   lr_wsd_decay_style: 'exponential'
+0:   override_opt_param_scheduler: False
+0:   start_weight_decay: 0.1
+0:   use_checkpoint_opt_param_scheduler: False
+0:   wd_incr_steps: 19200000
+0:   weight_decay_incr_style: 'constant'
+0: 
+0: [dataset]:
+0:   add_extra_token_to_sequence: True
+0:   allow_ambiguous_pad_tokens: False
+0:   blend_per_split: [(['/preproc_data/c4-train.en_6_text_document'], [50]), (['/preproc_data/c4-validation-91205-samples.en_text_document'], None), (['/preproc_data/c4-validation-91205-samples.en_text_document'], None)]
+0:   create_attention_mask: False
+0:   data_parallel_size: 1
+0:   data_sharding: True
+0:   dataloader_type: 'single'
+0:   defer_npy_index_mmap: True
+0:   drop_last: True
+0:   drop_last_partial_validation_sequence: True
+0:   eod_mask_loss: False
+0:   fast_cache_load: True
+0:   hybrid_context_parallel: False
+0:   inter_document_masking: False
+0:   mid_level_dataset_surplus: 0.005
+0:   mmap_bin_files: True
+0:   mock: False
+0:   num_dataset_builder_threads: 1
+0:   num_workers: 8
+0:   path_to_cache: '/npy_index'
+0:   persistent_workers: True
+0:   pin_memory: True
+0:   random_seed: 15371
+0:   reset_attention_mask: False
+0:   reset_position_ids: False
+0:   seq_length: 8192
+0:   sequence_length: 8192
+0:   sequence_parallel_size: 0
+0:   varlen_sbhd_validation: False
+0: 
+0: [checkpoint]:
+0:   also_save_hf_checkpoint: False
+0:   async_ckpt_cpu_priority: 10
+0:   async_ckpt_io_priority: 3
+0:   async_ckpt_use_cpu_shm: False
+0:   async_save: False
+0:   async_strategy: 'mcore'
+0:   async_write_results_mp_mode: 'fork'
+0:   auto_detect_ckpt_format: False
+0:   ckpt_assume_constant_structure: False
+0:   ckpt_convert_update_legacy_dist_opt_format: False
+0:   ckpt_format: 'torch_dist'
+0:   ckpt_fully_parallel_load_exchange_algo: 'broadcast'
+0:   ckpt_fully_parallel_load_per_rank_objects: False
+0:   ckpt_fully_parallel_load_process_group: 'dp'
+0:   ckpt_fully_parallel_save_process_group: 'dp'
+0:   ckpt_load_validate_sharding_integrity: True
+0:   ckpt_pg_tensors_cache_create: False
+0:   dist_ckpt_optim_fully_reshardable: False
+0:   dist_ckpt_save_pre_mcore_014: False
+0:   dist_ckpt_strictness: 'log_all'
+0:   dist_ckpt_workers: 1
+0:   distrib_optim_fully_reshardable_mem_efficient: False
+0:   exit_on_missing_checkpoint: False
+0:   finetune: False
+0:   fully_parallel_load: True
+0:   fully_parallel_save: True
+0:   hf_distributed_save: False
+0:   hf_save_every_n_ranks: 1
+0:   hf_trust_remote_code: False
+0:   load_main_params_from_ckpt: False
+0:   load_optim: False
+0:   load_rng: False
+0:   most_recent_k: -1
+0:   non_persistent_local_ckpt_algo: 'fully_parallel'
+0:   replication: False
+0:   replication_factor: 2
+0:   save_optim: True
+0:   save_rng: True
+0:   save_rng_state_per_dp_rank: False
+0:   save_tokenizer_assets: True
+0:   stage_precision_aware_optimizer_state_on_cpu: False
+0:   storage_writers_per_rank: 1
+0:   strict_fsdp_dtensor_load: False
+0:   use_checkpoint_args: False
+0:   use_mp_args_from_checkpoint_args: False
+0:   use_persistent_ckpt_worker: True
+0:   use_tokenizer_model_from_checkpoint_args: True
+0:   verify_integrity: False
+0: 
+0: [logger]:
+0:   barrier_with_L1_time: True
+0:   filter_warnings: True
+0:   log_device_memory_used: False
+0:   log_energy: False
+0:   log_interval: 1200001
+0:   log_l2_norm_grad_to_tensorboard: False
+0:   log_loss_scale_to_tensorboard: True
+0:   log_max_attention_logit: False
+0:   log_memory_to_tensorboard: False
+0:   log_num_zeros_in_grad: False
+0:   log_params_norm: False
+0:   log_progress: False
+0:   log_runtime_to_tensorboard: False
+0:   log_throughput: False
+0:   log_throughput_to_tensorboard: False
+0:   log_timers_to_tensorboard: False
+0:   log_validation_ppl_to_tensorboard: False
+0:   log_world_size_to_tensorboard: False
+0:   mlflow_log_artifacts: True
+0:   moe_routing_trace_capture_hidden_states: False
+0:   moe_routing_trace_capture_logits: False
+0:   moe_routing_trace_dump_weights: False
+0:   runtime_time_unit: 'hours'
+0:   set_level_for_all_loggers: False
+0:   skip_train_metrics_log: True
+0:   tensorboard_log_interval: 1
+0:   tensorboard_queue_size: 1000
+0:   throughput_window_size: 100
+0:   timing_log_level: -1
+0:   timing_log_option: 'minmax'
+0: 
+0: [tokenizer]:
+0:   force_system_message: False
+0:   hf_tokenizer_kwargs: {'use_fast': True}
+0:   make_vocab_size_divisible_by: 1
+0:   null_tokenizer_pad_id: -1
+0:   pad_vocab_size: False
+0:   rank: 0
+0:   tensor_model_parallel_size: 1
+0:   tiktoken_num_special_tokens: 1000
+0:   tokenizer_hf_no_include_special_tokens: False
+0:   tokenizer_hf_no_use_fast: False
+0:   tokenizer_model: '/workspace/llm/nemo_tokenizer'
+0:   tokenizer_sentencepiece_ignore_extra_whitespaces: True
+0:   tokenizer_sentencepiece_legacy: False
+0:   tokenizer_type: 'HuggingFaceTokenizer'
+0:   trust_remote_code: False
+0:   use_gigatoken: False
+0:   use_tokenizer_vocab_size: False
+0:   vocab_extra_ids: 0
+0: 
+0: [rng]:
+0:   data_parallel_random_init: False
+0:   inference_rng_tracker: False
+0:   seed: 15371
+0:   te_rng_tracker: True
+0: 
+0: ======================================================================
+0: Setting logging level to 20
+0: setting number of microbatches to constant 1
+0: > initializing torch distributed ...
+3: Setting logging level to 20
+2: Setting logging level to 20
+0: NCCL version 2.31.2+cuda13.4
+0: > initialized tensor model parallel with size 1
+0: > initialized pipeline model parallel with size 1
+0: > setting random seeds to 15371 ...
+0: > compiling dataset index builder ...
+4: make: Entering directory '/workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/datasets'
+0: make: Entering directory '/workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/datasets'
+4: make: Nothing to be done for 'default'.
+4: make: Leaving directory '/workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/datasets'
+0: make: Nothing to be done for 'default'.
+0: make: Leaving directory '/workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/datasets'
+0: >>> done with dataset index builder. Compilation time: 0.677 seconds
+0: time to initialize megatron (seconds): 11.838
+0: [after megatron is initialized] datetime: 2026-10-13 10:27:37 
+0: [after tokenizer is built] datetime: 2026-10-13 10:27:38 
+0:  > padded vocab (size: 128256) with 0 dummy tokens (new size: 128256)
+0:  > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank (0, 0, 0): 8030261248
+0: Setting up DistributedDataParallel with config DistributedDataParallelConfig(grad_reduce_in_fp32=False, overlap_grad_reduce=True, overlap_param_gather=True, align_param_gather=False, use_distributed_optimizer=True, num_distributed_optimizer_instances=1, check_for_nan_in_grad=False, check_for_large_grads=False, bucket_size=768000000, num_buckets=None, pad_buckets_for_high_nccl_busbw=False, reduce_scatter_with_fp32_accumulation=False, param_name_patterns_for_fp32_local_accumulation=(), average_in_collective=False, fp8_param_gather=False, fp4_param_gather=False, reuse_grad_buf_for_mxfp8_param_ag=False, use_megatron_fsdp=False, megatron_fsdp_version=1, use_custom_fsdp=False, data_parallel_sharding_strategy='optim_grads_params', expert_data_parallel_sharding_strategy=None, gradient_reduce_div_fusion=True, suggested_communication_unit_size=None, keep_fp8_transpose_cache=False, nccl_ub=False, fsdp_double_buffer=False, fsdp_db_use_persist_buf_on_alloc_fail=False, fsdp_all_gather_in_start_param_sync=True, outer_dp_sha
+0: rding_strategy='no_shard', expert_outer_dp_sharding_strategy='no_shard', disable_symmetric_registration=False, fsdp_manual_registration=False, delay_wgrad_compute=None, megatron_fsdp_main_params_dtype=torch.float32, megatron_fsdp_main_grads_dtype=None, megatron_fsdp_grad_comm_dtype=None, megatron_fsdp_use_decoupled_grad=False, megatron_fsdp_cuda_graph_mode=False, megatron_fsdp_enable_fine_grained_param_gather=False, megatron_fsdp_max_pool_double_buffer=False, hfsdp_param_gather_overlap=False)
+0: Setting up optimizer with config OptimizerConfig(lr=0.0004, min_lr=4e-05, decoupled_lr=None, decoupled_min_lr=None, weight_decay=0.1, apply_wd_to_qk_layernorm=False, fp8_recipe='tensorwise', fp16=False, bf16=True, reuse_grad_buf_for_mxfp8_param_ag=False, params_dtype=torch.bfloat16, use_precision_aware_optimizer=False, store_param_remainders=True, main_grads_dtype=torch.float32, main_params_dtype=torch.float32, exp_avg_dtype=torch.float32, exp_avg_sq_dtype=torch.float32, optimizer='adam', loss_scale=None, initial_loss_scale=4294967296, min_loss_scale=1.0, loss_scale_window=1000, hysteresis=2, adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-05, decoupled_weight_decay=True, sgd_momentum=0.9, muon_momentum=0.95, muon_split_qkv=True, muon_nesterov=False, muon_scale_mode='spectral', muon_fp32_matmul_prec='medium', muon_coefficient_type='quintic', muon_num_ns_steps=5, muon_tp_mode='duplicated', muon_use_syrk=False, muon_extra_scale_factor=1.0, muon_scalar_optimizer='adam', lion_beta1=0.95, lion_beta2=0.98, soap_shampo
+0: o_beta=0.95, soap_use_kl_shampoo=True, adaptive_muon_moment2_method='adamuon', adaptive_muon_beta2=0.95, adaptive_muon_eps=1e-08, use_distributed_optimizer=True, use_layer_wise_distributed_optimizer=False, overlap_param_gather=True, overlap_param_gather_with_optimizer_step=False, optimizer_cpu_offload=False, optimizer_offload_fraction=0.0, use_torch_optimizer_for_cpu_offload=False, overlap_cpu_optimizer_d2h_h2d=False, pin_cpu_grads=True, pin_cpu_params=True, clip_grad=1.0, grad_norm_skip_threshold=inf, log_num_zeros_in_grad=False, barrier_with_L1_time=False, timers=<megatron.core.timers.Timers object at 0xe54dd80f0f20>, config_logger_dir='', optimizer_cuda_graph=False)
+0: [after model, optimizer, and learning rate scheduler are built] datetime: 2026-10-13 10:27:38 
+0: 
+0: MCore config:
+0: Llama31ModelProvider8B(tensor_model_parallel_size=1,
+0:                        tensor_parallel_num_weight_shards=None,
+0:                        gtp_weight_remat_size=1,
+0:                        pipeline_model_parallel_comm_backend=None,
+0:                        pipeline_model_parallel_size=1,
+0:                        virtual_pipeline_model_parallel_size=None,
+0:                        sequence_parallel=False,
+0:                        context_parallel_size=1,
+0:                        hierarchical_context_parallel_sizes=None,
+0:                        max_seqlen_per_dp_cp_rank=None,
+0:                        hybrid_context_parallel=False,
+0:                        sequence_packing_scheduler=None,
+0:                        expert_model_parallel_size=1,
+0:                        expert_tensor_parallel_size=1,
+0:                        expert_tensor_parallel_num_weight_shards=None,
+0:                        expert_gtp_weight_remat_size=1,
+0:                        perform_initialization=True,
+0:                        use_cpu_initialization=False,
+0:                        fp16=False,
+0:                        bf16=True,
+0:                        params_dtype=torch.bfloat16,
+0:                        timers=<megatron.core.timers.Timers object at 0xe54dd80f0f20>,
+0:                        finalize_model_grads_func=functools.partial(<function finalize_model_grads at 0xe54e3f4902c0>, pg_collection=ProcessGroupCollection(tp(1), pp(1), mp(1), embd(1), pos_embd(1), cp(1), tp_cp(1), ep(1), expt_tp(1), tp_ep(1), tp_ep_pp(1), tp_ep_pp_with_egtp_remat(1), tp_dp_cp(8), dp(8), dp_cp(8), dp_cp_gtp_remat(8), gtp_remat(1), expt_gtp_remat(1), expt_dp(8), expt_dp_gtp_remat(8), intra_dp_cp(8), intra_expt_dp(8), intra_dist_opt(8))),
+0:                        grad_scale_func=<bound method MegatronOptimizer.scale_loss of <megatron.core.optimizer.optimizer.ChainedOptimizer object at 0xe54ca00a2810>>,
+0:                        moe_grad_scale_func=None,
+0:                        mtp_grad_scale_func=None,
+0:                        no_sync_func=<bound method DistributedDataParallel.no_sync of DistributedDataParallel(
+0:   (module): Float16Module(
+0:     (module): GPTModel(
+0:       (embedding): LanguageModelEmbedding(
+0:         (word_embeddings): VocabParallelEmbedding()
+0:         (embedding_dropout): Dropout(p=0.0, inplace=False)
+0:       )
+0:       (rotary_pos_emb): RotaryEmbedding()
+0:       (decoder): TransformerBlock(
+0:         (layers): ModuleList(
+0:           (0-31): 32 x TransformerLayer(
+0:             (input_layernorm): IdentityOp()
+0:             (self_attention): SelfAttention(
+0:               (core_attention): TEDotProductAttention(
+0:                 (flash_attention): FlashAttention()
+0:                 (fused_attention): FusedAttention()
+0:                 (unfused_attention): UnfusedDotProductAttention(
+0:                   (scale_mask_softmax): FusedScaleMaskSoftmax()
+0:                   (attention_dropout): Dropout(p=0.0, inplace=False)
+0:                 )
+0:               )
+0:               (linear_proj): TERowParallelLinear(in_features=4096, out_features=4096, bias=False, TP=1)
+0:               (linear_qkv): TELayerNormColumnParallelLinear(in_features=4096, out_features=6144, bias=False, TP=1)
+0:             )
+0:             (pre_cross_attn_layernorm): IdentityOp()
+0:             (cross_attention): IdentityOp()
+0:             (cross_attn_bda): IdentityFuncOp()
+0:             (pre_mlp_layernorm): IdentityOp()
+0:             (mlp): TEFusedMLP(
+0:               (linear_fc1): TELayerNormColumnParallelLinear(in_features=4096, out_features=28672, bias=False, TP=1)
+0:               (linear_fc2): TERowParallelLinear(in_features=14336, out_features=4096, bias=False, TP=1)
+0:             )
+0:           )
+0:         )
+0:         (final_layernorm): RMSNorm()
+0:       )
+0:       (output_layer): ColumnParallelLinear(in_features=4096, out_features=128256, bias=False, TP=1)
+0:     )
+0:   )
+0: )>,
+0:                        grad_sync_func=<bound method DistributedDataParallel.start_grad_sync of DistributedDataParallel(
+0:   (module): Float16Module(
+0:     (module): GPTModel(
+0:       (embedding): LanguageModelEmbedding(
+0:         (word_embeddings): VocabParallelEmbedding()
+0:         (embedding_dropout): Dropout(p=0.0, inplace=False)
+0:       )
+0:       (rotary_pos_emb): RotaryEmbedding()
+0:       (decoder): TransformerBlock(
+0:         (layers): ModuleList(
+0:           (0-31): 32 x TransformerLayer(
+0:             (input_layernorm): IdentityOp()
+0:             (self_attention): SelfAttention(
+0:               (core_attention): TEDotProductAttention(
+0:                 (flash_attention): FlashAttention()
+0:                 (fused_attention): FusedAttention()
+0:                 (unfused_attention): UnfusedDotProductAttention(
+0:                   (scale_mask_softmax): FusedScaleMaskSoftmax()
+0:                   (attention_dropout): Dropout(p=0.0, inplace=False)
+0:                 )
+0:               )
+0:               (linear_proj): TERowParallelLinear(in_features=4096, out_features=4096, bias=False, TP=1)
+0:               (linear_qkv): TELayerNormColumnParallelLinear(in_features=4096, out_features=6144, bias=False, TP=1)
+0:             )
+0:             (pre_cross_attn_layernorm): IdentityOp()
+0:             (cross_attention): IdentityOp()
+0:             (cross_attn_bda): IdentityFuncOp()
+0:             (pre_mlp_layernorm): IdentityOp()
+0:             (mlp): TEFusedMLP(
+0:               (linear_fc1): TELayerNormColumnParallelLinear(in_features=4096, out_features=28672, bias=False, TP=1)
+0:               (linear_fc2): TERowParallelLinear(in_features=14336, out_features=4096, bias=False, TP=1)
+0:             )
+0:           )
+0:         )
+0:         (final_layernorm): RMSNorm()
+0:       )
+0:       (output_layer): ColumnParallelLinear(in_features=4096, out_features=128256, bias=False, TP=1)
+0:     )
+0:   )
+0: )>,
+0:                        param_sync_func=None,
+0:                        deterministic_mode=False,
+0:                        enable_autocast=False,
+0:                        autocast_dtype=torch.bfloat16,
+0:                        num_microbatches_with_partial_activation_checkpoints=None,
+0:                        gradient_accumulation_fusion=True,
+0:                        use_te_rng_tracker=True,
+0:                        tp_comm_overlap=False,
+0:                        tp_comm_bulk_wgrad=True,
+0:                        tp_comm_bulk_dgrad=True,
+0:                        tp_comm_overlap_ag=True,
+0:                        tp_comm_overlap_rs=True,
+0:                        tp_comm_overlap_rs_dgrad=False,
+0:                        tp_comm_split_ag=True,
+0:                        tp_comm_atomic_ag=False,
+0:                        tp_comm_split_rs=True,
+0:                        tp_comm_atomic_rs=False,
+0:                        cross_entropy_loss_fusion=True,
+0:                        cross_entropy_fusion_impl='te',
+0:                        tp_comm_overlap_disable_qkv=False,
+0:                        tp_comm_overlap_disable_fc1=False,
+0:                        tp_comm_bootstrap_backend='mpi',
+0:                        overlap_moe_expert_parallel_comm=False,
+0:                        delay_wgrad_compute=False,
+0:                        overlap_dispatch_backward_with_experts_wgrad=False,
+0:                        ep_overlap_early_attn_memory_release=False,
+0:                        pipeline_dtype=torch.bfloat16,
+0:                        variable_seq_lengths=False,
+0:                        overlap_p2p_comm=True,
+0:                        batch_p2p_comm=False,
+0:                        batch_p2p_sync=True,
+0:                        use_ring_exchange_p2p=False,
+0:                        deallocate_pipeline_outputs=True,
+0:                        defer_embedding_wgrad_compute=False,
+0:                        wgrad_deferral_limit=50,
+0:                        overlap_p2p_comm_warmup_flush=False,
+0:                        microbatch_group_size_per_vp_stage=1,
+0:                        mtp_standalone=False,
+0:                        cpu_offloading=False,
+0:                        cpu_offloading_num_layers=95,
+0:                        _cpu_offloading_context=None,
+0:                        cpu_offloading_activations=True,
+0:                        cpu_offloading_weights=False,
+0:                        cpu_offloading_double_buffering=False,
+0:                        cpu_offloading_retain_pinned_cpu_buffers=False,
+0:                        barrier_with_L1_time=True,
+0:                        num_layers=32,
+0:                        mtp_num_layers=None,
+0:                        mtp_loss_scaling_factor=0.1,
+0:                        mtp_use_repeated_layer=False,
+0:                        freeze_base_model_for_mtp=False,
+0:                        mtp_detach_heads=False,
+0:                        mtp_hsm=False,
+0:                        mtp_hybrid_override_pattern=None,
+0:                        num_layers_in_first_pipeline_stage=None,
+0:                        num_layers_in_last_pipeline_stage=None,
+0:                        pipeline_model_parallel_layout=None,
+0:                        account_for_embedding_in_pipeline_split=False,
+0:                        account_for_loss_in_pipeline_split=False,
+0:                        hidden_size=4096,
+0:                        num_attention_heads=32,
+0:                        attention_backend=<AttnBackend.auto: 5>,
+0:                        flash_attention_version=None,
+0:                        softmax_scale=None,
+0:                        softmax_type='vanilla',
+0:                        attn_logit_softcapping=None,
+0:                        num_query_groups=8,
+0:                        ffn_hidden_size=14336,
+0:                        kv_channels=128,
+0:                        hidden_dropout=0.0,
+0:                        attention_dropout=0.0,
+0:                        fp32_residual_connection=False,
+0:                        apply_residual_connection_post_layernorm=False,
+0:                        layernorm_epsilon=1e-05,
+0:                        layernorm_zero_centered_gamma=False,
+0:                        add_bias_linear=False,
+0:                        add_qkv_bias=False,
+0:                        gated_linear_unit=True,
+0:                        activation_func=<function silu at 0xe550ff88e0c0>,
+0:                        activation_func_fp8_input_store=False,
+0:                        glu_linear_offset=0.0,
+0:                        activation_func_clamp_value=None,
+0:                        activation_func_tanh_clamp_scale=None,
+0:                        activation_func_tanh_clamp_scale_linear=None,
+0:                        num_moe_experts=None,
+0:                        rotary_interleaved=False,
+0:                        window_size=None,
+0:                        window_attn_skip_freq=None,
+0:                        normalization='RMSNorm',
+0:                        qk_layernorm=False,
+0:                        qk_l2_norm=False,
+0:                        qk_clip=False,
+0:                        qk_clip_alpha=0.5,
+0:                        qk_clip_threshold=100,
+0:                        log_max_attention_logit=False,
+0:                        attention_output_gate=False,
+0:                        test_mode=False,
+0:                        calculate_per_token_loss=False,
+0:                        multi_latent_attention=False,
+0:                        no_rope_freq=None,
+0:                        experimental_attention_variant=None,
+0:                        experimental_attention_variant_loss_scale_func=None,
+0:                        dsa_indexer_n_heads=None,
+0:                        dsa_indexer_head_dim=None,
+0:                        dsa_indexer_topk=None,
+0:                        dsa_indexer_topk_freq=1,
+0:                        dsa_indexer_skip_topk_offset=0,
+0:                        dsa_indexer_loss_coeff=None,
+0:                        dsa_indexer_use_sparse_loss=False,
+0:                        dsa_kernel_backend='none',
+0:                        dsa_indexer_rope_interleaved=False,
+0:                        dsa_indexer_rotate_activation=True,
+0:                        dsa_indexer_scoring_relu=True,
+0:                        dsa_indexer_k_norm_epsilon=None,
+0:                        dsa_indexer_k_norm_fp32=False,
+0:                        csa_window_size=128,
+0:                        csa_compress_ratios=None,
+0:                        csa_compress_rotary_base=40000.0,
+0:                        csa_dense_mode=False,
+0:                        linear_attention_freq=None,
+0:                        linear_conv_kernel_dim=4,
+0:                        linear_key_head_dim=128,
+0:                        linear_value_head_dim=128,
+0:                        linear_num_key_heads=16,
+0:                        linear_num_value_heads=32,
+0:                        init_method=functools.partial(<function normal_ at 0xe550ff71f060>, mean=0.0, std=0.02),
+0:                        output_layer_init_method=functools.partial(<function normal_ at 0xe550ff71f060>, mean=0.0, std=0.0025),
+0:                        init_method_std=0.02,
+0:                        embedding_init_method=functools.partial(<function normal_ at 0xe550ff71f060>, mean=0.0, std=0.02),
+0:                        embedding_init_method_std=0.02,
+0:                        init_model_with_meta_device=False,
+0:                        use_mup=False,
+0:                        mup_width_mult=1.0,
+0:                        mup_base_hidden_size=None,
+0:                        mup_embedding_mult=1.0,
+0:                        mup_output_mult=1.0,
+0:                        mup_base_head_dim=None,
+0:                        mup_attn_scale_power=1.0,
+0:                        apply_query_key_layer_scaling=False,
+0:                        attention_softmax_in_fp32=False,
+0:                        disable_bf16_reduced_precision_matmul=False,
+0:                        bias_activation_fusion=True,
+0:                        masked_softmax_fusion=True,
+0:                        persist_layer_norm=True,
+0:                        memory_efficient_layer_norm=False,
+0:                        bias_dropout_fusion=True,
+0:                        apply_rope_fusion=True,
+0:                        use_fused_weighted_squared_relu=False,
+0:                        fused_single_qkv_rope=True,
+0:                        fused_residual_rmsnorm=False,
+0:                        use_transformer_engine_op_fuser=True,
+0:                        recompute_granularity=None,
+0:                        recompute_method=None,
+0:                        recompute_num_layers=None,
+0:                        distribute_saved_activations=False,
+0:                        recompute_modules=['core_attn'],
+0:                        fp8=None,
+0:                        fp8_recipe='tensorwise',
+0:                        fp8_param=False,
+0:                        fp8_quantizer_factory=None,
+0:                        fp8_margin=0,
+0:                        fp8_interval=1,
+0:                        fp8_amax_history_len=1,
+0:                        fp8_amax_compute_algo='most_recent',
+0:                        fp8_wgrad=True,
+0:                        fp8_output_proj=False,
+0:                        fp8_dot_product_attention=True,
+0:                        fp8_multi_head_attention=False,
+0:                        tp_only_amax_red=True,
+0:                        first_last_layers_bf16=False,
+0:                        num_layers_at_start_in_bf16=0,
+0:                        num_layers_at_end_in_bf16=0,
+0:                        use_kitchen=False,
+0:                        use_kitchen_attention=False,
+0:                        kitchen_attention_backend='sdpa',
+0:                        fp4='e2m1',
+0:                        fp4_recipe='nvfp4',
+0:                        fp4_param=False,
+0:                        fp4_quantizer_factory=None,
+0:                        high_priority_a2a_comm_stream=False,
+0:                        moe_shared_expert_intermediate_size=None,
+0:                        moe_shared_expert_gate=False,
+0:                        moe_shared_expert_overlap=False,
+0:                        use_grouped_gemm_for_shared_expert=False,
+0:                        moe_shared_expert_glu_interleave_size=None,
+0:                        moe_layer_freq=1,
+0:                        moe_ffn_hidden_size=None,
+0:                        moe_router_load_balancing_type='aux_loss',
+0:                        moe_router_topk=2,
+0:                        moe_enable_routing_replay=False,
+0:                        moe_router_topk_limited_devices=None,
+0:                        moe_router_padding_for_quantization=False,
+0:                        moe_router_padding_for_fp8=False,
+0:                        moe_router_num_groups=None,
+0:                        moe_router_group_topk=None,
+0:                        moe_router_pre_softmax=False,
+0:                        moe_router_topk_scaling_factor=None,
+0:                        moe_router_score_function='softmax',
+0:                        moe_router_dtype=None,
+0:                        moe_router_skip_muon=False,
+0:                        moe_router_enable_expert_bias=False,
+0:                        moe_router_bias_update_rate=0.001,
+0:                        moe_router_quantile_balancing_ema=0.0,
+0:                        moe_router_force_load_balancing=False,
+0:                        moe_router_force_biased=None,
+0:                        use_grouped_gemm_for_dense_mlp=False,
+0:                        moe_grouped_gemm=False,
+0:                        moe_use_grouped_tensor=False,
+0:                        moe_single_grouped_weight=False,
+0:                        moe_single_grouped_bias=False,
+0:                        moe_aux_loss_coeff=0.0,
+0:                        moe_z_loss_coeff=None,
+0:                        moe_input_jitter_eps=None,
+0:                        moe_token_dropping=False,
+0:                        moe_token_dispatcher_type='allgather',
+0:                        moe_enable_deepep=False,
+0:                        moe_flex_dispatcher_backend='deepep',
+0:                        moe_permute_fusion_into_hybridep=False,
+0:                        moe_hybridep_pad_uneven_dispatch_inputs=False,
+0:                        moe_per_layer_logging=False,
+0:                        moe_expert_capacity_factor=None,
+0:                        moe_pad_expert_input_to_capacity=False,
+0:                        moe_pad_experts_for_cuda_graph_inference=False,
+0:                        moe_token_drop_policy='probs',
+0:                        moe_layer_recompute=False,
+0:                        moe_permute_fusion=False,
+0:                        moe_router_fusion=False,
+0:                        moe_apply_probs_on_input=False,
+0:                        moe_latent_size=None,
+0:                        moe_use_norm_before_up_proj=False,
+0:                        gtp_remat_opt_in_modules=[],
+0:                        moe_flex_dispatcher_num_sms=None,
+0:                        moe_deepep_num_sms=None,
+0:                        moe_hybridep_num_sms=None,
+0:                        moe_hybridep_num_blocks_permute=None,
+0:                        moe_hybridep_num_blocks_unpermute=None,
+0:                        moe_hybridep_num_sms_preprocessing=108,
+0:                        moe_ncclep_zero_copy=False,
+0:                        moe_dispatch_fwd_dtype='bf16',
+0:                        moe_combine_bwd_dtype='bf16',
+0:                        moe_mlp_glu_interleave_size=None,
+0:                        moe_expert_rank_capacity_factor=None,
+0:                        cp_comm_type=None,
+0:                        linear_cp_mode='headwise',
+0:                        linear_cp_layout='zigzag',
+0:                        attention_cp_layout='zigzag',
+0:                        enable_cuda_graph=False,
+0:                        cuda_graph_use_single_mempool=True,
+0:                        cuda_graph_retain_backward_graph=False,
+0:                        cuda_graph_warmup_steps=1,
+0:                        external_cuda_graph=False,
+0:                        cuda_graph_impl='full_iteration',
+0:                        cuda_graph_modules=[],
+0:                        inference_cuda_graph_scope=<InferenceCudaGraphScope.none: 1>,
+0:                        cuda_graph_scope=None,
+0:                        enable_mhc_connections=False,
+0:                        mhc_num_residual_streams=4,
+0:                        mhc_sinkhorn_iterations=20,
+0:                        mhc_init_gating_factor=0.01,
+0:                        use_fused_mhc=False,
+0:                        mhc_fused_backend='auto',
+0:                        mhc_recompute_layer_num=None,
+0:                        clone_scatter_output_in_embedding=True,
+0:                        disable_parameter_transpose_cache=False,
+0:                        config_logger_dir='',
+0:                        flash_decode=False,
+0:                        batch_invariant_mode=False,
+0:                        batch_invariant_backend='te_native',
+0:                        batch_invariant_collective='ordered',
+0:                        use_te_activation_func=False,
+0:                        inference_rng_tracker=False,
+0:                        inference_sampling_seed=42,
+0:                        symmetric_ar_type=None,
+0:                        nccl_all_reduce_for_prefill=False,
+0:                        use_inference_optimized_layers=False,
+0:                        inference_fuse_tp_communication=False,
+0:                        inference_disable_triton_nvls_kernels=False,
+0:                        inference_grouped_gemm_backend='vllm',
+0:                        inference_moe_disable_fused_quant_kernels=False,
+0:                        inference_flashinfer_mxfp8_token_capacity=None,
+0:                        inference_moe_token_dispatcher_type='nvls',
+0:                        mrope_section=None,
+0:                        is_hybrid_model=False,
+0:                        mamba_state_dim=128,
+0:                        mamba_head_dim=64,
+0:                        mamba_num_groups=8,
+0:                        mamba_num_heads=None,
+0:                        gdp_num_householder=3,
+0:                        mamba_training_ssm_states_dtype=None,
+0:                        use_mamba_mem_eff_path=True,
+0:                        gdp_cutedsl_kernel=False,
+0:                        gdp_num_chunk_states_to_recompute=2,
+0:                        mlp_chunks_for_prefill=1,
+0:                        mlp_chunks_for_training=1,
+0:                        heterogeneous_block_specs=False,
+0:                        hetereogenous_dist_checkpoint=False,
+0:                        quant_recipe=None,
+0:                        transformer_impl='transformer_engine',
+0:                        fine_grained_activation_offloading=False,
+0:                        offload_modules=[],
+0:                        min_offloaded_tensor_size=1048576,
+0:                        delay_offload_until_cuda_graph=False,
+0:                        delta_offload_bytes_across_pp_ranks=0,
+0:                        activation_offload_fraction=1.0,
+0:                        moe_paged_stash=False,
+0:                        moe_paged_stash_page_size=64,
+0:                        moe_paged_stash_buffer_size_factor_cuda=1.1,
+0:                        moe_paged_stash_buffer_size_factor_cpu=0.0,
+0:                        fine_grained_offloading_max_inflight_offloads=None,
+0:                        fp16_lm_cross_entropy=False,
+0:                        logit_dtype=None,
+0:                        parallel_output=True,
+0:                        share_embeddings_and_output_weights=False,
+0:                        make_vocab_size_divisible_by=128,
+0:                        position_embedding_type='rope',
+0:                        rotary_base=500000,
+0:                        rotary_percent=1.0,
+0:                        rope_scaling=True,
+0:                        rope_scaling_factor=8.0,
+0:                        rotary_scaling_factor=None,
+0:                        seq_len_interpolation_factor=None,
+0:                        yarn_rotary_scaling_factor=None,
+0:                        yarn_original_max_position_embeddings=None,
+0:                        yarn_beta_fast=None,
+0:                        yarn_beta_slow=None,
+0:                        yarn_mscale=None,
+0:                        yarn_mscale_all_dim=None,
+0:                        yarn_correction_range_round_to_int=None,
+0:                        seq_length=8192,
+0:                        scatter_embedding_sequence_parallel=True,
+0:                        tp_comm_overlap_cfg=None,
+0:                        use_transformer_engine_full_layer_spec=False,
+0:                        dense_grouped_gemm=False,
+0:                        transformer_layer_spec=<function default_layer_spec at 0xe54dd8d78e00>,
+0:                        mtp_layer_spec_transform=None,
+0:                        hf_model_id=None,
+0:                        hf_model_revision=None,
+0:                        vocab_size=128256,
+0:                        should_pad_vocab=True,
+0:                        mtp_enabled=False,
+0:                        restore_modelopt_state=False,
+0:                        use_arbitrary_attention_mask=None,
+0:                        _pg_collection=ProcessGroupCollection(tp(1), pp(1), mp(1), embd(1), pos_embd(1), cp(1), tp_cp(1), ep(1), expt_tp(1), tp_ep(1), tp_ep_pp(1), tp_ep_pp_with_egtp_remat(1), tp_dp_cp(8), dp(8), dp_cp(8), dp_cp_gtp_remat(8), gtp_remat(1), expt_gtp_remat(1), expt_dp(8), expt_dp_gtp_remat(8), intra_dp_cp(8), intra_expt_dp(8), intra_dist_opt(8)),
+0:                        std=0.02)
+1: NCCL version 2.31.2+cuda13.4
+6: NCCL version 2.31.2+cuda13.4
+7: NCCL version 2.31.2+cuda13.4
+5: NCCL version 2.31.2+cuda13.4
+4: NCCL version 2.31.2+cuda13.4
+2: NCCL version 2.31.2+cuda13.4
+3: NCCL version 2.31.2+cuda13.4
+0: Starting training warmup
+0:     Starting warmup step 0
+0:     Finished warmup step 0, takes 2.6031899452209473 s
+0:     Starting warmup step 1
+0: Capture CUDA graph for training!!!
+0: CUDA graph capture done for training!!!
+0:     Finished warmup step 1, takes 1.006739854812622 s
+0: Finished training warmup: 3.610591173171997 s. 
+0: Starting validation warmups
+0: Capture CUDA graph for validation!!!
+0: CUDA graph capture done for validation!!!
+0: Finished validation warmup: 0.7615251541137695 s. 
+0: Time spent in run_training_warmup: 4.372421741485596s
+0: > building train, validation, and test datasets for GPT ...
+0: > finished creating GPT datasets ...
+0: :::MLLOG {"namespace": "", "time_ms": 1791887296291, "event_type": "INTERVAL_END", "key": "init_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 161}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887296292, "event_type": "INTERVAL_START", "key": "run_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 161}}
+0: > building train, validation, and test datasets ...
+0:  > datasets target sizes (minimum size):
+0:     train:      19200000
+0:     validation: 1600512
+0:     test:       1024
+0: [after dataloaders are built] datetime: 2026-10-13 10:28:16 
+0: done with setup ...
+0: Setting rerun_state_machine.current_iteration to 0...
+0: Starting training loop at iteration 0
+0: :::MLLOG {"namespace": "", "time_ms": 1791887297236, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 165, "samples_count": 12288, "step": 0}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887297595, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.016228437423706055, "reduced_train_loss": 12.576288223266602}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 0}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887307866, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.31967616081237793, "reduced_train_loss": 8.21918773651123}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 512}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887318176, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3248100280761719, "reduced_train_loss": 7.686000823974609}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 1024}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887328641, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.32712483406066895, "reduced_train_loss": 7.309839248657227}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 1536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887339165, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33048319816589355, "reduced_train_loss": 6.943476676940918}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 2048}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887349728, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33031272888183594, "reduced_train_loss": 6.940853118896484}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 2560}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887360297, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3289973735809326, "reduced_train_loss": 6.857181072235107}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 3072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887370888, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3317594528198242, "reduced_train_loss": 6.605374336242676}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 3584}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887381488, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33263182640075684, "reduced_train_loss": 6.5707502365112305}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 4096}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887392103, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3304719924926758, "reduced_train_loss": 6.501641273498535}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 4608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887402716, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33030200004577637, "reduced_train_loss": 6.4259033203125}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 5120}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887413337, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33295130729675293, "reduced_train_loss": 6.238941669464111}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 5632}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887423964, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33245849609375, "reduced_train_loss": 6.440671920776367}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 6144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887434582, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312509059906006, "reduced_train_loss": 6.059144496917725}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 6656}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887445199, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33241844177246094, "reduced_train_loss": 5.9739274978637695}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 7168}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887455827, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3313326835632324, "reduced_train_loss": 5.952635765075684}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 7680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887466454, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325984477996826, "reduced_train_loss": 5.791189670562744}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 8192}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887477091, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3333423137664795, "reduced_train_loss": 5.673928260803223}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 8704}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887487715, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33176279067993164, "reduced_train_loss": 5.595695972442627}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 9216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887498355, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3342721462249756, "reduced_train_loss": 5.41672420501709}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 9728}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887508990, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332338809967041, "reduced_train_loss": 5.4469170570373535}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 10240}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887519627, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3329582214355469, "reduced_train_loss": 5.420059680938721}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 10752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887530262, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33121728897094727, "reduced_train_loss": 5.3273725509643555}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 11264}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887540897, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33179354667663574, "reduced_train_loss": 5.195754051208496}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 11776}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887550306, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887550307, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 12288, "step": 768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887557512, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.205329864984378}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887557513, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 5.120489597320557, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 12288}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887557513, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 12288, "step": 768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887557514, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887557854, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.019969463348388672, "reduced_train_loss": 5.082160472869873}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 12288}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887568493, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3336360454559326, "reduced_train_loss": 5.138358116149902}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 12800}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887579146, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33174586296081543, "reduced_train_loss": 4.940997123718262}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 13312}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887589778, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323705196380615, "reduced_train_loss": 5.039715766906738}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 13824}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887600417, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.333054780960083, "reduced_train_loss": 4.792494297027588}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 14336}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887611051, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3320639133453369, "reduced_train_loss": 4.907607555389404}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 14848}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887621696, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33444976806640625, "reduced_train_loss": 4.860614776611328}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 15360}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887632342, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323988914489746, "reduced_train_loss": 4.766247749328613}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 15872}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887642987, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33265066146850586, "reduced_train_loss": 4.595942974090576}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 16384}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887653629, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3317842483520508, "reduced_train_loss": 4.7282280921936035}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 16896}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887664279, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33408141136169434, "reduced_train_loss": 4.511561870574951}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 17408}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887674910, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33196496963500977, "reduced_train_loss": 4.597229957580566}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 17920}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887685549, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312838077545166, "reduced_train_loss": 4.486358642578125}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 18432}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887696183, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3335452079772949, "reduced_train_loss": 4.45973539352417}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 18944}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887706827, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33478546142578125, "reduced_train_loss": 4.442702770233154}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 19456}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887717478, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33415865898132324, "reduced_train_loss": 4.435057640075684}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 19968}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887728107, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33065342903137207, "reduced_train_loss": 4.391794681549072}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 20480}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887738747, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3309493064880371, "reduced_train_loss": 4.3889923095703125}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 20992}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887749394, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33142828941345215, "reduced_train_loss": 4.471986770629883}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 21504}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887760029, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321850299835205, "reduced_train_loss": 4.383179664611816}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 22016}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887770665, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3320746421813965, "reduced_train_loss": 4.365490913391113}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 22528}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887781307, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33243227005004883, "reduced_train_loss": 4.292842864990234}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 23040}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887791952, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33170127868652344, "reduced_train_loss": 4.390181064605713}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 23552}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887802584, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.330613374710083, "reduced_train_loss": 4.230850696563721}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 24064}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887811988, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 1536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887811988, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 24576, "step": 1536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887819190, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.202000681951176}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 1536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887819190, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 4.229187965393066, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 24576}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887819190, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 24576, "step": 1536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887819190, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 1536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887819526, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.007825374603271484, "reduced_train_loss": 4.249763488769531}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 24576}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887830173, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3327767848968506, "reduced_train_loss": 4.235252380371094}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 25088}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887840822, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323500156402588, "reduced_train_loss": 4.1354899406433105}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 25600}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887851464, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33275532722473145, "reduced_train_loss": 4.153587818145752}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 26112}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887862100, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325157165527344, "reduced_train_loss": 4.241135597229004}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 26624}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887872744, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33305883407592773, "reduced_train_loss": 4.000407695770264}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 27136}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887883368, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33118772506713867, "reduced_train_loss": 4.180039405822754}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 27648}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887894016, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33525919914245605, "reduced_train_loss": 4.09565544128418}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 28160}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887904661, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3328592777252197, "reduced_train_loss": 4.162868976593018}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 28672}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887915293, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33274269104003906, "reduced_train_loss": 4.064763069152832}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 29184}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887925926, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3307785987854004, "reduced_train_loss": 4.018768787384033}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 29696}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887936560, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3328409194946289, "reduced_train_loss": 4.017836093902588}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 30208}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887947199, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33344459533691406, "reduced_train_loss": 3.9870951175689697}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 30720}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887957836, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3326702117919922, "reduced_train_loss": 4.034585475921631}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 31232}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887968483, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33271098136901855, "reduced_train_loss": 4.099434852600098}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 31744}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887979117, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33170127868652344, "reduced_train_loss": 4.086047172546387}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 32256}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791887989763, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33455491065979004, "reduced_train_loss": 3.9857282638549805}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 32768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888000410, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311009407043457, "reduced_train_loss": 3.9732460975646973}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 33280}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888011044, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33355164527893066, "reduced_train_loss": 4.114051818847656}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 33792}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888021683, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33272290229797363, "reduced_train_loss": 4.016867637634277}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 34304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888032315, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3337688446044922, "reduced_train_loss": 4.013189792633057}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 34816}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888042955, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331480026245117, "reduced_train_loss": 4.093279838562012}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 35328}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888053596, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33425450325012207, "reduced_train_loss": 3.962036609649658}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 35840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888064225, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3329446315765381, "reduced_train_loss": 4.0072479248046875}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 36352}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888073641, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 2304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888073642, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 36864, "step": 2304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888080830, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.188920099986717}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 2304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888080831, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.9415502548217773, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 36864}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888080831, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 36864, "step": 2304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888080831, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 2304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888081167, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008175134658813477, "reduced_train_loss": 4.118100166320801}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 36864}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888091814, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3327784538269043, "reduced_train_loss": 3.887925386428833}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 37376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888102449, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33179354667663574, "reduced_train_loss": 3.8977746963500977}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 37888}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888113089, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33083105087280273, "reduced_train_loss": 3.937192440032959}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 38400}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888123728, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3315730094909668, "reduced_train_loss": 3.821964740753174}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 38912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888134366, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3330879211425781, "reduced_train_loss": 3.802720069885254}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 39424}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888145017, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33361244201660156, "reduced_train_loss": 3.769622802734375}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 39936}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888155650, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332489013671875, "reduced_train_loss": 3.85286021232605}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 40448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888166288, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33187150955200195, "reduced_train_loss": 3.918733596801758}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 40960}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888176913, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33251118659973145, "reduced_train_loss": 3.9618582725524902}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 41472}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888187547, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331577777862549, "reduced_train_loss": 3.8129067420959473}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 41984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888198183, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.333141565322876, "reduced_train_loss": 4.111602306365967}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 42496}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888208834, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325772285461426, "reduced_train_loss": 3.8787899017333984}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 43008}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888219476, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33344316482543945, "reduced_train_loss": 3.8584213256835938}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 43520}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888230112, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33186841011047363, "reduced_train_loss": 3.8279342651367188}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 44032}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888240742, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33051180839538574, "reduced_train_loss": 3.8002636432647705}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 44544}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888251373, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323938846588135, "reduced_train_loss": 3.7579641342163086}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 45056}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888262017, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33338236808776855, "reduced_train_loss": 3.9044172763824463}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 45568}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888272665, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3327178955078125, "reduced_train_loss": 3.8672077655792236}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 46080}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888283300, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33190250396728516, "reduced_train_loss": 3.7896738052368164}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 46592}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888293945, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321506977081299, "reduced_train_loss": 3.792055368423462}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 47104}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888304574, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33086204528808594, "reduced_train_loss": 3.7847743034362793}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 47616}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888315222, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33281707763671875, "reduced_train_loss": 3.796759605407715}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 48128}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888325859, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33292269706726074, "reduced_train_loss": 3.577317237854004}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 48640}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888335266, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 3072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888335267, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 49152, "step": 3072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888342469, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.202076443005353}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 3072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888342469, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.787328004837036, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 49152}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888342469, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 49152, "step": 3072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888342469, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 3072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888342807, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008240938186645508, "reduced_train_loss": 3.753857135772705}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 49152}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888353431, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33089423179626465, "reduced_train_loss": 3.769808769226074}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 49664}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888364074, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33111000061035156, "reduced_train_loss": 3.9685940742492676}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 50176}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888374704, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33125972747802734, "reduced_train_loss": 3.8063735961914062}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 50688}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888385358, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33251070976257324, "reduced_train_loss": 3.851701259613037}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 51200}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888395988, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332080602645874, "reduced_train_loss": 3.807279109954834}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 51712}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888406626, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33202219009399414, "reduced_train_loss": 3.665372371673584}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 52224}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888417256, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33237648010253906, "reduced_train_loss": 3.840834379196167}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 52736}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888427883, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3313283920288086, "reduced_train_loss": 3.730653762817383}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 53248}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888438515, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323695659637451, "reduced_train_loss": 3.8901312351226807}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 53760}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888449157, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33261752128601074, "reduced_train_loss": 3.6771340370178223}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 54272}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888459789, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33033037185668945, "reduced_train_loss": 3.6888179779052734}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 54784}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888470425, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3338801860809326, "reduced_train_loss": 3.6828320026397705}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 55296}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888481059, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33325672149658203, "reduced_train_loss": 3.686373233795166}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 55808}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888491689, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33141088485717773, "reduced_train_loss": 3.626145839691162}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 56320}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888502327, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325965404510498, "reduced_train_loss": 3.6664938926696777}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 56832}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888512960, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33350229263305664, "reduced_train_loss": 3.671480178833008}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 57344}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888523589, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3316934108734131, "reduced_train_loss": 3.7545130252838135}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 57856}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888534227, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33312034606933594, "reduced_train_loss": 3.586512327194214}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 58368}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888544859, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33502817153930664, "reduced_train_loss": 3.8201847076416016}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 58880}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888555501, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33347105979919434, "reduced_train_loss": 3.738428831100464}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 59392}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888566150, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3308141231536865, "reduced_train_loss": 3.6060447692871094}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 59904}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888576772, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3310103416442871, "reduced_train_loss": 3.7103404998779297}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 60416}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888587414, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33219242095947266, "reduced_train_loss": 3.6412875652313232}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 60928}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888596821, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 3840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888596821, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 61440, "step": 3840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888604010, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.189650386979338}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 3840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888604011, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.673349142074585, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 61440}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888604011, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 61440, "step": 3840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888604011, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 3840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888604347, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008437871932983398, "reduced_train_loss": 3.6821506023406982}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 61440}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888614981, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33452796936035156, "reduced_train_loss": 3.593776226043701}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 61952}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888625613, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33080363273620605, "reduced_train_loss": 3.798121929168701}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 62464}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888636250, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312244415283203, "reduced_train_loss": 3.694997549057007}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 62976}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888646888, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33457231521606445, "reduced_train_loss": 3.5650126934051514}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 63488}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888657523, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.4024159908294678, "reduced_train_loss": 3.6285486221313477}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 64000}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888668163, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3340129852294922, "reduced_train_loss": 3.6289258003234863}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 64512}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888678802, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33308863639831543, "reduced_train_loss": 3.731870412826538}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 65024}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888689430, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33084869384765625, "reduced_train_loss": 3.715489149093628}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 65536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888700063, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33443570137023926, "reduced_train_loss": 3.6820476055145264}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 66048}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888710699, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3322932720184326, "reduced_train_loss": 3.6072702407836914}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 66560}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888721330, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3318796157836914, "reduced_train_loss": 3.6302571296691895}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 67072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888731970, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33501482009887695, "reduced_train_loss": 3.564054012298584}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 67584}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888742614, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3310415744781494, "reduced_train_loss": 3.639681339263916}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 68096}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888753237, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3326725959777832, "reduced_train_loss": 3.518636465072632}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 68608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888763866, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3319251537322998, "reduced_train_loss": 3.593226909637451}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 69120}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888774499, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33222317695617676, "reduced_train_loss": 3.61460018157959}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 69632}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888785149, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331441879272461, "reduced_train_loss": 3.495373487472534}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 70144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888795782, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3335554599761963, "reduced_train_loss": 3.6539664268493652}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 70656}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888806410, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33090662956237793, "reduced_train_loss": 3.7402091026306152}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 71168}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888817033, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33069443702697754, "reduced_train_loss": 3.5495617389678955}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 71680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888827670, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33126091957092285, "reduced_train_loss": 3.6480274200439453}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 72192}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888838297, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33139705657958984, "reduced_train_loss": 3.533071279525757}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 72704}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888848928, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311796188354492, "reduced_train_loss": 3.7232513427734375}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 73216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888858336, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 4608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888858336, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 73728, "step": 4608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888865525, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.189248465991113}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 4608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888865526, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.6016852855682373, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 73728}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888865526, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 73728, "step": 4608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888865526, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 4608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888865865, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008171319961547852, "reduced_train_loss": 3.59775447845459}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 73728}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888876499, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33210158348083496, "reduced_train_loss": 3.6316189765930176}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 74240}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888887128, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33230066299438477, "reduced_train_loss": 3.584639310836792}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 74752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888897758, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312265872955322, "reduced_train_loss": 3.5925798416137695}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 75264}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888908388, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321828842163086, "reduced_train_loss": 3.524773359298706}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 75776}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888919030, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33434081077575684, "reduced_train_loss": 3.6679019927978516}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 76288}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888929656, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3316178321838379, "reduced_train_loss": 3.5719306468963623}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 76800}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888940291, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3322436809539795, "reduced_train_loss": 3.64056396484375}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 77312}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888950923, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33263516426086426, "reduced_train_loss": 3.614408254623413}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 77824}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888961554, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33233094215393066, "reduced_train_loss": 3.5474298000335693}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 78336}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888972180, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323781490325928, "reduced_train_loss": 3.536390781402588}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 78848}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888982830, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33339619636535645, "reduced_train_loss": 3.5436770915985107}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 79360}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791888993463, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3324563503265381, "reduced_train_loss": 3.494286298751831}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 79872}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889004108, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33348584175109863, "reduced_train_loss": 3.579219102859497}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 80384}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889014747, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33440494537353516, "reduced_train_loss": 3.537158489227295}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 80896}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889025375, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332294225692749, "reduced_train_loss": 3.5284390449523926}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 81408}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889036014, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33202052116394043, "reduced_train_loss": 3.740621566772461}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 81920}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889046648, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3341209888458252, "reduced_train_loss": 3.5374362468719482}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 82432}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889057271, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3324766159057617, "reduced_train_loss": 3.565584659576416}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 82944}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889067901, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33259010314941406, "reduced_train_loss": 3.518461227416992}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 83456}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889078527, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3315436840057373, "reduced_train_loss": 3.7083685398101807}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 83968}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889089172, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3328680992126465, "reduced_train_loss": 3.5648646354675293}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 84480}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889099839, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3318037986755371, "reduced_train_loss": 3.5595130920410156}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 84992}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889110491, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325645923614502, "reduced_train_loss": 3.608577013015747}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 85504}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889119891, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 5376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889119892, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 86016, "step": 5376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889127076, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.1848812910029665}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 5376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889127077, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.5365211963653564, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 86016}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889127077, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 86016, "step": 5376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889127077, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 5376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889127414, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008242130279541016, "reduced_train_loss": 3.5523581504821777}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 86016}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889138041, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33282923698425293, "reduced_train_loss": 3.5563743114471436}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 86528}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889148674, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331780433654785, "reduced_train_loss": 3.4995851516723633}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 87040}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889159302, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33227109909057617, "reduced_train_loss": 3.6139402389526367}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 87552}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889169927, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321208953857422, "reduced_train_loss": 3.5007824897766113}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 88064}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889180565, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33316993713378906, "reduced_train_loss": 3.4512956142425537}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 88576}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889191204, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.333188533782959, "reduced_train_loss": 3.612762212753296}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 89088}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889201837, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3306279182434082, "reduced_train_loss": 3.30452036857605}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 89600}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889212472, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33251261711120605, "reduced_train_loss": 3.587083101272583}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 90112}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889223104, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33307385444641113, "reduced_train_loss": 3.58390474319458}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 90624}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889233735, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33115696907043457, "reduced_train_loss": 3.5860249996185303}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 91136}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889244363, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323345184326172, "reduced_train_loss": 3.499762773513794}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 91648}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889254995, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33257198333740234, "reduced_train_loss": 3.5488452911376953}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 92160}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889265638, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312816619873047, "reduced_train_loss": 3.4967377185821533}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 92672}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889276279, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321545124053955, "reduced_train_loss": 3.51660418510437}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 93184}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889286913, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331475257873535, "reduced_train_loss": 3.5369739532470703}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 93696}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889297543, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33275866508483887, "reduced_train_loss": 3.478480577468872}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 94208}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889308174, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33069419860839844, "reduced_train_loss": 3.5310919284820557}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 94720}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889318809, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3316011428833008, "reduced_train_loss": 3.416508913040161}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 95232}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889329438, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3302595615386963, "reduced_train_loss": 3.604779005050659}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 95744}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889340065, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3317892551422119, "reduced_train_loss": 3.477430582046509}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 96256}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889350693, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323805332183838, "reduced_train_loss": 3.3903355598449707}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 96768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889361318, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33075523376464844, "reduced_train_loss": 3.426088809967041}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 97280}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889371953, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311021327972412, "reduced_train_loss": 3.48077392578125}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 97792}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889381345, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 6144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889381345, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 98304, "step": 6144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889388531, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.185414935986046}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 6144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889388531, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.4867188930511475, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 98304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889388531, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 98304, "step": 6144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889388531, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 6144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889388867, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008646965026855469, "reduced_train_loss": 3.443168878555298}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 98304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889399506, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3333396911621094, "reduced_train_loss": 3.4980006217956543}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 98816}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889410132, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33160400390625, "reduced_train_loss": 3.464015245437622}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 99328}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889420755, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3322262763977051, "reduced_train_loss": 3.4800009727478027}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 99840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889431384, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33296823501586914, "reduced_train_loss": 3.427928924560547}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 100352}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889442011, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33322858810424805, "reduced_train_loss": 3.3314034938812256}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 100864}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889452642, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3324849605560303, "reduced_train_loss": 3.534147262573242}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 101376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889463260, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33244872093200684, "reduced_train_loss": 3.4282779693603516}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 101888}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889473894, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3327040672302246, "reduced_train_loss": 3.4876723289489746}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 102400}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889484519, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33139920234680176, "reduced_train_loss": 3.3778202533721924}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 102912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889495158, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33118772506713867, "reduced_train_loss": 3.4243662357330322}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 103424}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889505782, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312838077545166, "reduced_train_loss": 3.428678035736084}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 103936}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889516419, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33063817024230957, "reduced_train_loss": 3.5450057983398438}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 104448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889527045, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321666717529297, "reduced_train_loss": 3.4908370971679688}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 104960}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889537674, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332033634185791, "reduced_train_loss": 3.4600160121917725}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 105472}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889548309, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33260488510131836, "reduced_train_loss": 3.3190510272979736}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 105984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889558939, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33123135566711426, "reduced_train_loss": 3.398712158203125}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 106496}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889569560, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332050085067749, "reduced_train_loss": 3.302426338195801}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 107008}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889580188, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33181095123291016, "reduced_train_loss": 3.4864184856414795}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 107520}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889590831, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3319363594055176, "reduced_train_loss": 3.4332895278930664}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 108032}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889601458, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33112001419067383, "reduced_train_loss": 3.4964237213134766}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 108544}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889612091, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3333730697631836, "reduced_train_loss": 3.3811216354370117}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 109056}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889622710, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33135128021240234, "reduced_train_loss": 3.3751556873321533}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 109568}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889633367, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3328089714050293, "reduced_train_loss": 3.510960102081299}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 110080}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889642774, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 6912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889642775, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 110592, "step": 6912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889649943, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.169121582002845}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 6912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889649944, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.4369945526123047, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 110592}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889649944, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 110592, "step": 6912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889649944, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 6912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889650280, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.009418487548828125, "reduced_train_loss": 3.3202943801879883}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 110592}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889660911, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3334681987762451, "reduced_train_loss": 3.3285491466522217}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 111104}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889671553, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325619697570801, "reduced_train_loss": 3.5035958290100098}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 111616}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889682178, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33214640617370605, "reduced_train_loss": 3.4122705459594727}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 112128}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889692831, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321495056152344, "reduced_train_loss": 3.3931355476379395}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 112640}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889703472, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33355093002319336, "reduced_train_loss": 3.2509725093841553}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 113152}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889714098, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3302485942840576, "reduced_train_loss": 3.431276798248291}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 113664}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889724720, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3309657573699951, "reduced_train_loss": 3.4440042972564697}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 114176}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889735352, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33143019676208496, "reduced_train_loss": 3.420482873916626}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 114688}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889745979, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33139657974243164, "reduced_train_loss": 3.3703672885894775}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 115200}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889756613, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33072519302368164, "reduced_train_loss": 3.565251588821411}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 115712}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889767241, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321671485900879, "reduced_train_loss": 3.5019052028656006}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 116224}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889777856, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3306703567504883, "reduced_train_loss": 3.439202308654785}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 116736}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889788489, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3342247009277344, "reduced_train_loss": 3.475368022918701}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 117248}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889799108, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3320767879486084, "reduced_train_loss": 3.337583303451538}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 117760}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889809727, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33205556869506836, "reduced_train_loss": 3.4909873008728027}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 118272}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889820358, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3323650360107422, "reduced_train_loss": 3.5436267852783203}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 118784}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889830985, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311903476715088, "reduced_train_loss": 3.5325546264648438}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 119296}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889841604, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3315398693084717, "reduced_train_loss": 3.4974777698516846}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 119808}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889852233, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3317418098449707, "reduced_train_loss": 3.5560548305511475}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 120320}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889862851, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33130979537963867, "reduced_train_loss": 3.400299310684204}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 120832}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889873492, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33277225494384766, "reduced_train_loss": 3.378457546234131}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 121344}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889884117, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33107495307922363, "reduced_train_loss": 3.3777360916137695}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 121856}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889894741, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33173298835754395, "reduced_train_loss": 3.4467105865478516}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 122368}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889904143, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 7680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889904143, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 122880, "step": 7680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889911314, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.171161240024958}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 7680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889911314, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.3986759185791016, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 122880}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889911314, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 122880, "step": 7680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889911315, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 7680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889911653, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008844137191772461, "reduced_train_loss": 3.299792528152466}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 122880}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889922272, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33110523223876953, "reduced_train_loss": 3.3796677589416504}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 123392}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889932901, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33203625679016113, "reduced_train_loss": 3.543351173400879}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 123904}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889943535, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3326985836029053, "reduced_train_loss": 3.42629337310791}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 124416}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889954161, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3316183090209961, "reduced_train_loss": 3.3444831371307373}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 124928}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889964780, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3315308094024658, "reduced_train_loss": 3.4613852500915527}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 125440}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889975411, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3315389156341553, "reduced_train_loss": 3.390235185623169}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 125952}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889986036, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33414530754089355, "reduced_train_loss": 3.166407346725464}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 126464}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791889996649, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33260512351989746, "reduced_train_loss": 3.4083058834075928}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 126976}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890007273, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3334031105041504, "reduced_train_loss": 3.425363540649414}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 127488}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890017891, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.4031047821044922, "reduced_train_loss": 3.359973430633545}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 128000}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890028514, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3322429656982422, "reduced_train_loss": 3.2264187335968018}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 128512}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890039165, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3329024314880371, "reduced_train_loss": 3.4004290103912354}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 129024}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890049797, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3321340084075928, "reduced_train_loss": 3.4567742347717285}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 129536}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890060420, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33214521408081055, "reduced_train_loss": 3.2871952056884766}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 130048}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890071043, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3306863307952881, "reduced_train_loss": 3.354574680328369}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 130560}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890081666, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33336567878723145, "reduced_train_loss": 3.4517452716827393}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 131072}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890092303, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3313028812408447, "reduced_train_loss": 3.537156343460083}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 131584}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890102921, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33138060569763184, "reduced_train_loss": 3.3885395526885986}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 132096}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890113568, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33165407180786133, "reduced_train_loss": 3.3619914054870605}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 132608}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890124196, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3309924602508545, "reduced_train_loss": 3.4090638160705566}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 133120}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890134828, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33216285705566406, "reduced_train_loss": 3.409956693649292}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 133632}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890145450, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33170104026794434, "reduced_train_loss": 3.297443389892578}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 134144}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890156080, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3339231014251709, "reduced_train_loss": 3.3291049003601074}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 134656}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890165480, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 8448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890165480, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 135168, "step": 8448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890172643, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.163387122971471}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 8448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890172644, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.3676319122314453, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 135168}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890172644, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 135168, "step": 8448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890172644, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 8448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890172981, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.009542703628540039, "reduced_train_loss": 3.441948890686035}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 135168}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890183615, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3306903839111328, "reduced_train_loss": 3.18839955329895}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 135680}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890194240, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3329606056213379, "reduced_train_loss": 3.4164202213287354}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 136192}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890204861, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3308103084564209, "reduced_train_loss": 3.2166666984558105}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 136704}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890215491, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33168530464172363, "reduced_train_loss": 3.165665864944458}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 137216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890226113, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33123111724853516, "reduced_train_loss": 3.3339788913726807}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 137728}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890236746, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3308427333831787, "reduced_train_loss": 3.292619466781616}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 138240}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890247373, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3327522277832031, "reduced_train_loss": 3.20943546295166}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 138752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890258001, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3332250118255615, "reduced_train_loss": 3.403797149658203}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 139264}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890268635, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33235692977905273, "reduced_train_loss": 3.289473056793213}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 139776}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890279249, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3317759037017822, "reduced_train_loss": 3.423832416534424}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 140288}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890289880, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3332705497741699, "reduced_train_loss": 3.2882885932922363}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 140800}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890300505, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3298203945159912, "reduced_train_loss": 3.364211320877075}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 141312}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890311124, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3313784599304199, "reduced_train_loss": 3.469296455383301}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 141824}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890321736, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33162546157836914, "reduced_train_loss": 3.410917282104492}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 142336}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890332374, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33341217041015625, "reduced_train_loss": 3.4105443954467773}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 142848}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890342993, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33246374130249023, "reduced_train_loss": 3.3585996627807617}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 143360}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890353630, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3314363956451416, "reduced_train_loss": 3.424783706665039}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 143872}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890364249, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325333595275879, "reduced_train_loss": 3.2889602184295654}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 144384}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890374869, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33287644386291504, "reduced_train_loss": 3.509575843811035}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 144896}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890385504, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33063578605651855, "reduced_train_loss": 3.3505101203918457}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 145408}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890396123, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33034682273864746, "reduced_train_loss": 3.3166041374206543}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 145920}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890406749, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311946392059326, "reduced_train_loss": 3.4023020267486572}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 146432}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890417381, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33446311950683594, "reduced_train_loss": 3.426923990249634}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 146944}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890426784, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 9216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890426785, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 147456, "step": 9216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890433953, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.168278809986077}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 9216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890433953, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.3392677307128906, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 147456}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890433953, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 147456, "step": 9216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890433953, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 9216}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890434288, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.00877523422241211, "reduced_train_loss": 3.2809898853302}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 147456}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890444914, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3334066867828369, "reduced_train_loss": 3.4252023696899414}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 147968}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890455536, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33184123039245605, "reduced_train_loss": 3.3704404830932617}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 148480}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890466167, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3334341049194336, "reduced_train_loss": 3.3346145153045654}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 148992}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890476800, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331279754638672, "reduced_train_loss": 3.4812047481536865}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 149504}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890487433, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3322789669036865, "reduced_train_loss": 3.4501571655273438}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 150016}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890498054, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33273744583129883, "reduced_train_loss": 3.4037821292877197}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 150528}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890508681, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311281204223633, "reduced_train_loss": 3.3740897178649902}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 151040}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890519307, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33124518394470215, "reduced_train_loss": 3.3437039852142334}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 151552}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890529930, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3328218460083008, "reduced_train_loss": 3.3124279975891113}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 152064}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890540563, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3308086395263672, "reduced_train_loss": 3.3276724815368652}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 152576}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890551183, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33159852027893066, "reduced_train_loss": 3.329373359680176}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 153088}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890561809, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3310377597808838, "reduced_train_loss": 3.266995429992676}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 153600}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890572429, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3320448398590088, "reduced_train_loss": 3.2314951419830322}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 154112}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890583049, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3318750858306885, "reduced_train_loss": 3.389331340789795}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 154624}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890593682, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33475708961486816, "reduced_train_loss": 3.3038148880004883}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 155136}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890604303, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3300466537475586, "reduced_train_loss": 3.2859725952148438}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 155648}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890614921, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33119630813598633, "reduced_train_loss": 3.3593783378601074}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 156160}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890625544, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311131000518799, "reduced_train_loss": 3.247163772583008}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 156672}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890636171, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33063316345214844, "reduced_train_loss": 3.2491302490234375}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 157184}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890646784, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3312239646911621, "reduced_train_loss": 3.251349925994873}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 157696}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890657410, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.332319974899292, "reduced_train_loss": 3.3655691146850586}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 158208}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890668029, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33154940605163574, "reduced_train_loss": 3.3813633918762207}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 158720}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890678657, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3331875801086426, "reduced_train_loss": 3.3183798789978027}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 159232}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890688052, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 9984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890688052, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 159744, "step": 9984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890695217, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.165283530019224}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 9984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890695218, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.3129019737243652, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 159744}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890695218, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 159744, "step": 9984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890695218, "event_type": "INTERVAL_START", "key": "block_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 267, "samples_count": 12288, "step": 9984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890695554, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.008682012557983398, "reduced_train_loss": 3.273301362991333}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 159744}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890706170, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3308827877044678, "reduced_train_loss": 3.3662991523742676}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 160256}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890716792, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33138036727905273, "reduced_train_loss": 3.2903404235839844}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 160768}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890727417, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33088254928588867, "reduced_train_loss": 3.2769482135772705}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 161280}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890738042, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33255839347839355, "reduced_train_loss": 3.285194158554077}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 161792}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890748670, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33209228515625, "reduced_train_loss": 3.2347893714904785}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 162304}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890759289, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3326303958892822, "reduced_train_loss": 3.368227958679199}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 162816}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890769901, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3319687843322754, "reduced_train_loss": 3.29498291015625}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 163328}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890780528, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.330857515335083, "reduced_train_loss": 3.342766284942627}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 163840}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890791163, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33159613609313965, "reduced_train_loss": 3.3596456050872803}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 164352}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890801787, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33331894874572754, "reduced_train_loss": 3.2043814659118652}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 164864}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890812424, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3305180072784424, "reduced_train_loss": 3.3766961097717285}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 165376}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890823040, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3326869010925293, "reduced_train_loss": 3.240879774093628}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 165888}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890833664, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33242225646972656, "reduced_train_loss": 3.277742862701416}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 166400}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890844298, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33135366439819336, "reduced_train_loss": 3.334329843521118}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 166912}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890854921, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3318827152252197, "reduced_train_loss": 3.2661757469177246}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 167424}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890865547, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33104753494262695, "reduced_train_loss": 3.3950955867767334}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 167936}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890876171, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33060145378112793, "reduced_train_loss": 3.25996732711792}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 168448}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890886791, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33220839500427246, "reduced_train_loss": 3.462798595428467}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 168960}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890897411, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3314189910888672, "reduced_train_loss": 3.2610161304473877}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 169472}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890908044, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33451247215270996, "reduced_train_loss": 3.326775074005127}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 169984}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890918666, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3325660228729248, "reduced_train_loss": 3.323777437210083}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 170496}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890929290, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.3311805725097656, "reduced_train_loss": 3.2243614196777344}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 171008}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890939904, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"train_step_time": 0.33191752433776855, "reduced_train_loss": 3.2745251655578613}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 317, "samples_count": 171520}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890949291, "event_type": "INTERVAL_END", "key": "block_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 276, "samples_count": 12288, "step": 10752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890949292, "event_type": "INTERVAL_START", "key": "eval_start", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 192, "samples_count": 172032, "step": 10752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890956468, "event_type": "POINT_IN_TIME", "key": "tracked_stats", "value": {"validation_time": 7.177004776021931}, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 286, "step": 10752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890956469, "event_type": "POINT_IN_TIME", "key": "eval_accuracy", "value": 3.292750120162964, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 211, "samples_count": 172032}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890956469, "event_type": "INTERVAL_END", "key": "eval_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 216, "samples_count": 172032, "step": 10752}}
+0: :::MLLOG {"namespace": "", "time_ms": 1791890956469, "event_type": "INTERVAL_END", "key": "run_stop", "value": null, "metadata": {"file": "/workspace/llm/callback_logging.py", "lineno": 226, "samples_count": 172032, "status": "success"}}
+0: Deleting CUDA graphs
+0: [after training is done] datetime: 2026-10-13 11:29:16 
++ RUN_AND_TIME_EXIT_STATUS=0
+++ date +%s
++ echo 'RUNANDTIME_STOP 1791890964'
+RUNANDTIME_STOP 1791890964
++ echo 0
++ set -e

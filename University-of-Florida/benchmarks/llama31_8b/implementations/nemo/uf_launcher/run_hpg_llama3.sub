@@ -1,0 +1,136 @@
+#!/bin/bash
+# Run an NVIDIA v6.1 benchmark from its x86 SIF on HiPerGator B200 (Slurm + apptainer).
+# Submit it with launcher/run_hpg.sh. The container's own code runs (no repo bind). Configs reach this script
+# through the environment. Same steps as NVIDIA's run.sub: per run a cache drop, one rank per GPU,
+# the sorted MLPerf log and the compliance checker.
+
+#SBATCH --exclusive
+#SBATCH --mem=0
+
+set -exo pipefail
+module unload python 2>/dev/null || true
+unset PYTHONHOME
+
+# Fix conflicting Slurm CPU environment variables
+if [[ "${SLURM_TRES_PER_TASK:-}" == *cpu=* ]]; then
+    unset SLURM_CPUS_PER_TASK
+fi
+
+: "${CONT:?CONT not set}"
+: "${CTX:?CTX not set}"
+: "${KIT:?KIT not set}"
+: "${BENCH:?BENCH not set}"
+: "${WORK_DIR:?WORK_DIR not set}"
+: "${LOGDIR:?LOGDIR not set}"
+: "${DGXSYSTEM:?DGXSYSTEM not set}"
+: "${WALLTIME_RUNANDTIME:?WALLTIME_RUNANDTIME not set}"
+: "${NEXP:=10}"
+: "${MLPERF_RULESET:=6.1.0}"
+: "${MLPERF_CLUSTER_NAME:='unknown'}"
+: "${DATESTAMP:=$(date +'%y%m%d%H%M%S%N')}"
+: "${CLEAR_CACHES:=1}"
+: "${DROPCACHE_CMD:="sudo -n /sbin/sysctl vm.drop_caches=3"}"
+: "${CHECK_COMPLIANCE:=1}"
+export DGXSYSTEM DATESTAMP MLPERF_CLUSTER_NAME CONT
+export MODEL_FRAMEWORK="pytorch"
+export LOGBASE="${DATESTAMP}" NEMO_RESULTS_SUBDIR="${DATESTAMP}"
+export MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST-}" | head -n1)"
+export MASTER_PORT=${MASTER_PORT:-29500}
+export WORLD_SIZE=$((DGXNNODES * DGXNGPU)) LOCAL_WORLD_SIZE=${DGXNGPU}
+export PYTHONNOUSERSITE=1
+# Node-local: the NFS home gave "Stale file handle" with 8 nodes (DLRMv4)
+export TRITON_CACHE_DIR=/tmp/triton_cache
+# HPG B200 InfiniBand (the settings of the working 8-node DLRMv4 runs)
+export NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_15,mlx5_10,mlx5_14,mlx5_13,mlx5_8,mlx5_7,mlx5_9,mlx5_4}
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-bridge-1145}
+export OMPI_MCA_pml=ucx OMPI_MCA_btl=^openib
+
+mkdir -p "${LOGDIR}"
+# config_mounts.sh sets _cont_mounts (and makes its host dirs), as for srun --container-mounts.
+_cont_mounts=""
+source "${CTX}/config_mounts.sh"
+[[ "${_cont_mounts}" == *":/results"* ]] || _cont_mounts="${LOGDIR}:/results,${_cont_mounts}"
+# NVIDIA's run.sub runs the image writable (pyxis); the SIF is read-only and HPG forbids
+# --writable-tmpfs (enable overlay = no). Bind host dirs where the code writes:
+# HF_HOME=/hf_home (flux), Hydra outputs/ in the work dir (LoRA, GPT-OSS), and the Megatron-Core
+# JIT build dir (GPT-OSS, NCCL_UB_DP=True).
+# hf_home is on /blue (per job), so every node sees it. Flux sets HF_HOME=/hf_home but reads
+# nothing from it; the dir only has to exist and be writable.
+mkdir -p "${LOGDIR}/${DATESTAMP}_outputs" "${LOGDIR}/${DATESTAMP}_hf_home"
+_cont_mounts="${_cont_mounts},${LOGDIR}/${DATESTAMP}_hf_home:/hf_home"
+_cont_mounts="${_cont_mounts},${LOGDIR}/${DATESTAMP}_outputs:${WORK_DIR}/outputs"
+if [[ "${MCORE_BUILD_BIND:-0}" == 1 ]]; then
+    mkdir -p "${LOGDIR}/mcore_build"
+    _cont_mounts="${_cont_mounts},${LOGDIR}/mcore_build:/workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/build"
+fi
+echo "MOUNTS=${_cont_mounts}"
+
+appt() {
+    apptainer exec --nv -B "${_cont_mounts}" --pwd "${WORK_DIR}" "${CONT}" "$@"
+}
+
+readonly _logfile_base="${LOGDIR}/${DATESTAMP}"
+srun --ntasks-per-node=1 apptainer exec --nv "${CONT}" nvidia-smi --query-gpu=gpu_name,gpu_bus_id,memory.total --format=csv
+for _experiment_index in $(seq 1 "${NEXP}"); do
+    export SEED=${SEED_OVERRIDE:-$RANDOM}   # a new seed for each run
+    echo "EXPERIMENT_START $(date +%s)"
+    (
+        echo "Beginning trial ${_experiment_index} of ${NEXP}"
+        echo ":::DLPAL ${CONT} ${SLURM_JOB_ID} ${SLURM_JOB_NUM_NODES} ${SLURM_JOB_NODELIST} ${MLPERF_CLUSTER_NAME} ${DGXSYSTEM}"
+        echo ":::SYSJSON $(appt mlperf-sysjson.sh)"
+        appt bash -c 'echo ":::GITCOMMITID ${GIT_COMMIT_ID:-}"'
+
+        # Clear caches on every node. Log cache_clear only when every drop succeeds.
+        if [[ "${CLEAR_CACHES}" -eq 1 ]]; then
+            if srun --ntasks-per-node=1 bash -c '
+                 set -e
+                 cache_before=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 sync && '"${DROPCACHE_CMD}"'
+                 cache_after=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 echo "$(hostname) cache_cleared ${cache_before}kB to ${cache_after}kB"'; then
+                appt python3 -c "
+import mlperf_logging.mllog as mllog
+mllogger = mllog.get_mllogger()
+mllogger.event(key=mllog.constants.CACHE_CLEAR, value=True)"
+            else
+                echo "WARNING: cache drop failed, cache_clear not logged"
+            fi
+        fi
+
+        export -p > "${_logfile_base}_${_experiment_index}.env"
+        set +e
+        echo "RUNANDTIME_START $(date +%s)"
+        # one task per GPU; slurm2pytorch sets RANK, LOCAL_RANK from SLURM_PROCID, SLURM_LOCALID
+        # MEMLOG=1: local rank 0 of each node logs GPU memory every 5 s (nvidia-smi inside the job step)
+        export MEMLOG_PREFIX="/results/${DATESTAMP}_${_experiment_index}_gpumem"
+        srun -l --mpi="${SLURM_MPI_TYPE:-pmix}" --ntasks-per-node="${DGXNGPU}" \
+            --time="${WALLTIME_RUNANDTIME}" \
+            apptainer exec --nv -B "${_cont_mounts}" --pwd "${WORK_DIR}" "${CONT}" \
+            bash -c 'if [[ "${MEMLOG:-0}" == 1 && "${SLURM_LOCALID}" == 0 ]]; then
+                         nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total --format=csv,noheader -l 5 \
+                             > "${MEMLOG_PREFIX}_$(hostname -s).csv" 2>&1 &
+                     fi
+                     exec slurm2pytorch ./run_and_time.sh'
+        echo "$?" > "${LOGDIR}/.exit_status_${DATESTAMP}_${_experiment_index}"
+        echo "RUNANDTIME_STOP $(date +%s)"
+        set -e
+    ) |& tee "${_logfile_base}_raw_${_experiment_index}.log"
+
+    RUN_AND_TIME_EXIT_STATUS=$(cat "${LOGDIR}/.exit_status_${DATESTAMP}_${_experiment_index}" 2>/dev/null || echo 255)
+    echo "RUN_AND_TIME_EXIT_STATUS=${RUN_AND_TIME_EXIT_STATUS}"
+
+    # MLPerf lines sorted by timestamp: the file for the submission and the checkers
+    grep ":::" "${_logfile_base}_raw_${_experiment_index}.log" | sed -E 's/^ *[0-9]+: (:::)/\1/' \
+        | sort -k5 -n -s > "${_logfile_base}_${_experiment_index}.log" || true
+
+    if [[ "${CHECK_COMPLIANCE}" -eq 1 ]]; then
+        appt python3 -m mlperf_logging.compliance_checker --usage training \
+            --ruleset "${MLPERF_RULESET}" \
+            --log_output "/results/compliance_${DATESTAMP}_${_experiment_index}.out" \
+            "/results/${DATESTAMP}_${_experiment_index}.log" || true
+    fi
+    echo "EXPERIMENT_STOP $(date +%s)"
+done
+
+set +x
+python3 "${KIT}/launcher/summarize.py" "${LOGDIR}" "${DATESTAMP}" | tee "${_logfile_base}_summary.txt"

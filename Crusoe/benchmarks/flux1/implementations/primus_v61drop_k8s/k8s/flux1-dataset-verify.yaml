@@ -1,0 +1,31 @@
+# Verify the raw flux1 dataset directories the v6.1 Primus recipe reads (coco eval set, empty encodings)
+# against their published md5 lists. coco_preprocessed still holds an aria2 control file for one shard.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: flux1-dataset-verify, labels: { app: v61-drop, role: dataset } }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata: { labels: { app: v61-drop, role: dataset } }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: v
+          image: mirror.gcr.io/library/ubuntu:24.04
+          command: [ "bash", "-c" ]
+          args:
+            - |
+              cd /shared/datasets/flux1
+              echo "coco files: $(ls coco_preprocessed | grep -c arrow$) arrow, aria2 leftovers: $(ls coco_preprocessed | grep -c aria2$)"
+              head -3 flux-1-coco-preprocessed.md5
+              # md5 list paths may be relative to the dataset dir or to coco_preprocessed; try both
+              if (cd /shared/datasets/flux1 && head -1 flux-1-coco-preprocessed.md5 | awk '{print $2}' | xargs -I{} test -e {}); then base=/shared/datasets/flux1; else base=/shared/datasets/flux1/coco_preprocessed; fi
+              echo "checking from $base"
+              cd $base && cat /shared/datasets/flux1/flux-1-coco-preprocessed.md5 | xargs -P 32 -L1 sh -c 'echo "$0  $1" | md5sum -c --quiet - || echo "BAD $1"' > /tmp/res.txt 2>&1
+              cat /tmp/res.txt | tail -20; grep -c BAD /tmp/res.txt || true
+              cd /shared/datasets/flux1/empty_encodings && md5sum -c flux-1-empty-encodings.md5 2>&1 | tail -3
+          resources: { requests: { cpu: "8", memory: 8Gi } }
+          volumeMounts: [ { name: shared, mountPath: /shared, readOnly: true } ]
+      volumes:
+        - { name: shared, persistentVolumeClaim: { claimName: mlperf-training-shared } }

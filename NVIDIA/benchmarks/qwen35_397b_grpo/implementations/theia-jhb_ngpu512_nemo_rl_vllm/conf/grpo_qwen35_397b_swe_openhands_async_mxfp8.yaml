@@ -1,0 +1,34 @@
+defaults:
+- grpo_qwen35_397b_swe_openhands_async.yaml
+- bf16_adam_state.yaml
+
+policy:
+  megatron_cfg:
+    use_grouped_gemm_for_shared_expert: false
+    clear_memory_caches_before_refit: true
+    model_overrides:
+      moe_use_grouped_tensor: ${oc.decode:${oc.env:MOE_USE_GROUPED_TENSOR,true}}
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      force_clear_fp8_caches: true
+      fp8_param: false
+    te_precision_config_file: qwen_35/configs/te_routed_mxfp8_fwd_bwd.yaml
+  generation:
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      quantization_ignore_patterns:
+      - "*visual*"
+      - "*embed_tokens*"
+      - "*self_attn*"
+      - "*linear_attn*"
+      - "*mlp.gate"
+      - "*mlp.shared_expert*"
+      - "*mtp*"
+      - lm_head
+    vllm_kwargs:
+      moe_backend: ${oc.env:VLLM_MOE_BACKEND,flashinfer_trtllm}
+  offload_policy_before_refit: true
+  offload_optimizer_for_refit: false

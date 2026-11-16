@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+# Flux.1 MLPerf trainer for AINIC 1.117.5-a-77 hosts (bundle2 + the CMK cluster): AMD stock
+# trainer + libionic1 from the a-77 *jammy* repo (trainer base is Ubuntu 22.04; suite verified).
+# Referenced by k8s-manifests/bundle2/50-train-8node-ccr-bundle2.yaml. Validated: 8-node smoke
+# 3066 samples/s on bundle2 (2026-08-18).
+# Build: docker build -f Dockerfile.flux-libionic-bundle2 -t $REG/flux1-libionic:bundle2-v1.0 .
+FROM rocm/amd-mlperf:flux1_training_6.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      wget gnupg ca-certificates libibverbs1 \
+ && rm -rf /var/lib/apt/lists/*
+# AINIC userspace libionic matching the 1.117.5-a-77 kernel driver (uABI 1)
+RUN mkdir -p /etc/apt/keyrings \
+ && wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/rocm.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/1.117.5-a-77 jammy main" \
+      > /etc/apt/sources.list.d/amdainic.list \
+ && apt-get update && apt-get install -y --allow-downgrades libionic1 \
+ && apt-cache policy libionic1 | grep -q "1.117.5-a-77" \
+ && echo "driver ionic" > /etc/libibverbs.d/ionic.driver && ldconfig \
+ && test -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace/code

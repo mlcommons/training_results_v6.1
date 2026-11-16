@@ -1,0 +1,82 @@
+--- a/megatron/core/optimizer/clip_grads.py
++++ b/megatron/core/optimizer/clip_grads.py
+@@ -52,6 +52,45 @@
+     param_is_not_gtp_duplicate,
+     param_is_not_tensor_parallel_duplicate,
+ )
++
++# auto_kernel X9-E0 overlay: the last clip coefficient computed by clip_grad_by_total_norm_fp32
++_AK_X9_CLIP_COEFF = None
++
++# auto_kernel X9-FOLD overlay (2026-09-21): AK_X9_FOLD=1 replaces TE's multi_tensor_l2norm in
++# get_grad_norm_fp32 with the fold module's norm() -- TE's reduction order in Triton (the
++# optimizer_adamw_fold task's contract: the LOCAL norm, bytes identical to TE's kernel; the
++# square, the all-reduce, the root and the coefficient below stay as shipped).  The module is the
++# one AK_X9_KERNEL_DIR names (harness/tier2/x9_adamw/fused_adamw_master.py), the same file whose
++# step() the distributed optimizer runs.  Rank 0 prints one ARMED line at the first norm.
++# (sec 168: ported to the 20260929 image -- 0929 moved the empty-list case ahead of the l2norm
++# branch, so the fold now sits inside `elif norm_type == 2.0`; behaviour unchanged.)
++import os as _ak_os
++import sys as _ak_sys
++_AK_X9_FOLD = _ak_os.environ.get("AK_X9_FOLD", "0") == "1"
++_ak_fold_norm = None
++_ak_fold_announced = False
++if _AK_X9_FOLD:
++    _ak_root = _ak_os.environ.get("AK_X9_KERNEL_DIR", "/opt/firmus/ak/x9")
++    if _ak_root not in _ak_sys.path:
++        _ak_sys.path.insert(0, _ak_root)
++    from harness.tier2.x9_adamw import fused_adamw_master as _ak_fold_mod
++
++
++def _ak_fold_l2norm(grads_for_norm):
++    """norm() of the fold module over the bf16 shard views; a 1-element fp32 tensor like TE's."""
++    global _ak_fold_norm, _ak_fold_announced
++    if _ak_fold_norm is None:
++        _ak_fold_norm = _ak_fold_mod.FusedAdamWMaster(device=torch.cuda.current_device())
++    if not _ak_fold_announced:
++        _ak_fold_announced = True
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++        if rank == 0:
++            import hashlib as _h
++            path = _ak_fold_mod.__file__
++            sha = _h.sha256(open(path, "rb").read()).hexdigest()[:16]
++            print("[auto_kernel x9fold] norm pass ARMED: {} shards, dtype {}, module {} sha256={}".format(
++                len(grads_for_norm), grads_for_norm[0].dtype if grads_for_norm else None, path, sha), flush=True)
++    return _ak_fold_norm.norm(grads_for_norm)
+ from ..transformer.module import param_is_not_shared
+ from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+ 
+@@ -117,9 +156,12 @@
+             # Use apex's multi-tensor applier for efficiency reasons.
+             # Multi-tensor applier takes a function and a list of list
+             # and performs the operation on that list all in one kernel.
+-            grad_norm, _ = multi_tensor_applier(
+-                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
+-            )
++            if _AK_X9_FOLD and all(g.dtype == torch.bfloat16 for g in grads_for_norm):
++                grad_norm = _ak_fold_l2norm(grads_for_norm)
++            else:
++                grad_norm, _ = multi_tensor_applier(
++                    l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
++                )
+             # Since we will be summing across data parallel groups,
+             # we need the pow(norm-type).
+             total_norm = grad_norm**norm_type
+@@ -184,6 +226,17 @@
+     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+     if isinstance(clip_coeff, torch.Tensor):
+         clip_coeff.clamp_max_(1.0)
++        # --- auto_kernel X9-E0 overlay (2026-09-19): the fused optimizer step folds this
++        # coefficient into its FP32 grad product; the bf16-master params carry no .grad, so
++        # `grads` is empty for them and the scale kernel must not be launched on an empty
++        # list (TE's multi_tensor_scale_tensor segfaults on zero tensors).  The coefficient is
++        # stashed for distrib_optimizer._ak_x9_fused_step; fp32-param grads (if any) are
++        # scaled below as shipped.
++        global _AK_X9_CLIP_COEFF
++        _AK_X9_CLIP_COEFF = clip_coeff
++        if len(grads) == 0:
++            return
++        # -----------------------------------------------------------------------------------
+         assert (
+             multi_tensor_scale_tensor_impl is not None
+         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."

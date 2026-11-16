@@ -1,0 +1,16 @@
+export FP8=True
+export FP8_PARAM_GATHER=True
+export REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=True
+
+export FP8_DPA=True
+
+export MLPERF_LINEAR_PRECISION="fp8"
+export MLPERF_ATTN_PRECISION="fp8"
+# FP8_PARAM_GATHER all-gathers the MXFP8 parameters.
+export MLPERF_COMM_PRECISION="fp8"
+
+#LN+quant fusion
+export NVTE_CUDNN_MXFP8_NORM_OUTPUT_IN_INPUT_DTYPE=1
+#Shared expert fusion
+export USE_GROUPED_GEMM_FOR_SHARED_EXPERT=True
+export MOE_SHARED_EXPERT_GLU_INTERLEAVE_SIZE=32
